@@ -9,7 +9,7 @@ st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", l
 st.title("🛡️ Sovereign Harness Execution Portal")
 
 # --- HARDCODED KEY TO BYPASS STREAMLIT SECRETS BUG ---
-API_KEY = "PASTE_GOOGLE_KEY_HERE"
+gen-lang-client-0195127873
 
 if API_KEY == "PASTE_YOUR_KEY_HERE":
     st.error("🚨 You forgot to paste your API key on line 12 of app.py!")
