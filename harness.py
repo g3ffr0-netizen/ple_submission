@@ -67,11 +67,10 @@ class HarnessExecutionEngine:
             return fail_res
 
         try:
-            # 3. Environment & Client Verification
-            # --- REPLACE THE STRING BELOW WITH YOUR ACTUAL KEY ---
-            api_key = "PASTE_YOUR_ACTUAL_KEY_HERE"
-            
-            if not api_key or api_key == "PASTE_YOUR_ACTUAL_KEY_HERE":
+                       # 3. Environment & Client Verification
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                raise ValueError("Missing GEMINI_API_KEY environment variable. Check Streamlit Secrets.")
                 raise ValueError("Missing GEMINI_API_KEY. Did you paste it into line 64?")
 
             client = genai.Client(api_key=api_key)
