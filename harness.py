@@ -58,7 +58,7 @@ class HarnessExecutionEngine:
             if not api_key or api_key == "PASTE_YOUR_KEY_HERE":
                 raise ValueError("Missing key. Paste it in harness.py line 61.")
 
-            client = genai.Client(api_key=api_key)
+AQ.Ab8RN6LFiQUzzyX2W0wQMfK0vnXOoiHyInwAboSxx2ZBl2iGWA
             
             # 4. Live Gemini API Call
             response = client.models.generate_content(
