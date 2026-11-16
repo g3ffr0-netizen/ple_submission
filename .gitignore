@@ -1,0 +1,17 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Streamlit local cache & config
+.streamlit/
+
+# Local data and submission files (keep these off GitHub!)
+test.csv
+train.csv
+submission.csv
+*.csv
+
+# OS generated files
+.DS_Store
+Thumbs.db
