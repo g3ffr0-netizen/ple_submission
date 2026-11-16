@@ -12,7 +12,7 @@ st.title("🛡️ Sovereign Harness Execution Portal")
 API_KEY = "AIzaSyDr9wW05Vp5vV..."
 
 if not API_KEY or API_KEY == "PASTE_YOUR_KEY_HERE":
-    st.error("🚨 Please provide a valid Google AI Studio API key on line 12 of app.py!")
+AQ.Ab8RN6JsfYngC6CWjxQ8okfc-HXFc1CcVTDak5qFrJnBGeS1Lg
     st.stop()
 
 if 'engine' not in st.session_state:
