@@ -8,12 +8,8 @@ from harness import HarnessExecutionEngine
 st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", layout="centered")
 st.title("🛡️ Sovereign Harness Execution Portal")
 
-# --- FETCH SECRET SECURELY ---
-try:
-    API_KEY = st.secrets["GEMINI_API_KEY"]
-except KeyError:
-    st.error("🚨 GEMINI_API_KEY not found in Streamlit Secrets. Please add it in the dashboard.")
-    st.stop() # Stops the app from running if the key is missing
+# --- HARDCODED API KEY ---
+API_KEY = "AQ.Ab8RN6KleH5EIHrg7T-06lL9VDKxnYhpc-LKn_WSZLMKO71MrA"
 
 if 'engine' not in st.session_state:
     st.session_state.engine = HarnessExecutionEngine()
@@ -39,7 +35,7 @@ with col1:
             st.warning("⚠️ Please enter a task prompt before executing.")
         else:
             with st.spinner("Running verification loops..."):
-                # PASS THE API KEY AS AN ARGUMENT HERE
+                # PASS THE HARDCODED API KEY AS AN ARGUMENT HERE
                 result = engine.run_harness(task, api_key=API_KEY)
                 
                 if result.get("status") == "SUCCESS":
