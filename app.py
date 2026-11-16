@@ -9,10 +9,10 @@ st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", l
 st.title("🛡️ Sovereign Harness Execution Portal")
 
 # --- HARDCODED API KEY ASSIGNMENT ---
-API_KEY = "AIzaSyDr9wW05Vp5vV..."
+API_KEY = "AQ.Ab8RN6JsfYngC6CWjxQ8okfc-HXFc1CcVTDak5qFrJnBGeS1Lg"
 
 if not API_KEY or API_KEY == "PASTE_YOUR_KEY_HERE":
-AQ.Ab8RN6JsfYngC6CWjxQ8okfc-HXFc1CcVTDak5qFrJnBGeS1Lg
+    st.error("🚨 Please provide a valid API key on line 12 of app.py!")
     st.stop()
 
 if 'engine' not in st.session_state:
