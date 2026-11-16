@@ -11,7 +11,7 @@ st.title("🛡️ Sovereign Harness Execution Portal")
 # --- HARDCODED API KEY ASSIGNMENT ---
 API_KEY = "AIzaSyDr9wW05Vp5vV..."
 
-if not API_KEY or API_KEY == "PASTE_YOUR_KEY_HERE":
+if not API_KEY or API_KEY == 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
     st.error("🚨 Please provide a valid Google AI Studio API key on line 12 of app.py!")
     st.stop()
 
