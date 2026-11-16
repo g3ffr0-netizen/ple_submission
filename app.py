@@ -2,19 +2,18 @@ import streamlit as st
 import sys
 import os
 
-# --- DIAGNOSTIC (Remove this later) ---
-st.write("--- DIAGNOSTIC ---")
-st.write("Is the key in the environment?", "YES" if os.environ.get("GEMINI_API_KEY") else "NO")
-if os.environ.get("GEMINI_API_KEY"):
-    st.write("Key starts with:", os.environ.get("GEMINI_API_KEY")[:5])
-st.write("------------------")
-
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from harness import HarnessExecutionEngine
 
 st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", layout="centered")
 st.title("🛡️ Sovereign Harness Execution Portal")
-st.markdown("*Submit tasks directly to the verified execution harness with automated safety gates.*")
+
+# --- FETCH SECRET SECURELY ---
+try:
+    API_KEY = st.secrets["GEMINI_API_KEY"]
+except KeyError:
+    st.error("🚨 GEMINI_API_KEY not found in Streamlit Secrets. Please add it in the dashboard.")
+    st.stop() # Stops the app from running if the key is missing
 
 if 'engine' not in st.session_state:
     st.session_state.engine = HarnessExecutionEngine()
@@ -26,12 +25,11 @@ with st.sidebar:
     st.header("⚙️ Engine Status")
     st.write(f"**Failed Attempts:** {engine.failed_attempts}")
     st.write(f"**Max Failures:** {engine.max_failures}")
-    
     status_icon = "✅" if engine.verification_passed else "❌"
     st.write(f"**Verification Passed:** {status_icon}")
 
 # --- MAIN PAGE ---
-task = st.text_input("Enter Task Prompt:", placeholder="e.g., Run telemetry check or fail test")
+task = st.text_input("Enter Task Prompt:", placeholder="e.g., What is 2+2?")
 
 col1, col2 = st.columns(2)
 
@@ -41,7 +39,8 @@ with col1:
             st.warning("⚠️ Please enter a task prompt before executing.")
         else:
             with st.spinner("Running verification loops..."):
-                result = engine.run_harness(task)
+                # PASS THE API KEY AS AN ARGUMENT HERE
+                result = engine.run_harness(task, api_key=API_KEY)
                 
                 if result.get("status") == "SUCCESS":
                     st.success(f"✅ **Success:** {result.get('answer')}")
