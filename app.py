@@ -1,72 +1,79 @@
 # =====================================================================
-# STRESS TEST SUITE FOR HARNESS EXECUTION ENGINE (test_harness.py)
+# HARNESS EXECUTION ENGINE (harness.py)
 # =====================================================================
-import unittest
-from harness import HarnessExecutionEngine
 
-class TestHarnessExecutionEngine(unittest.TestCase):
-    
-    def setUp(self):
-        # Initialize with low threshold (max_failures=2) for fast testing
-        self.engine = HarnessExecutionEngine(max_steps=5, max_failures=2)
+class HarnessExecutionEngine:
+    """
+    Execution engine with built-in failure tracking, safety lockout gates,
+    and input validation.
+    """
 
-    def test_01_successful_execution(self):
-        """Verify normal success path resets failure counter."""
-        res = self.engine.run_harness("Process test data normal flow")
-        self.assertEqual(res["status"], "SUCCESS")
-        self.assertTrue(self.engine.verification_passed)
-        self.assertEqual(self.engine.failed_attempts, 0)
+    def __init__(self, max_steps: int = 5, max_failures: int = 2):
+        self.max_steps = max_steps
+        self.max_failures = max_failures
+        self.failed_attempts = 0
+        self.verification_passed = False
 
-    def test_02_simulated_tool_failure(self):
-        """Verify tool failures increment failure counter."""
-        res = self.engine.run_harness("Trigger a fail condition")
-        self.assertEqual(res["status"], "FAILED")
-        self.assertEqual(res["failed_attempts"], 1)
-        self.assertFalse(self.engine.verification_passed)
+    def run_harness(self, prompt) -> dict:
+        """
+        Executes a harness step with safety lockout and edge-case validation.
+        """
+        # 1. Check safety lockout gate first
+        if self.failed_attempts >= self.max_failures:
+            self.verification_passed = False
+            return {
+                "status": "FAILED",
+                "reason": "ENGINEERING_SAFETY_VIOLATION: Max failure threshold reached.",
+                "failed_attempts": self.failed_attempts,
+                "requires_reset": True,
+            }
 
-    def test_03_safety_lockout_gate(self):
-        """Verify max failures triggers the safety lockout gate."""
-        # 1st failure
-        self.engine.run_harness("fail step one")
-        # 2nd failure (hits max_failures=2)
-        self.engine.run_harness("fail step two")
-        
-        # 3rd attempt should trigger the hard lockout gate even with a valid prompt
-        lockout_res = self.engine.run_harness("Normal valid prompt post-lockout")
-        self.assertEqual(lockout_res["status"], "FAILED")
-        self.assertTrue(lockout_res.get("requires_reset", False))
-        self.assertIn("ENGINEERING_SAFETY_VIOLATION", lockout_res["reason"])
+        # 2. Validate None input
+        if prompt is None:
+            self.verification_passed = False
+            return {
+                "status": "FAILED",
+                "reason": "INVALID_INPUT: Prompt cannot be None.",
+                "failed_attempts": self.failed_attempts,
+            }
 
-    def test_04_manual_reset(self):
-        """Verify manual reset clears lockout state and failure counts."""
-        self.engine.run_harness("fail step one")
-        self.engine.run_harness("fail step two")
-        
-        # Perform reset
-        reset_res = self.engine.reset_harness()
-        self.assertEqual(reset_res["status"], "RESET")
-        self.assertEqual(self.engine.failed_attempts, 0)
-        self.assertFalse(self.engine.verification_passed)
-        
-        # Subsequent prompt should succeed now
-        success_res = self.engine.run_harness("Valid execution post-reset")
-        self.assertEqual(success_res["status"], "SUCCESS")
+        # 3. Coerce to string (handles integers/other types) and check whitespace
+        prompt_str = str(prompt).strip()
+        if not prompt_str:
+            self.verification_passed = False
+            return {
+                "status": "FAILED",
+                "reason": "EMPTY_PROMPT: Prompt cannot be empty or whitespace.",
+                "failed_attempts": self.failed_attempts,
+            }
 
-    def test_05_extreme_edge_inputs(self):
-        """Verify empty, whitespace, and invalid type inputs are safely caught."""
-        # Whitespace test
-        res_ws = self.engine.run_harness("   ")
-        self.assertEqual(res_ws["status"], "FAILED")
-        self.assertIn("EMPTY_PROMPT", res_ws["reason"])
+        # 4. Simulated tool failure condition
+        if "fail" in prompt_str.lower():
+            self.failed_attempts += 1
+            self.verification_passed = False
+            return {
+                "status": "FAILED",
+                "reason": "SIMULATED_TOOL_FAILURE: Execution encountered a fail condition.",
+                "failed_attempts": self.failed_attempts,
+                "requires_reset": self.failed_attempts >= self.max_failures,
+            }
 
-        # None type test
-        res_none = self.engine.run_harness(None)
-        self.assertEqual(res_none["status"], "FAILED")
-        self.assertIn("INVALID_INPUT", res_none["reason"])
+        # 5. Normal success path resets failure counter
+        self.failed_attempts = 0
+        self.verification_passed = True
+        return {
+            "status": "SUCCESS",
+            "answer": f"Executed: {prompt_str}",  # Aligned with app.py expectation
+            "failed_attempts": self.failed_attempts,
+        }
 
-        # Integer type test (coerced safely)
-        res_int = self.engine.run_harness(12345)
-        self.assertEqual(res_int["status"], "SUCCESS")
-
-if __name__ == "__main__":
-    unittest.main()
+    def reset_harness(self, *args, **kwargs) -> dict:
+        """
+        Manually resets failure counters and clears safety lockout state.
+        """
+        self.failed_attempts = 0
+        self.verification_passed = False
+        return {
+            "status": "RESET",
+            "failed_attempts": self.failed_attempts,
+        }
