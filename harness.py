@@ -55,8 +55,9 @@ class HarnessExecutionEngine:
 
             client = genai.Client(api_key=api_key)
             
+            # Using gemini-1.5-flash as it is the most stable for new keys
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-1.5-flash",
                 contents=sanitized_prompt
             )
             
