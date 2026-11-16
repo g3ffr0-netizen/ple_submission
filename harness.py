@@ -54,7 +54,7 @@ class HarnessExecutionEngine:
             # --- PASTE YOUR ACTUAL KEY BETWEEN THE QUOTES ON THE NEXT LINE ---
             api_key = "PASTE_YOUR_KEY_HERE"
             
-            if not api_key or api_key == "PASTE_YOUR_KEY_HERE":
+AQ.Ab8RN6KUchgsII7jE73otZH5hLd5KK3nZd6xLs7pLslRHR5U0Q
                 raise ValueError("Missing key. Paste it into harness.py.")
 
             client = genai.Client(api_key=api_key)
