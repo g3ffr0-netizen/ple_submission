@@ -9,7 +9,7 @@ st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", l
 st.title("🛡️ Sovereign Harness Execution Portal")
 
 # --- HARDCODED API KEY ASSIGNMENT ---
-API_KEY = "AQ.Ab8RN6JsfYngC6CWjxQ8okfc-HXFc1CcVTDak5qFrJnBGeS1Lg"
+API_KEY = "AQ.Ab8RN6K6qnt8f7wMmVG3epeZoFwDbXxz4xxbm3Q_eh2MrNqdLg"
 
 if not API_KEY or API_KEY == "PASTE_YOUR_KEY_HERE":
     st.error("🚨 Please provide a valid API key on line 12 of app.py!")
