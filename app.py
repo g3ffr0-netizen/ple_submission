@@ -1,19 +1,21 @@
+import streamlit as st
+import sys
 import os
+
+# --- DIAGNOSTIC (Remove this later) ---
 st.write("--- DIAGNOSTIC ---")
 st.write("Is the key in the environment?", "YES" if os.environ.get("GEMINI_API_KEY") else "NO")
 if os.environ.get("GEMINI_API_KEY"):
     st.write("Key starts with:", os.environ.get("GEMINI_API_KEY")[:5])
-st.write("------------------")import streamlit as st
-import sys
-import os
+st.write("------------------")
 
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from harness import HarnessExecutionEngine
 
-# Page configuration
 st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", layout="centered")
+st.title("🛡️ Sovereign Harness Execution Portal")
+st.markdown("*Submit tasks directly to the verified execution harness with automated safety gates.*")
 
-# Initialize the engine
 if 'engine' not in st.session_state:
     st.session_state.engine = HarnessExecutionEngine()
 
@@ -25,18 +27,12 @@ with st.sidebar:
     st.write(f"**Failed Attempts:** {engine.failed_attempts}")
     st.write(f"**Max Failures:** {engine.max_failures}")
     
-    # Safely display the boolean
     status_icon = "✅" if engine.verification_passed else "❌"
     st.write(f"**Verification Passed:** {status_icon}")
 
 # --- MAIN PAGE ---
-st.title("🛡️ Sovereign Harness Execution Portal")
-st.markdown("*Submit tasks directly to the verified execution harness with automated safety gates.*")
-
-# Input box
 task = st.text_input("Enter Task Prompt:", placeholder="e.g., Run telemetry check or fail test")
 
-# Buttons
 col1, col2 = st.columns(2)
 
 with col1:
