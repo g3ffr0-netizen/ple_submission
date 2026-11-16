@@ -51,7 +51,7 @@ class HarnessExecutionEngine:
             return fail_res
 
         try:
-            # --- PASTE YOUR ACTUAL KEY BETWEEN THE QUOTES ON THE NEXT LINE ---
+           AQ.Ab8RN6K2mL9a1b-NAQXCgq-vK5pGL-eVVJlbUipnupyzniMOTw
             import os
 from google import genai
 
