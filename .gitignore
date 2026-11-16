@@ -1,17 +1,58 @@
-# Python bytecode & cache
-__pycache__/
-*.py[cod]
-*$py.class
+# =====================================================================
+# SOVEREIGN HARNESS EXECUTION PORTAL (app.py)
+# =====================================================================
+import streamlit as st
+import sys
+import os
 
-# Streamlit local cache & config
-.streamlit/
+# Ensure the app can find harness.py in the same directory
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 
-# Local data and submission files (keep these off GitHub!)
-test.csv
-train.csv
-submission.csv
-*.csv
+from harness import HarnessExecutionEngine
 
-# OS generated files
-.DS_Store
-Thumbs.db
+st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", layout="centered")
+st.title("🛡️ Sovereign Harness Execution Portal")
+st.markdown("*Submit tasks directly to the verified execution harness with automated safety gates.*")
+
+# Initialize engine in session state so it persists across reruns
+if 'engine' not in st.session_state:
+    st.session_state.engine = HarnessExecutionEngine()
+
+engine = st.session_state.engine
+
+# Sidebar / Status metrics for observability
+with st.sidebar:
+    st.header("⚙️ Engine Status")
+    st.metric(label="Failed Attempts", value=engine.failed_attempts)
+    st.metric(label="Max Failures Threshold", value=engine.max_failures)
+    
+    # Convert boolean to string for cleaner UI rendering
+    passed_str = "✅ True" if engine.verification_passed else "❌ False"
+    st.metric(label="Verification Passed", value=passed_str)
+
+# UI Layout
+task = st.text_input("Enter Task Prompt:", placeholder="e.g., Run telemetry check or fail test")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    if st.button("Execute Harness Task", use_container_width=True):
+        if not task.strip():
+            st.warning("⚠️ Please enter a task prompt before executing.")
+        else:
+            with st.spinner("Running verification loops..."):
+                result = engine.run_harness(task)
+                
+                # Matches the 'answer' key from harness.py
+                if result.get("status") == "SUCCESS":
+                    st.success(f"✅ **Success:** {result.get('answer')}")
+                elif result.get("requires_reset"):
+                    st.error(f"🛑 **Lockout:** {result.get('reason')}")
+                else:
+                    st.warning(f"⚠️ **Failed:** {result.get('reason')} (Attempt {result.get('failed_attempts')}/{engine.max_failures})")
+
+with col2:
+    if st.button("Reset Engine State", use_container_width=True):
+        engine.reset_harness()
+        st.info("🔄 Engine state has been reset. Failure counter is back to 0.")
+        st.rerun()
