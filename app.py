@@ -8,8 +8,13 @@ from harness import HarnessExecutionEngine
 st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", layout="centered")
 st.title("🛡️ Sovereign Harness Execution Portal")
 
-# --- HARDCODED API KEY ---
-API_KEY = "AQ.Ab8RN6KleH5EIHrg7T-06lL9VDKxnYhpc-LKn_WSZLMKO71MrA"
+# --- HARDCODED KEY TO BYPASS STREAMLIT SECRETS BUG ---
+# Replace the text inside the quotes with your actual key
+API_KEY = "PASTE_YOUR_KEY_HERE"
+
+if API_KEY == "PASTE_YOUR_KEY_HERE":
+    st.error("🚨 You forgot to paste your API key on line 12 of app.py!")
+    st.stop()
 
 if 'engine' not in st.session_state:
     st.session_state.engine = HarnessExecutionEngine()
@@ -35,7 +40,6 @@ with col1:
             st.warning("⚠️ Please enter a task prompt before executing.")
         else:
             with st.spinner("Running verification loops..."):
-                # PASS THE HARDCODED API KEY AS AN ARGUMENT HERE
                 result = engine.run_harness(task, api_key=API_KEY)
                 
                 if result.get("status") == "SUCCESS":
