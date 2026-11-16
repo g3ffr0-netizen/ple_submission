@@ -1,57 +1,74 @@
 # =====================================================================
-# MACHINE LEARNING PIPELINE & SUBMISSION GENERATOR (pipeline.py)
-# Handles data preprocessing, inference, and schema-compliant export.
+# STRESS TEST SUITE FOR HARNESS EXECUTION ENGINE (test_harness.py)
 # =====================================================================
+import unittest
+from harness import HarnessExecutionEngine
 
-import os
-import pandas as pd
-import numpy as np
-
-def run_inference_pipeline(test_data_path: str = "test.csv", output_path: str = "submission.csv") -> pd.DataFrame:
-    """
-    Executes the data preprocessing pipeline, loads test records, 
-    generates predictions, and outputs a strict Kaggle-compliant submission CSV.
-    """
-    print(f"🚀 Initializing pipeline. Loading test data from: {test_data_path}")
+class TestHarnessExecutionEngine(unittest.TestCase):
     
-    try:
-        # 1. Load test dataset (with fallback dummy data if file is missing for demo/testing)
-        if os.path.exists(test_data_path):
-            df_test = pd.read_csv(test_data_path)
-        else:
-            print(f"⚠️ Warning: '{test_data_path}' not found. Generating sample submission dataframe for validation.")
-            df_test = pd.DataFrame({
-                "id": [1001, 1002, 1003, 1004, 1005],
-                "feature_1": [0.55, 0.12, 0.89, 0.43, 0.77]
-            })
+    def setUp(self):
+        # Initialize fresh engine instance before each test
+        self.engine = HarnessExecutionEngine(max_steps=5, max_failures=2)
 
-        # 2. Extract identifiers and perform inference/feature processing
-        # (Replace this sample probability calculation with your trained model `.predict_proba()` logic)
-        if "id" in df_test.columns:
-            record_ids = df_test["id"]
-        else:
-            record_ids = pd.Series(range(len(df_test)))
+    def test_01_successful_execution(self):
+        """Verify normal success path resets failure counter and logs history."""
+        res = self.engine.run_harness("Process telemetry data normal flow")
+        self.assertEqual(res["status"], "SUCCESS")
+        self.assertTrue(self.engine.verification_passed)
+        self.assertEqual(self.engine.failed_attempts, 0)
+        self.assertEqual(len(self.engine.history), 1)
 
-        # Example mock inference (Substitute your model here, e.g., model.predict(df_test))
-        np.random.seed(42)
-        mock_predictions = np.random.uniform(0.0, 1.0, size=len(df_test))
+    def test_02_simulated_tool_failure(self):
+        """Verify tool failures increment failure counter correctly."""
+        res = self.engine.run_harness("Trigger a fail condition")
+        self.assertEqual(res["status"], "FAILED")
+        self.assertEqual(res["failed_attempts"], 1)
+        self.assertFalse(self.engine.verification_passed)
 
-        # 3. Construct schema-compliant submission dataframe
-        submission_df = pd.DataFrame({
-            "id": record_ids,
-            "prediction": mock_predictions,
-            "verification_passed": True
-        })
+    def test_03_safety_lockout_gate(self):
+        """Verify max failures triggers the hard engineering safety lockout gate."""
+        # 1st failure
+        self.engine.run_harness("fail step one")
+        # 2nd failure (hits max_failures=2 threshold)
+        self.engine.run_harness("fail step two")
+        
+        # 3rd attempt must trigger the lockout even with a valid prompt
+        lockout_res = self.engine.run_harness("Valid execution prompt post-lockout")
+        self.assertEqual(lockout_res["status"], "FAILED")
+        self.assertTrue(lockout_res.get("requires_reset", False))
+        self.assertIn("ENGINEERING_SAFETY_VIOLATION", lockout_res["reason"])
 
-        # 4. Safe export to CSV
-        submission_df.to_csv(output_path, index=False)
-        print(f"✅ Submission successfully generated and saved to: {output_path}")
-        return submission_df
+    def test_04_manual_reset(self):
+        """Verify manual reset clears lockout state and resets counters."""
+        self.engine.run_harness("fail step one")
+        self.engine.run_harness("fail step two")
+        
+        # Execute reset
+        reset_res = self.engine.reset_harness()
+        self.assertEqual(reset_res["status"], "RESET")
+        self.assertEqual(self.engine.failed_attempts, 0)
+        self.assertFalse(self.engine.verification_passed)
+        
+        # Subsequent prompt should execute successfully
+        success_res = self.engine.run_harness("Valid execution post-reset")
+        self.assertEqual(success_res["status"], "SUCCESS")
 
-    except Exception as e:
-        print(f"❌ Pipeline Execution Failed: {str(e)}")
-        raise e
+    def test_05_edge_case_inputs(self):
+        """Verify empty, whitespace, None-type, and coerced inputs are safely handled."""
+        # Whitespace test -> FAILED
+        res_ws = self.engine.run_harness("   ")
+        self.assertEqual(res_ws["status"], "FAILED")
+        self.assertIn("EMPTY_PROMPT", res_ws["reason"])
+
+        # None type test -> FAILED
+        res_none = self.engine.run_harness(None)
+        self.assertEqual(res_none["status"], "FAILED")
+        self.assertIn("INVALID_INPUT", res_none["reason"])
+
+        # Integer coercion test -> SUCCESS (fresh engine instance)
+        fresh_engine = HarnessExecutionEngine(max_failures=2)
+        res_int = fresh_engine.run_harness(9999)
+        self.assertEqual(res_int["status"], "SUCCESS")
 
 if __name__ == "__main__":
-    # Test execution when run directly
-    run_inference_pipeline()
+    unittest.main()
