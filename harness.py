@@ -1,7 +1,5 @@
-# =====================================================================
-# VERIFICATION & EXECUTION HARNESS (harness.py)
-# Enforces safety gates, tool retries, hallucination blocking, and lockout resets.
-# =====================================================================
+import os
+from google import genai
 
 class HarnessExecutionEngine:
     def __init__(self, max_steps: int = 15, max_failures: int = 3):
@@ -12,72 +10,59 @@ class HarnessExecutionEngine:
         self.history = []
 
     def generate_artifacts(self, task_prompt: str, result_payload: dict):
-        """Log and store execution artifacts for complete auditability."""
-        self.history.append({
-            "prompt": task_prompt,
-            "outcome": result_payload
-        })
+        self.history.append({"prompt": task_prompt, "outcome": result_payload})
 
     def run_harness(self, task_prompt: str) -> dict:
-        """Main execution loop entry point with enhanced input sanitization, 
-        verification gates, and automatic reset on success."""
         try:
-            # 1. Enhanced Input Sanitization & Type Enforcement
-            if task_prompt is None:
-                raise ValueError("INVALID_INPUT: task_prompt cannot be None.")
-            
-            if not isinstance(task_prompt, str):
-                # Safely coerce ints/floats to strings so they don't crash the app
-                task_prompt = str(task_prompt)
-            
+            # 1. Sanitization
+            if not task_prompt or not isinstance(task_prompt, str):
+                raise ValueError("INVALID_INPUT: task_prompt must be a non-empty string.")
             sanitized_prompt = task_prompt.strip()
             if len(sanitized_prompt) == 0:
-                raise ValueError("EMPTY_PROMPT: Task prompt cannot be blank or whitespace-only.")
+                raise ValueError("EMPTY_PROMPT: Task prompt cannot be blank.")
 
-            # 2. Enforce Verification Thresholds (THE SAFETY LOCKOUT GATE)
+            # 2. Lockout Gate
             if self.failed_attempts >= self.max_failures:
-                fail_res = {
-                    "status": "FAILED", 
-                    "reason": f"ENGINEERING_SAFETY_VIOLATION: Max failure threshold ({self.max_failures}) reached. Please reset harness state.",
-                    "requires_reset": True
-                }
-                self.generate_artifacts(sanitized_prompt, fail_res)
-                return fail_res
+                return {"status": "FAILED", "reason": "ENGINEERING_SAFETY_VIOLATION: Max failures reached.", "requires_reset": True}
 
-            # 3. Execution Simulation / Tool Routing
-            if "fail" in sanitized_prompt.lower():
-                raise RuntimeError("SIMULATED_TOOL_FAILURE: External tool returned a 500 error.")
+            # 3. THE ACTUAL GEMINI CALL
+            api_key = os.environ.get("GEMINI_API_KEY")
+            if not api_key:
+                raise ValueError("Missing GEMINI_API_KEY environment variable.")
 
-            # 4. SUCCESS PATH & STATE RESET
-            self.failed_attempts = 0 
+            client = genai.Client(api_key=api_key)
+            
+            # Send the prompt to Gemini
+            response = client.models.generate_content(
+                model="gemini-2.5-flash", # Using flash for speed and cost
+                contents=sanitized_prompt
+            )
+            
+            # 4. Success
+            self.failed_attempts = 0
             self.verification_passed = True
             
             final_output = {
                 "status": "SUCCESS",
-                "answer": f"Successfully executed and verified: {sanitized_prompt}",
+                "answer": response.text, # The actual AI response!
                 "history_length": len(self.history)
             }
             self.generate_artifacts(sanitized_prompt, final_output)
             return final_output
 
         except Exception as e:
-            # FAILURE PATH & INCREMENT RETRY COUNTER
             self.verification_passed = False
             self.failed_attempts += 1
-            
             fail_res = {
                 "status": "FAILED",
                 "reason": str(e),
                 "failed_attempts": self.failed_attempts,
                 "max_attempts": self.max_failures
             }
-            # Safely handle None types in the failure logger
-            safe_prompt = str(task_prompt) if task_prompt is not None else "UNKNOWN_PROMPT"
-            self.generate_artifacts(safe_prompt, fail_res)
+            self.generate_artifacts(task_prompt or "UNKNOWN", fail_res)
             return fail_res
 
     def reset_harness(self):
-        """Manually resets failure counters and verification state after a lockout."""
         self.failed_attempts = 0
         self.verification_passed = False
         return {"status": "RESET", "message": "Harness state reset successfully."}
