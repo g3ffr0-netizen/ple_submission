@@ -8,11 +8,11 @@ from harness import HarnessExecutionEngine
 st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", layout="centered")
 st.title("🛡️ Sovereign Harness Execution Portal")
 
-# --- HARDCODED KEY TO BYPASS STREAMLIT SECRETS BUG ---
-gen-lang-client-0195127873
+# --- HARDCODED API KEY ASSIGNMENT ---
+API_KEY = "AIzaSyDr9wW05Vp5vV..."
 
-if API_KEY == "PASTE_YOUR_KEY_HERE":
-    st.error("🚨 You forgot to paste your API key on line 12 of app.py!")
+if not API_KEY or API_KEY == "PASTE_YOUR_KEY_HERE":
+    st.error("🚨 Please provide a valid Google AI Studio API key on line 12 of app.py!")
     st.stop()
 
 if 'engine' not in st.session_state:
