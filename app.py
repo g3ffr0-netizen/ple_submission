@@ -1,4 +1,9 @@
-import streamlit as st
+import os
+st.write("--- DIAGNOSTIC ---")
+st.write("Is the key in the environment?", "YES" if os.environ.get("GEMINI_API_KEY") else "NO")
+if os.environ.get("GEMINI_API_KEY"):
+    st.write("Key starts with:", os.environ.get("GEMINI_API_KEY")[:5])
+st.write("------------------")import streamlit as st
 import sys
 import os
 
