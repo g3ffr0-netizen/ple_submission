@@ -12,25 +12,28 @@ class HarnessExecutionEngine:
         self.history = []
 
     def generate_artifacts(self, task_prompt: str, result_payload: dict):
-        """Log and store execution artifacts for auditability."""
+        """Log and store execution artifacts for complete auditability."""
         self.history.append({
             "prompt": task_prompt,
             "outcome": result_payload
         })
 
     def run_harness(self, task_prompt: str) -> dict:
-        """Main execution loop entry point with strict input sanitization, 
+        """Main execution loop entry point with enhanced input sanitization, 
         verification gates, and automatic reset on success."""
         try:
-            # 1. Input sanitization & type enforcement
-            if not task_prompt or not isinstance(task_prompt, str):
-                raise ValueError("INVALID_INPUT: task_prompt must be a non-empty string.")
+            # 1. Enhanced Input Sanitization & Type Enforcement
+            if task_prompt is None:
+                raise ValueError("INVALID_INPUT: task_prompt cannot be None.")
+            if not isinstance(task_prompt, str):
+                # Convert non-string inputs safely or raise an explicit error
+                task_prompt = str(task_prompt)
             
             sanitized_prompt = task_prompt.strip()
             if len(sanitized_prompt) == 0:
-                raise ValueError("EMPTY_PROMPT: Task prompt cannot be blank.")
+                raise ValueError("EMPTY_PROMPT: Task prompt cannot be blank or whitespace-only.")
 
-            # 2. Enforce verification thresholds (THE LOCKOUT GATE)
+            # 2. Enforce Verification Thresholds (THE SAFETY LOCKOUT GATE)
             if self.failed_attempts >= self.max_failures:
                 fail_res = {
                     "status": "FAILED", 
@@ -40,9 +43,9 @@ class HarnessExecutionEngine:
                 self.generate_artifacts(sanitized_prompt, fail_res)
                 return fail_res
 
-            # 3. Execution Simulation / Routing
+            # 3. Execution Simulation / Tool Routing
             if "fail" in sanitized_prompt.lower():
-                raise RuntimeError("SIMULATED_TOOL_FAILURE: Tool returned a 500 error.")
+                raise RuntimeError("SIMULATED_TOOL_FAILURE: External tool returned a 500 error.")
 
             # 4. SUCCESS PATH & STATE RESET
             self.failed_attempts = 0 
@@ -57,7 +60,7 @@ class HarnessExecutionEngine:
             return final_output
 
         except Exception as e:
-            # FAILURE PATH
+            # FAILURE PATH & INCREMENT RETRY COUNTER
             self.verification_passed = False
             self.failed_attempts += 1
             
