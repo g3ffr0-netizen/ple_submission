@@ -1,8 +1,0 @@
-# Move the files back into your clean folder structure
-mv ple_submission_app.py ple_submission/app.py
-mv ple_submission_harness.py ple_submission/harness.py
-
-# Stage, commit, and push the cleaned structure
-git add ple_submission/
-git commit -m "Refactor: Clean up filenames and organize package structure"
-git push origin main
