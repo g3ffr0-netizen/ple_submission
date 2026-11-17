@@ -55,9 +55,9 @@ class HarnessExecutionEngine:
 
             client = genai.Client(api_key=api_key)
             
-            # This is where the model goes!
+            # Updated model to 3.8-flash as per Google's latest API requirement
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.8-flash",
                 contents=sanitized_prompt
             )
             
