@@ -1,12 +1,21 @@
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 class HarnessExecutionEngine:
     def __init__(self, model_name: str = "gemini-2.0-flash"):
         self.client = genai.Client()
         self.model_name = model_name
 
+    @retry(
+        # Retry only on GenAI API errors (which covers 429 rate limits and 5xx server errors)
+        retry=retry_if_exception_type(APIError),
+        # Wait exponentially: 2s -> 4s -> 8s (up to 3 attempts total)
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        stop=stop_after_attempt(3),
+        reraise=True # Reraise the final exception if all retries fail
+    )
     def run_inference(
         self, 
         prompt: str, 
@@ -14,29 +23,16 @@ class HarnessExecutionEngine:
         temperature: float = 0.7
     ) -> str:
         """
-        Runs inference with try/except error handling for GenAI API errors.
+        Runs inference with automatic exponential backoff for rate limits.
         """
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
             temperature=temperature,
         )
 
-        try:
-            response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=prompt,
-                config=config,
-            )
-            return response.text or ""
-            
-        except APIError as e:
-            # Handle specific API errors (e.g., quota limits, invalid keys, server errors)
-            error_message = f"Gemini API Error [{e.code}]: {e.message}"
-            print(error_message) # Logs to terminal/Streamlit logs
-            return f"⚠️ **Execution Failed:** {error_message}"
-            
-        except Exception as e:
-            # Handle any other unexpected runtime exceptions (e.g., network drops)
-            error_message = f"Unexpected Error: {str(e)}"
-            print(error_message)
-            return f"⚠️ **Execution Failed:** {error_message}"
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=prompt,
+            config=config,
+        )
+        return response.text or ""
