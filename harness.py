@@ -1,4 +1,5 @@
 import os
+import streamlit as st
 from typing import Optional
 from google import genai
 from google.genai import types
@@ -6,7 +7,6 @@ from google.genai.errors import APIError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from pydantic import BaseModel, Field
 
-# 1. Define the structured schema for model evaluations
 class HarnessEvaluationResult(BaseModel):
     is_successful: bool = Field(
         description="Whether the task prompt passed evaluation."
@@ -20,8 +20,17 @@ class HarnessEvaluationResult(BaseModel):
 
 class HarnessExecutionEngine:
     def __init__(self, model_name: str = "gemini-2.0-flash"):
-        # Automatically pick up GEMINI_API_KEY from environment variables / st.secrets
-        api_key = os.environ.get("GEMINI_API_KEY")
+        # 1. Check Streamlit secrets first, then environment variables
+        api_key = None
+        try:
+            if "GEMINI_API_KEY" in st.secrets:
+                api_key = st.secrets["GEMINI_API_KEY"]
+        except Exception:
+            pass
+            
+        if not api_key:
+            api_key = os.environ.get("GEMINI_API_KEY")
+
         if api_key:
             self.client = genai.Client(api_key=api_key)
         else:
@@ -38,9 +47,6 @@ class HarnessExecutionEngine:
         temperature: float = 0.2,
         simulate_errors: bool = False
     ) -> HarnessEvaluationResult:
-        """
-        Runs structured inference with tenacity retries and Pydantic validation.
-        """
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
             temperature=temperature,
@@ -56,7 +62,6 @@ class HarnessExecutionEngine:
             reraise=True
         )
         def _execute():
-            # Optional simulation toggle for testing retry backoff in the UI
             if simulate_errors and self._test_failure_count < 2:
                 self._test_failure_count += 1
                 raise APIError(code=429, message="Simulated rate limit for testing retry backoff.")
@@ -73,7 +78,6 @@ class HarnessExecutionEngine:
         return _execute()
 
     def _log_retry(self, retry_state, callback):
-        """Helper triggered by tenacity before sleeping/retrying."""
         attempt = retry_state.attempt_number
         exception = retry_state.outcome.exception()
         wait_time = getattr(retry_state.next_action, "sleep", 0)
