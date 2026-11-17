@@ -24,28 +24,25 @@ class HarnessExecutionEngine:
         self.model_name = model_name
         self._test_failure_count = 0
 
-        # 2. Resolve API Key (Streamlit Secrets -> Environment Variables)
+        # 2. Resolve API Key (Secrets -> Environment)
         api_key = None
         try:
-            # Check Streamlit Secrets first
             if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
                 api_key = st.secrets["GEMINI_API_KEY"]
         except Exception:
             pass
             
         if not api_key:
-            # Fallback to environment variable
             api_key = os.environ.get("GEMINI_API_KEY")
 
-        # 3. Initialize Client (Forced Developer API to avoid Vertex AI crash)
         if not api_key:
-            raise ValueError("Missing API Key. Please set GEMINI_API_KEY in Streamlit Secrets or environment variables.")
+            raise ValueError("Missing API Key. Set GEMINI_API_KEY in Streamlit Secrets.")
 
+        # 3. FORCE Developer API (vertexai=False) to prevent the Vertex AI crash
         try:
-            # vertexai=False forces the use of the standard Gemini API, not Google Cloud Vertex
             self.client = genai.Client(api_key=api_key, vertexai=False)
         except Exception as e:
-            raise RuntimeError(f"Failed to initialize Google GenAI Client: {str(e)}")
+            raise RuntimeError(f"Failed to initialize GenAI Client: {str(e)}")
 
     def run_structured_inference(
         self, 
@@ -72,11 +69,10 @@ class HarnessExecutionEngine:
             reraise=True
         )
         def _execute():
-            # Simulate errors for testing the retry logic
+            # Simulate errors for testing retry logic
             if simulate_errors and self._test_failure_count < 2:
                 self._test_failure_count += 1
-                # Note: Using a generic Exception here since APIError constructor can be finicky
-                raise APIError(429, {"message": "Simulated rate limit for testing retry backoff."})
+                raise APIError(429, {"message": "Simulated rate limit."})
             
             self._test_failure_count = 0
 
@@ -91,14 +87,13 @@ class HarnessExecutionEngine:
             if response.parsed:
                 return response.parsed
             else:
-                raise ValueError("The model returned a response, but it could not be parsed into the expected schema.")
+                raise ValueError("Model returned unparseable response.")
 
         return _execute()
 
     def _log_retry(self, retry_state, callback):
         attempt = retry_state.attempt_number
         exception = retry_state.outcome.exception()
-        # Safely get the wait time
         wait_time = getattr(retry_state.next_action, "sleep", 0) if retry_state.next_action else 0
         
         if callback:
