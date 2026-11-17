@@ -24,25 +24,36 @@ class HarnessExecutionEngine:
         self.model_name = model_name
         self._test_failure_count = 0
 
-        # 2. Resolve API Key (Secrets -> Environment)
+        # Accept either supported environment/Streamlit secret name. Strip
+        # whitespace so a pasted key with a trailing newline is still usable.
         api_key = None
-        try:
-            if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
-                api_key = st.secrets["GEMINI_API_KEY"]
-        except Exception:
-            pass
-            
-        if not api_key:
-            api_key = os.environ.get("GEMINI_API_KEY")
+        for key_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+            try:
+                candidate = st.secrets.get(key_name)
+            except Exception:
+                candidate = None
+            if candidate:
+                api_key = str(candidate).strip()
+                if api_key:
+                    break
+
+            candidate = os.environ.get(key_name)
+            if candidate:
+                api_key = candidate.strip()
+                if api_key:
+                    break
 
         if not api_key:
-            raise ValueError("Missing API Key. Set GEMINI_API_KEY in Streamlit Secrets.")
+            raise ValueError(
+                "Missing Gemini API key. Add GEMINI_API_KEY (or GOOGLE_API_KEY) "
+                "to Streamlit Secrets or the app's environment variables."
+            )
 
-        # 3. FORCE Developer API (vertexai=False) to prevent the Vertex AI crash
+        # Use the Gemini Developer API rather than Vertex AI.
         try:
             self.client = genai.Client(api_key=api_key, vertexai=False)
         except Exception as e:
-            raise RuntimeError(f"Failed to initialize GenAI Client: {str(e)}")
+            raise RuntimeError(f"Failed to initialize GenAI Client: {str(e)}") from e
 
     def run_structured_inference(
         self, 
@@ -98,3 +109,4 @@ class HarnessExecutionEngine:
         
         if callback:
             callback(attempt, str(exception), wait_time)
+
