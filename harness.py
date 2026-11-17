@@ -1,30 +1,53 @@
-import time
+import os
+from typing import Optional
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+from pydantic import BaseModel, Field
+
+# 1. Define the structured schema for model evaluations
+class HarnessEvaluationResult(BaseModel):
+    is_successful: bool = Field(
+        description="Whether the task prompt passed evaluation."
+    )
+    reasoning: str = Field(
+        description="Step-by-step reasoning explaining the result."
+    )
+    confidence_score: float = Field(
+        ge=0.0, le=1.0, description="Confidence score between 0.0 and 1.0."
+    )
 
 class HarnessExecutionEngine:
     def __init__(self, model_name: str = "gemini-2.0-flash"):
-        self.client = genai.Client()
+        # Automatically pick up GEMINI_API_KEY from environment variables / st.secrets
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if api_key:
+            self.client = genai.Client(api_key=api_key)
+        else:
+            self.client = genai.Client()
+            
         self.model_name = model_name
+        self._test_failure_count = 0
 
-    def run_inference_with_status(
+    def run_structured_inference(
         self, 
         prompt: str, 
         status_callback=None,
-        system_instruction: str | None = None, 
-        temperature: float = 0.7
-    ) -> str:
+        system_instruction: Optional[str] = None, 
+        temperature: float = 0.2,
+        simulate_errors: bool = False
+    ) -> HarnessEvaluationResult:
         """
-        Runs inference with tenacity retries and reports status changes via callback.
+        Runs structured inference with tenacity retries and Pydantic validation.
         """
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
             temperature=temperature,
+            response_mime_type="application/json",
+            response_schema=HarnessEvaluationResult,
         )
 
-        # Define the retry behavior dynamically so we can inject the callback
         @retry(
             retry=retry_if_exception_type(APIError),
             wait=wait_exponential(multiplier=1, min=2, max=10),
@@ -33,12 +56,19 @@ class HarnessExecutionEngine:
             reraise=True
         )
         def _execute():
+            # Optional simulation toggle for testing retry backoff in the UI
+            if simulate_errors and self._test_failure_count < 2:
+                self._test_failure_count += 1
+                raise APIError(code=429, message="Simulated rate limit for testing retry backoff.")
+            
+            self._test_failure_count = 0
+
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
                 config=config,
             )
-            return response.text or ""
+            return response.parsed
 
         return _execute()
 
