@@ -1,6 +1,6 @@
 import os
 import streamlit as st
-from typing import Optional
+from typing import Optional, Dict, Any
 from google import genai
 from google.genai import types
 from google.genai.errors import APIError
@@ -13,7 +13,7 @@ class HarnessEvaluationResult(BaseModel):
     confidence_score: float = Field(ge=0.0, le=1.0, description="Confidence score.")
 
 class HarnessExecutionEngine:
-    def __init__(self, model_name: str = "gemini-3.8-flash", max_steps: int = 15, max_failures: int = 3):
+    def __init__(self, model_name: str = "gemini-2.0-flash", max_steps: int = 15, max_failures: int = 3):
         self.model_name = model_name
         self.max_steps = max_steps
         self.max_failures = max_failures
@@ -21,12 +21,12 @@ class HarnessExecutionEngine:
         self.verification_passed = False
         self.history = []
         self._test_failure_count = 0
-
+        
         # Clear conflicting Cloud variables
         os.environ.pop("GOOGLE_CLOUD_PROJECT", None)
         os.environ.pop("GOOGLE_CLOUD_LOCATION", None)
         os.environ.pop("GOOGLE_GENAI_USE_VERTEXAI", None)
-
+        
         # Resolve API Key
         api_key = None
         try:
@@ -37,11 +37,13 @@ class HarnessExecutionEngine:
             
         if not api_key:
             api_key = os.environ.get("GEMINI_API_KEY")
-            if api_key: api_key = api_key.strip()
-
+            
+        if api_key:
+            api_key = api_key.strip()
+            
         if not api_key:
             raise ValueError("Missing API Key. Set GEMINI_API_KEY in Streamlit Secrets.")
-
+            
         # Initialize Client
         self.client = genai.Client(api_key=api_key, vertexai=False)
 
@@ -52,33 +54,37 @@ class HarnessExecutionEngine:
     def run_harness(self, task_prompt, api_key: str = None) -> dict:
         if self.failed_attempts >= self.max_failures:
             return {"status": "FAILED", "reason": "SAFETY_VIOLATION: Max failures reached.", "requires_reset": True}
-        
+            
         if not task_prompt or str(task_prompt).strip() == "":
             self.failed_attempts += 1
             return {"status": "FAILED", "reason": "EMPTY_PROMPT", "failed_attempts": self.failed_attempts, "max_attempts": self.max_failures}
-
+            
         try:
             result = self.run_structured_inference(str(task_prompt))
             self.failed_attempts = 0
             self.verification_passed = True
             return {
-                "status": "SUCCESS",
-                "answer": result.reasoning,
+                "status": "SUCCESS", 
+                "answer": result.reasoning, 
                 "confidence": result.confidence_score
             }
         except Exception as e:
             self.failed_attempts += 1
-            return {"status": "FAILED", "reason": str(e), "failed_attempts": self.failed_attempts, "max_attempts": self.max_failures}
+            return {
+                "status": "FAILED", 
+                "reason": str(e), 
+                "failed_attempts": self.failed_attempts, 
+                "max_attempts": self.max_failures
+            }
 
     # NEW STRUCTURED METHOD
     def run_structured_inference(
         self, 
         prompt: str, 
-        status_callback=None,
+        status_callback=None, 
         system_instruction: Optional[str] = None, 
         temperature: float = 0.2
     ) -> HarnessEvaluationResult:
-        
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
             temperature=temperature,
