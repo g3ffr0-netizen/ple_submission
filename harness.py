@@ -7,6 +7,7 @@ from google.genai.errors import APIError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from pydantic import BaseModel, Field
 
+# --- 1. Define the expected output schema ---
 class HarnessEvaluationResult(BaseModel):
     is_successful: bool = Field(
         description="Whether the task prompt passed evaluation."
@@ -20,24 +21,31 @@ class HarnessEvaluationResult(BaseModel):
 
 class HarnessExecutionEngine:
     def __init__(self, model_name: str = "gemini-2.0-flash"):
-        # 1. Check Streamlit secrets first, then environment variables
+        self.model_name = model_name
+        self._test_failure_count = 0
+
+        # 2. Resolve API Key (Streamlit Secrets -> Environment Variables)
         api_key = None
         try:
-            if "GEMINI_API_KEY" in st.secrets:
+            # Check Streamlit Secrets first
+            if hasattr(st, "secrets") and "GEMINI_API_KEY" in st.secrets:
                 api_key = st.secrets["GEMINI_API_KEY"]
         except Exception:
             pass
             
         if not api_key:
+            # Fallback to environment variable
             api_key = os.environ.get("GEMINI_API_KEY")
 
-        if api_key:
-            self.client = genai.Client(api_key=api_key)
-        else:
-            self.client = genai.Client()
-            
-        self.model_name = model_name
-        self._test_failure_count = 0
+        # 3. Initialize Client (Forced Developer API to avoid Vertex AI crash)
+        if not api_key:
+            raise ValueError("Missing API Key. Please set GEMINI_API_KEY in Streamlit Secrets or environment variables.")
+
+        try:
+            # vertexai=False forces the use of the standard Gemini API, not Google Cloud Vertex
+            self.client = genai.Client(api_key=api_key, vertexai=False)
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize Google GenAI Client: {str(e)}")
 
     def run_structured_inference(
         self, 
@@ -47,6 +55,8 @@ class HarnessExecutionEngine:
         temperature: float = 0.2,
         simulate_errors: bool = False
     ) -> HarnessEvaluationResult:
+        
+        # 4. Configure the generation settings
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
             temperature=temperature,
@@ -62,25 +72,34 @@ class HarnessExecutionEngine:
             reraise=True
         )
         def _execute():
+            # Simulate errors for testing the retry logic
             if simulate_errors and self._test_failure_count < 2:
                 self._test_failure_count += 1
-                raise APIError(code=429, message="Simulated rate limit for testing retry backoff.")
+                # Note: Using a generic Exception here since APIError constructor can be finicky
+                raise APIError(429, {"message": "Simulated rate limit for testing retry backoff."})
             
             self._test_failure_count = 0
 
+            # Execute the API call
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
                 config=config,
             )
-            return response.parsed
+            
+            # Return the parsed Pydantic object
+            if response.parsed:
+                return response.parsed
+            else:
+                raise ValueError("The model returned a response, but it could not be parsed into the expected schema.")
 
         return _execute()
 
     def _log_retry(self, retry_state, callback):
         attempt = retry_state.attempt_number
         exception = retry_state.outcome.exception()
-        wait_time = getattr(retry_state.next_action, "sleep", 0)
+        # Safely get the wait time
+        wait_time = getattr(retry_state.next_action, "sleep", 0) if retry_state.next_action else 0
         
         if callback:
             callback(attempt, str(exception), wait_time)
