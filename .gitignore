@@ -1,37 +1,35 @@
-# =====================================================================
-# SOVEREIGN HARNESS EXECUTION PORTAL (app.py)
-# =====================================================================
 import streamlit as st
 import sys
 import os
 
-# Ensure the app can find harness.py in the same directory
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
-
 from harness import HarnessExecutionEngine
 
 st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", layout="centered")
 st.title("🛡️ Sovereign Harness Execution Portal")
-st.markdown("*Submit tasks directly to the verified execution harness with automated safety gates.*")
 
-# Initialize engine in session state so it persists across reruns
+# --- HARDCODED KEY (Replace this with your real key) ---
+API_KEY = "PASTE_YOUR_KEY_HERE"
+
+if API_KEY == "PASTE_YOUR_KEY_HERE":
+    st.error("🚨 You forgot to paste your API key on line 12 of app.py!")
+    st.stop()
+
 if 'engine' not in st.session_state:
     st.session_state.engine = HarnessExecutionEngine()
 
 engine = st.session_state.engine
 
-# Sidebar / Status metrics for observability
+# --- SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Engine Status")
-    st.metric(label="Failed Attempts", value=engine.failed_attempts)
-    st.metric(label="Max Failures Threshold", value=engine.max_failures)
-    
-    # Convert boolean to string for cleaner UI rendering
-    passed_str = "✅ True" if engine.verification_passed else "❌ False"
-    st.metric(label="Verification Passed", value=passed_str)
+    st.write(f"**Failed Attempts:** {engine.failed_attempts}")
+    st.write(f"**Max Failures:** {engine.max_failures}")
+    status_icon = "✅" if engine.verification_passed else "❌"
+    st.write(f"**Verification Passed:** {status_icon}")
 
-# UI Layout
-task = st.text_input("Enter Task Prompt:", placeholder="e.g., Run telemetry check or fail test")
+# --- MAIN PAGE ---
+task = st.text_input("Enter Task Prompt:", placeholder="e.g., What is 2+2?")
 
 col1, col2 = st.columns(2)
 
@@ -41,9 +39,8 @@ with col1:
             st.warning("⚠️ Please enter a task prompt before executing.")
         else:
             with st.spinner("Running verification loops..."):
-                result = engine.run_harness(task)
+                result = engine.run_harness(task, api_key=API_KEY)
                 
-                # Matches the 'answer' key from harness.py
                 if result.get("status") == "SUCCESS":
                     st.success(f"✅ **Success:** {result.get('answer')}")
                 elif result.get("requires_reset"):
