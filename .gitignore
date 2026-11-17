@@ -8,12 +8,12 @@ from harness import HarnessExecutionEngine
 st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", layout="centered")
 st.title("🛡️ Sovereign Harness Execution Portal")
 
-# --- HARDCODED KEY (Replace this with your real key) ---
-API_KEY = "PASTE_YOUR_KEY_HERE"
-
-if API_KEY == "PASTE_YOUR_KEY_HERE":
-    st.error("🚨 You forgot to paste your API key on line 12 of app.py!")
+# --- SECURE API KEY RESOLUTION ---
+if "GEMINI_API_KEY" not in st.secrets:
+    st.error("🚨 Missing GEMINI_API_KEY in Streamlit Secrets! Please add it in your app settings.")
     st.stop()
+
+API_KEY = st.secrets["GEMINI_API_KEY"]
 
 if 'engine' not in st.session_state:
     st.session_state.engine = HarnessExecutionEngine()
