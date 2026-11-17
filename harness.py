@@ -7,7 +7,6 @@ from google.genai.errors import APIError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from pydantic import BaseModel, Field
 
-# --- 1. Define the expected output schema ---
 class HarnessEvaluationResult(BaseModel):
     is_successful: bool = Field(
         description="Whether the task prompt passed evaluation."
@@ -21,39 +20,24 @@ class HarnessEvaluationResult(BaseModel):
 
 class HarnessExecutionEngine:
     def __init__(self, model_name: str = "gemini-2.0-flash"):
+        # 1. Check Streamlit secrets first, then environment variables
+        api_key = None
+        try:
+            if "GEMINI_API_KEY" in st.secrets:
+                api_key = st.secrets["GEMINI_API_KEY"]
+        except Exception:
+            pass
+            
+        if not api_key:
+            api_key = os.environ.get("GEMINI_API_KEY")
+
+        if api_key:
+            self.client = genai.Client(api_key=api_key)
+        else:
+            self.client = genai.Client()
+            
         self.model_name = model_name
         self._test_failure_count = 0
-
-        # Accept either supported environment/Streamlit secret name. Strip
-        # whitespace so a pasted key with a trailing newline is still usable.
-        api_key = None
-        for key_name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-            try:
-                candidate = st.secrets.get(key_name)
-            except Exception:
-                candidate = None
-            if candidate:
-                api_key = str(candidate).strip()
-                if api_key:
-                    break
-
-            candidate = os.environ.get(key_name)
-            if candidate:
-                api_key = candidate.strip()
-                if api_key:
-                    break
-
-        if not api_key:
-            raise ValueError(
-                "Missing Gemini API key. Add GEMINI_API_KEY (or GOOGLE_API_KEY) "
-                "to Streamlit Secrets or the app's environment variables."
-            )
-
-        # Use the Gemini Developer API rather than Vertex AI.
-        try:
-            self.client = genai.Client(api_key=api_key, vertexai=False)
-        except Exception as e:
-            raise RuntimeError(f"Failed to initialize GenAI Client: {str(e)}") from e
 
     def run_structured_inference(
         self, 
@@ -63,8 +47,6 @@ class HarnessExecutionEngine:
         temperature: float = 0.2,
         simulate_errors: bool = False
     ) -> HarnessEvaluationResult:
-        
-        # 4. Configure the generation settings
         config = types.GenerateContentConfig(
             system_instruction=system_instruction,
             temperature=temperature,
@@ -80,33 +62,25 @@ class HarnessExecutionEngine:
             reraise=True
         )
         def _execute():
-            # Simulate errors for testing retry logic
             if simulate_errors and self._test_failure_count < 2:
                 self._test_failure_count += 1
-                raise APIError(429, {"message": "Simulated rate limit."})
+                raise APIError(code=429, message="Simulated rate limit for testing retry backoff.")
             
             self._test_failure_count = 0
 
-            # Execute the API call
             response = self.client.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
                 config=config,
             )
-            
-            # Return the parsed Pydantic object
-            if response.parsed:
-                return response.parsed
-            else:
-                raise ValueError("Model returned unparseable response.")
+            return response.parsed
 
         return _execute()
 
     def _log_retry(self, retry_state, callback):
         attempt = retry_state.attempt_number
         exception = retry_state.outcome.exception()
-        wait_time = getattr(retry_state.next_action, "sleep", 0) if retry_state.next_action else 0
+        wait_time = getattr(retry_state.next_action, "sleep", 0)
         
         if callback:
             callback(attempt, str(exception), wait_time)
-
