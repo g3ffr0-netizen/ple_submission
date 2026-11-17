@@ -9,7 +9,7 @@ st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", l
 st.title("🛡️ Sovereign Harness Execution Portal")
 
 # --- API KEY CHECK ---
-# (Recommended: Use st.secrets["GEMINI_API_KEY"] instead of hardcoding keys)
+AQ.Ab8RN6L34mmoWxgulJXvaGPVr3OgZKs4ZGmWNbLBCoifCd6sAg
 if "GEMINI_API_KEY" not in st.secrets:
     st.error("🚨 Missing GEMINI_API_KEY in Streamlit Secrets!")
     st.stop()
