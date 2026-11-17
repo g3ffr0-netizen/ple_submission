@@ -1,87 +1,55 @@
 import streamlit as st
+import sys
+import os
+
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from harness import HarnessExecutionEngine
 
+st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", layout="centered")
 st.title("🛡️ Sovereign Harness Execution Portal")
 
-# Initialize session state variables
-if "execution_history" not in st.session_state:
-    st.session_state.execution_history = []
+# --- HARDCODED KEY (Replace this with your real key) ---
+API_KEY = "PASTE_YOUR_KEY_HERE"
 
-if "total_attempts_logged" not in st.session_state:
-    st.session_state.total_attempts_logged = 0
+if API_KEY == "PASTE_YOUR_KEY_HERE":
+    st.error("🚨 You forgot to paste your API key on line 12 of app.py!")
+    st.stop()
 
-# Sidebar metrics & testing toggles
-st.sidebar.title("📊 Session Metrics")
-st.sidebar.metric("Total Executions", len(st.session_state.execution_history))
-st.sidebar.metric("Total Attempts Recorded", st.session_state.total_attempts_logged)
+if 'engine' not in st.session_state:
+    st.session_state.engine = HarnessExecutionEngine()
 
-st.sidebar.markdown("---")
-simulate_test_error = st.sidebar.checkbox("🧪 Simulate API Rate Limit", value=False)
+engine = st.session_state.engine
 
-# Main task input
-task_prompt = st.text_area(
-    "Enter Evaluation Prompt:", 
-    "Evaluate whether the following assistant response correctly answers the user:\nUser: What is the capital of France?\nAssistant: The capital of France is Paris."
-)
+# --- SIDEBAR ---
+with st.sidebar:
+    st.header("⚙️ Engine Status")
+    st.write(f"**Failed Attempts:** {engine.failed_attempts}")
+    st.write(f"**Max Failures:** {engine.max_failures}")
+    status_icon = "✅" if engine.verification_passed else "❌"
+    st.write(f"**Verification Passed:** {status_icon}")
 
-if st.button("Run Structured Harness"):
-    engine = HarnessExecutionEngine()
-    
-    attempt_container = [0]
+# --- MAIN PAGE ---
+task = st.text_input("Enter Task Prompt:", placeholder="e.g., What is 2+2?")
 
-    def count_attempt(attempt_num, error_msg, wait_seconds):
-        attempt_container[0] = attempt_num
+col1, col2 = st.columns(2)
 
-    with st.status("Executing structured harness inference...", expanded=True) as status:
-        try:
-            result = engine.run_structured_inference(
-                prompt=task_prompt, 
-                status_callback=count_attempt,
-                simulate_errors=simulate_test_error
-            )
-            
-            attempt_count = attempt_container[0]
-            if attempt_count == 0:
-                attempt_count = 1
+with col1:
+    if st.button("Execute Harness Task", use_container_width=True):
+        if not task.strip():
+            st.warning("⚠️ Please enter a task prompt before executing.")
+        else:
+            with st.spinner("Running verification loops..."):
+                result = engine.run_harness(task, api_key=API_KEY)
                 
-            status.update(label="✅ Evaluation Successful!", state="complete", expanded=False)
-            
-            # Display structured Pydantic results
-            st.success("Structured Evaluation Results:")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Success", str(result.is_successful))
-            with col2:
-                st.metric("Confidence Score", f"{result.confidence_score * 100:.1f}%")
-            
-            st.write(f"**Reasoning:** {result.reasoning}")
-            
-            # Save to session history
-            st.session_state.execution_history.append({
-                "prompt": task_prompt,
-                "result": f"Success: {result.is_successful} | Confidence: {result.confidence_score} | {result.reasoning}",
-                "attempts": attempt_count,
-                "status": "Success"
-            })
-            st.session_state.total_attempts_logged += attempt_count
-            
-        except Exception as e:
-            failed_attempts = attempt_container[0] or 3
-            st.session_state.execution_history.append({
-                "prompt": task_prompt,
-                "result": str(e),
-                "attempts": failed_attempts,
-                "status": "Failed"
-            })
-            st.session_state.total_attempts_logged += failed_attempts
-            status.update(label="❌ Execution Failed", state="error", expanded=True)
-            st.error(f"Error: {str(e)}")
+                if result.get("status") == "SUCCESS":
+                    st.success(f"✅ **Success:** {result.get('answer')}")
+                elif result.get("requires_reset"):
+                    st.error(f"🛑 **Lockout:** {result.get('reason')}")
+                else:
+                    st.warning(f"⚠️ **Failed:** {result.get('reason')} (Attempt {result.get('failed_attempts')}/{engine.max_failures})")
 
-# Display past execution history logs
-if st.session_state.execution_history:
-    st.markdown("---")
-    st.subheader("📜 Past Execution History")
-    for idx, item in enumerate(reversed(st.session_state.execution_history)):
-        with st.expander(f"Run #{len(st.session_state.execution_history) - idx}: {item['status']} (Attempts: {item['attempts']})"):
-            st.write(f"**Prompt:** {item['prompt']}")
-            st.write(f"**Outcome:** {item['result']}")
+with col2:
+    if st.button("Reset Engine State", use_container_width=True):
+        engine.reset_harness()
+        st.info("🔄 Engine state has been reset. Failure counter is back to 0.")
+        st.rerun()
