@@ -11,7 +11,7 @@ st.title("🛡️ Sovereign Harness Execution Portal")
 # --- HARDCODED KEY (Replace this with your real key) ---
 API_KEY = "PASTE_YOUR_KEY_HERE"
 
-if API_KEY == "PASTE_YOUR_KEY_HERE":
+API_KEY = "AQ.Ab8RN6...your_actual_key_here"
     st.error("🚨 You forgot to paste your API key on line 12 of app.py!")
     st.stop()
 
