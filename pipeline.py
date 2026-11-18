@@ -1,9 +1,5 @@
 # pipeline.py
-"""Offline contract checks for HarnessExecutionEngine.
-
-Run from the repository root:
-    python pipeline.py
-"""
+"""Offline contract checks for HarnessExecutionEngine."""
 
 import unittest
 from unittest.mock import patch
@@ -13,7 +9,6 @@ from harness import HarnessExecutionEngine
 
 class HarnessContractTests(unittest.TestCase):
     def setUp(self):
-        # Prevent tests from creating a real Gemini client.
         client_patcher = patch("harness.genai.Client")
         self.mock_client = client_patcher.start()
         self.addCleanup(client_patcher.stop)
@@ -23,38 +18,45 @@ class HarnessContractTests(unittest.TestCase):
             max_failures=3,
         )
 
-    def test_engine_has_expected_state(self):
+    def test_initial_state(self):
         self.assertEqual(self.engine.max_failures, 3)
         self.assertEqual(self.engine.failed_attempts, 0)
         self.assertFalse(self.engine.verification_passed)
+        self.assertIsInstance(self.engine.history, list)
+        self.assertGreater(self.engine.max_steps, 0)
 
-    def test_engine_exposes_expected_methods(self):
-        required_methods = ("run_harness", "reset_harness")
-        for method in required_methods:
-            with self.subTest(method=method):
-                self.assertTrue(
-                    callable(getattr(self.engine, method, None)),
-                    f"HarnessExecutionEngine is missing {method}()",
-                )
+    def test_required_methods_are_callable(self):
+        for method_name in ("run_harness", "reset_harness"):
+            with self.subTest(method=method_name):
+                method = getattr(self.engine, method_name, None)
+                self.assertTrue(callable(method))
 
-    def test_engine_exposes_history_and_step_limit(self):
-        self.assertTrue(
-            hasattr(self.engine, "history"),
-            "HarnessExecutionEngine is missing history",
-        )
-        self.assertTrue(
-            hasattr(self.engine, "max_steps"),
-            "HarnessExecutionEngine is missing max_steps",
-        )
+    def test_reset_harness_restores_initial_state(self):
+        self.engine.failed_attempts = 2
+        self.engine.verification_passed = True
+        self.engine.history.append({"unexpected": "entry"})
 
-    def test_reset_method_is_callable(self):
-        reset = getattr(self.engine, "reset_harness", None)
-        if not callable(reset):
-            self.skipTest("reset_harness() is not implemented yet")
+        self.engine.reset_harness()
 
-        reset()
         self.assertEqual(self.engine.failed_attempts, 0)
         self.assertFalse(self.engine.verification_passed)
+        self.assertEqual(self.engine.history, [])
+
+    def test_reset_harness_is_safe_after_initialization(self):
+        self.engine.reset_harness()
+        self.engine.reset_harness()
+
+        self.assertEqual(self.engine.failed_attempts, 0)
+        self.assertFalse(self.engine.verification_passed)
+
+    def test_invalid_max_failures_values_are_rejected(self):
+        for value in (-1, 0):
+            with self.subTest(max_failures=value):
+                with self.assertRaises(ValueError):
+                    HarnessExecutionEngine(
+                        api_key="test-key-not-for-real-use",
+                        max_failures=value,
+                    )
 
 
 if __name__ == "__main__":
