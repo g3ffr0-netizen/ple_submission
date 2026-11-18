@@ -8,11 +8,11 @@ venv/
 env/
 .venv/
 
-# Streamlit Secrets (CRITICAL: Prevents committing API keys)
+# Secrets — never commit real API keys
 .streamlit/secrets.toml
 .env
 
-# OS & IDE
+# OS and IDE files
 .DS_Store
 Thumbs.db
 .vscode/
