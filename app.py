@@ -1,9 +1,11 @@
-import streamlit as st
-import sys
 import os
+import sys
+
+import streamlit as st
 
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from harness import HarnessExecutionEngine
+
 
 st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", layout="centered")
 st.title("🛡️ Sovereign Harness Execution Portal")
@@ -15,8 +17,8 @@ except KeyError:
     st.error("🚨 GEMINI_API_KEY not found in Streamlit Secrets. Please add it in the dashboard.")
     st.stop()
 
-if 'engine' not in st.session_state:
-    st.session_state.engine = HarnessExecutionEngine()
+if "engine" not in st.session_state:
+    st.session_state.engine = HarnessExecutionEngine(api_key=API_KEY)
 
 engine = st.session_state.engine
 
@@ -35,18 +37,22 @@ col1, col2 = st.columns(2)
 
 with col1:
     if st.button("Execute Harness Task", use_container_width=True):
-        if not task.strip():
+        clean_task = task.strip()
+        if not clean_task:
             st.warning("⚠️ Please enter a task prompt before executing.")
         else:
             with st.spinner("Running verification loops..."):
-                result = engine.run_harness(task, api_key=API_KEY)
-                
+                result = engine.run_harness(clean_task, api_key=API_KEY)
+
                 if result.get("status") == "SUCCESS":
                     st.success(f"✅ **Success:** {result.get('answer')}")
                 elif result.get("requires_reset"):
                     st.error(f"🛑 **Lockout:** {result.get('reason')}")
                 else:
-                    st.warning(f"⚠️ **Failed:** {result.get('reason')} (Attempt {result.get('failed_attempts')}/{engine.max_failures})")
+                    st.warning(
+                        f"⚠️ **Failed:** {result.get('reason')} "
+                        f"(Attempt {result.get('failed_attempts')}/{engine.max_failures})"
+                    )
 
 with col2:
     if st.button("Reset Engine State", use_container_width=True):

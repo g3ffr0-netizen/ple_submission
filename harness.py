@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Optional
 
 from google import genai
@@ -13,11 +14,14 @@ class HarnessExecutionEngine:
         model_name: str = "gemini-2.0-flash",
         max_failures: int = 3,
         max_steps: int = 3,
+        history_limit: int = 100,
     ):
         if not isinstance(max_failures, int) or isinstance(max_failures, bool) or max_failures < 1:
             raise ValueError("max_failures must be a positive integer")
         if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps < 1:
             raise ValueError("max_steps must be a positive integer")
+        if not isinstance(history_limit, int) or isinstance(history_limit, bool) or history_limit < 1:
+            raise ValueError("history_limit must be a positive integer")
 
         resolved_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not isinstance(resolved_key, str) or not resolved_key.strip():
@@ -26,6 +30,7 @@ class HarnessExecutionEngine:
         self.model_name = model_name
         self.max_failures = max_failures
         self.max_steps = max_steps
+        self.history_limit = history_limit
         self.failed_attempts = 0
         self.verification_passed = False
         self.history = []
@@ -36,6 +41,30 @@ class HarnessExecutionEngine:
         self.failed_attempts = 0
         self.verification_passed = False
         self.history = []
+
+    def _record_history(self, entry: dict) -> None:
+        """Append a bounded history entry to avoid unbounded session memory use."""
+        self.history.append(entry)
+        if len(self.history) > self.history_limit:
+            del self.history[:-self.history_limit]
+
+    @staticmethod
+    def _is_non_retryable(exc: Exception) -> bool:
+        """Stop retries for deterministic configuration/client-side failures."""
+        status_code = getattr(exc, "status_code", None)
+        if status_code is None:
+            status_code = getattr(exc, "code", None)
+
+        if isinstance(status_code, int) and status_code in (400, 401, 403, 404):
+            return True
+
+        message = str(exc).lower()
+        return any(marker in message for marker in (
+            "api key",
+            "permission denied",
+            "unauthenticated",
+            "invalid argument",
+        ))
 
     def run_harness(self, task: str, api_key: Optional[str] = None) -> dict:
         """Run a task subject to retry, verification, and lockout gates."""
@@ -57,10 +86,11 @@ class HarnessExecutionEngine:
                 "failed_attempts": self.failed_attempts,
             }
 
+        clean_task = task.strip()
         prompt = (
             "Answer the user's task directly and accurately. "
             "Do not claim to perform actions you cannot perform.\n\n"
-            f"Task: {task.strip()}"
+            f"Task: {clean_task}"
         )
 
         for step in range(1, self.max_steps + 1):
@@ -79,8 +109,8 @@ class HarnessExecutionEngine:
 
                 answer = answer.strip()
                 self.verification_passed = True
-                self.history.append(
-                    {"step": step, "status": "SUCCESS", "task": task.strip(), "answer": answer}
+                self._record_history(
+                    {"step": step, "status": "SUCCESS", "task": clean_task, "answer": answer}
                 )
                 return {
                     "status": "SUCCESS",
@@ -93,9 +123,15 @@ class HarnessExecutionEngine:
                 self.failed_attempts += 1
                 reason = str(exc).strip() or exc.__class__.__name__
                 self.verification_passed = False
-                self.history.append(
-                    {"step": step, "status": "FAILED", "task": task.strip(), "reason": reason}
+                self._record_history(
+                    {"step": step, "status": "FAILED", "task": clean_task, "reason": reason}
                 )
+
+                if self._is_non_retryable(exc):
+                    break
+
+                if step < self.max_steps and self.failed_attempts < self.max_failures:
+                    time.sleep(min(0.25 * (2 ** (step - 1)), 2.0))
 
         locked = self.failed_attempts >= self.max_failures
         return {
