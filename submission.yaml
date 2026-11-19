@@ -1,0 +1,2 @@
+model: google-cloud/gemini-3.8-flash
+harness: serve.py
