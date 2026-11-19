@@ -1,146 +1,109 @@
-import os
-import time
-from typing import Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, Optional
+import yaml
 
-from google import genai
+
+def load_submission_config(config_path: str = "submission.yaml") -> Dict[str, Any]:
+    path = Path(config_path)
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def normalize_model_name(raw_model: Optional[str], fallback: str = "gemini-3.8-flash") -> str:
+    if not raw_model:
+        return fallback
+    # Strip optional provider prefix like "google-cloud/" or "models/"
+    cleaned = raw_model.split("/")[-1].strip()
+    return cleaned or fallback
 
 
 class HarnessExecutionEngine:
-    """Bounded execution engine for Gemini-backed task runs."""
-
     def __init__(
         self,
-        api_key: Optional[str] = None,
-        model_name: str = "gemini-2.0-flash",
-        max_failures: int = 3,
-        max_steps: int = 3,
-        history_limit: int = 100,
+        model: Optional[str] = None,
+        config_path: str = "submission.yaml",
+        max_retries: Optional[int] = None,
+        max_failures: Optional[int] = None,
     ):
-        if not isinstance(max_failures, int) or isinstance(max_failures, bool) or max_failures < 1:
-            raise ValueError("max_failures must be a positive integer")
-        if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps < 1:
-            raise ValueError("max_steps must be a positive integer")
-        if not isinstance(history_limit, int) or isinstance(history_limit, bool) or history_limit < 1:
-            raise ValueError("history_limit must be a positive integer")
+        cfg = load_submission_config(config_path)
+        harness_cfg = cfg.get("harness", {})
 
-        resolved_key = api_key or os.environ.get("GEMINI_API_KEY")
-        if not isinstance(resolved_key, str) or not resolved_key.strip():
-            raise ValueError("Gemini API key is missing. Pass api_key or set GEMINI_API_KEY.")
+        resolved_model = model if model is not None else cfg.get("model")
+        self.model = normalize_model_name(resolved_model, fallback="gemini-3.8-flash")
+        self.max_retries = max_retries if max_retries is not None else int(harness_cfg.get("max_retries", 3))
+        self.max_failures = max_failures if max_failures is not None else int(harness_cfg.get("max_failures", 3))
+        self.max_output_tokens = int(harness_cfg.get("max_output_tokens", 4096))
 
-        self.model_name = model_name
-        self.max_failures = max_failures
-        self.max_steps = max_steps
-        self.history_limit = history_limit
-        self.failed_attempts = 0
-        self.verification_passed = False
-        self.history = []
-        self.client = genai.Client(api_key=resolved_key.strip(), vertexai=False)
+        self.failure_count = 0
+        self.locked = False
 
-    def reset_harness(self) -> None:
-        """Return the engine to its initial unlocked state."""
-        self.failed_attempts = 0
-        self.verification_passed = False
-        self.history = []
+    def reset(self) -> Dict[str, Any]:
+        self.failure_count = 0
+        self.locked = False
+        return {"status": "reset", "locked": self.locked, "failure_count": self.failure_count}
 
-    def _record_history(self, entry: dict) -> None:
-        """Append a bounded history entry to avoid unbounded session memory use."""
-        self.history.append(entry)
-        if len(self.history) > self.history_limit:
-            del self.history[:-self.history_limit]
-
-    @staticmethod
-    def _is_non_retryable(exc: Exception) -> bool:
-        """Stop retries for deterministic configuration/client-side failures."""
-        status_code = getattr(exc, "status_code", None)
-        if status_code is None:
-            status_code = getattr(exc, "code", None)
-
-        if isinstance(status_code, int) and status_code in (400, 401, 403, 404):
-            return True
-
-        message = str(exc).lower()
-        return any(marker in message for marker in (
-            "api key",
-            "permission denied",
-            "unauthenticated",
-            "invalid argument",
-        ))
-
-    def run_harness(self, task: str, api_key: Optional[str] = None) -> dict:
-        """Run a task subject to retry, verification, and lockout gates."""
-        del api_key
-
-        if self.failed_attempts >= self.max_failures:
+    def run_with_verification(
+        self,
+        prompt: str,
+        generate_fn: Callable[[str, str, int], str],
+        verify_fn: Callable[[str], tuple[bool, str]],
+    ) -> Dict[str, Any]:
+        if self.locked:
             return {
-                "status": "LOCKED",
-                "requires_reset": True,
-                "reason": "Maximum failure count reached. Reset the engine to continue.",
-                "failed_attempts": self.failed_attempts,
+                "ok": False,
+                "status": "locked",
+                "error": "Harness is locked due to repeated failures. Call reset() to unlock.",
+                "failure_count": self.failure_count,
+                "locked": True,
             }
 
-        if not isinstance(task, str) or not task.strip():
-            return {
-                "status": "FAILED",
-                "requires_reset": False,
-                "reason": "Task prompt must be a non-empty string.",
-                "failed_attempts": self.failed_attempts,
-            }
+        active_prompt = prompt
+        last_reason = ""
+        last_output = ""
 
-        clean_task = task.strip()
-        prompt = (
-            "Answer the user's task directly and accurately. "
-            "Do not claim to perform actions you cannot perform.\n\n"
-            f"Task: {clean_task}"
-        )
-
-        for step in range(1, self.max_steps + 1):
-            if self.failed_attempts >= self.max_failures:
-                break
-
-            try:
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt,
-                )
-                answer = getattr(response, "text", None)
-
-                if not isinstance(answer, str) or not answer.strip():
-                    raise ValueError("The model returned an empty response")
-
-                answer = answer.strip()
-                self.verification_passed = True
-                self._record_history(
-                    {"step": step, "status": "SUCCESS", "task": clean_task, "answer": answer}
-                )
+        for attempt in range(1, self.max_retries + 1):
+            last_output = generate_fn(active_prompt, self.model, self.max_output_tokens)
+            passed, reason = verify_fn(last_output)
+            if passed:
                 return {
-                    "status": "SUCCESS",
-                    "requires_reset": False,
-                    "answer": answer,
-                    "failed_attempts": self.failed_attempts,
+                    "ok": True,
+                    "status": "verified",
+                    "attempt": attempt,
+                    "model": self.model,
+                    "output": last_output,
+                    "locked": self.locked,
+                    "failure_count": self.failure_count,
                 }
 
-            except Exception as exc:
-                self.failed_attempts += 1
-                reason = str(exc).strip() or exc.__class__.__name__
-                self.verification_passed = False
-                self._record_history(
-                    {"step": step, "status": "FAILED", "task": clean_task, "reason": reason}
-                )
+            last_reason = reason or "Verification check failed."
+            active_prompt = (
+                f"{prompt}\n\n"
+                f"[Verification Feedback — Attempt {attempt}/{self.max_retries}]:\n"
+                f"Your previous response did not pass verification because: {last_reason}\n"
+                f"Revise your response so every hard constraint, calculation, and formatting rule is satisfied completely."
+            )
 
-                if self._is_non_retryable(exc):
-                    break
+        self.failure_count += 1
+        if self.failure_count >= self.max_failures:
+            self.locked = True
+            return {
+                "ok": False,
+                "status": "locked",
+                "error": f"Verification retries exhausted; harness locked after {self.failure_count} failures.",
+                "last_reason": last_reason,
+                "output": last_output,
+                "locked": True,
+                "failure_count": self.failure_count,
+            }
 
-                if step < self.max_steps and self.failed_attempts < self.max_failures:
-                    time.sleep(min(0.25 * (2 ** (step - 1)), 2.0))
-
-        locked = self.failed_attempts >= self.max_failures
         return {
-            "status": "LOCKED" if locked else "FAILED",
-            "requires_reset": locked,
-            "reason": (
-                "Maximum failure count reached. Reset the engine to continue."
-                if locked
-                else "Verification retries exhausted."
-            ),
-            "failed_attempts": self.failed_attempts,
+            "ok": False,
+            "status": "verification_retries_exhausted",
+            "error": "Verification retries exhausted.",
+            "last_reason": last_reason,
+            "output": last_output,
+            "locked": False,
+            "failure_count": self.failure_count,
         }
