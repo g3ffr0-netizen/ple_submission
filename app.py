@@ -1,25 +1,78 @@
+import json
 import os
 import sys
+from typing import Tuple
 
+import pandas as pd
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from harness import HarnessExecutionEngine
 
+try:
+    from google import genai
+    from google.genai import types
+except ImportError:
+    genai = None
+    types = None
+
 
 def get_gemini_api_key() -> str:
     """Read the key from Streamlit secrets or a local environment variable."""
     try:
         secret_key = st.secrets.get("GEMINI_API_KEY", "")
-    except StreamlitSecretNotFoundError:
+    except (StreamlitSecretNotFoundError, Exception):
         secret_key = ""
+    return (str(secret_key) or os.environ.get("GEMINI_API_KEY", "")).strip()
 
-    return (secret_key or os.environ.get("GEMINI_API_KEY", "")).strip()
+
+def make_generate_fn(api_key: str):
+    """Build a generate_fn(prompt, model, max_output_tokens) callback for HarnessExecutionEngine."""
+    def _generate(prompt: str, model: str, max_output_tokens: int) -> str:
+        if genai is None:
+            raise RuntimeError("google-genai is not installed. Add 'google-genai' to requirements.txt.")
+        client = genai.Client(api_key=api_key, vertexai=False)
+        config = types.GenerateContentConfig(max_output_tokens=max_output_tokens) if types else None
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config=config,
+        )
+        return (response.text or "").strip()
+
+    return _generate
 
 
-st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", layout="centered")
+def make_verify_fn(min_chars: int, required_phrase: str, require_json: bool):
+    """Build a strict (bool, str) verifier for the harness loop."""
+    phrase = required_phrase.strip()
+
+    def _verify(output: str) -> Tuple[bool, str]:
+        text = (output or "").strip()
+        if not text:
+            return False, "Output is empty."
+        if len(text) < min_chars:
+            return False, f"Output too short ({len(text)} chars; minimum required is {min_chars})."
+        if phrase and phrase.lower() not in text.lower():
+            return False, f"Output must include the required phrase: '{phrase}'."
+        if require_json:
+            cleaned = text
+            if cleaned.startswith("```"):
+                lines = cleaned.splitlines()
+                cleaned = "\n".join(lines[1:-1] if len(lines) >= 3 and lines[-1].strip() == "```" else lines[1:])
+            try:
+                json.loads(cleaned)
+            except json.JSONDecodeError as exc:
+                return False, f"Output must be valid JSON ({exc.msg})."
+        return True, "All verification checks passed."
+
+    return _verify
+
+
+st.set_page_config(page_title="Sovereign Harness Portal", page_icon="🛡️", layout="wide")
 st.title("🛡️ Sovereign Harness Execution Portal")
+st.caption("Self-correcting verification loop · Automatic fallback model rotation · Circuit-breaker protection")
 
 API_KEY = get_gemini_api_key()
 if not API_KEY:
@@ -31,43 +84,22 @@ if not API_KEY:
     st.stop()
 
 if "engine" not in st.session_state:
-    st.session_state.engine = HarnessExecutionEngine(api_key=API_KEY)
+    st.session_state.engine = HarnessExecutionEngine(config_path="submission.yaml")
 
-engine = st.session_state.engine
+if "last_result" not in st.session_state:
+    st.session_state.last_result = None
+
+engine: HarnessExecutionEngine = st.session_state.engine
 
 with st.sidebar:
     st.header("⚙️ Engine Status")
-    st.write(f"**Failed Attempts:** {engine.failed_attempts}")
-    st.write(f"**Max Failures:** {engine.max_failures}")
-    status_icon = "✅" if engine.verification_passed else "❌"
-    st.write(f"**Verification Passed:** {status_icon}")
+    status_label = "🔒 LOCKED" if engine.locked else "🟢 READY"
+    st.markdown(f"**State:** {status_label}")
+    st.write(f"**Primary Model:** `{engine.model}`")
+    if engine.fallback_models:
+        st.write(f"**Fallbacks:** `{', '.join(engine.fallback_models)}`")
+    st.write(f"**Consecutive Failures:** {engine.failure_count} / {engine.max_failures}")
+    st.write(f"**Max Retries / Run:** {engine.max_retries}")
 
-
-task = st.text_input("Enter Task Prompt:", placeholder="e.g., What is 2+2?")
-
-col1, col2 = st.columns(2)
-
-with col1:
-    if st.button("Execute Harness Task", use_container_width=True):
-        clean_task = task.strip()
-        if not clean_task:
-            st.warning("⚠️ Please enter a task prompt before executing.")
-        else:
-            with st.spinner("Running verification loops..."):
-                result = engine.run_harness(clean_task, api_key=API_KEY)
-
-                if result.get("status") == "SUCCESS":
-                    st.success(f"✅ **Success:** {result.get('answer')}")
-                elif result.get("requires_reset"):
-                    st.error(f"🛑 **Lockout:** {result.get('reason')}")
-                else:
-                    st.warning(
-                        f"⚠️ **Failed:** {result.get('reason')} "
-                        f"(Attempt {result.get('failed_attempts')}/{engine.max_failures})"
-                    )
-
-with col2:
-    if st.button("Reset Engine State", use_container_width=True):
-        engine.reset_harness()
-        st.info("🔄 Engine state has been reset. Failure counter is back to 0.")
-        st.rerun()
+    st.markdown("---")
+    st.header
