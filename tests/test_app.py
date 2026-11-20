@@ -116,7 +116,9 @@ class TestSovereignHarnessApp(unittest.TestCase):
         ok, _ = verifier('```json\n{"check": "passed", "note": "microgrid verified"}\n```')
         self.assertTrue(ok)
 
-        bad_json, reason_json = verifier('```json\n{"check": "passed", invalid}\n```')
+        bad_json, reason_json = verifier(
+            '```json\n{"check": "passed", "note": "microgrid verified", invalid}\n```'
+        )
         self.assertFalse(bad_json)
         self.assertIn("JSON", reason_json)
 
