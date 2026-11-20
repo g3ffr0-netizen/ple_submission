@@ -241,4 +241,4 @@ def call_gemini(prompt: str, model_name: str, max_tokens: int, api_key: str) -> 
     return getattr(response, "text", "") or ""
 
 
-def init_state
+def init_state() -> None:
