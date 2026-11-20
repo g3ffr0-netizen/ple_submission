@@ -75,6 +75,7 @@ def _install_streamlit_stub() -> py_types.ModuleType:
 def load_module_from_path(module_name: str, file_path: Path):
     spec = importlib.util.spec_from_file_location(module_name, str(file_path))
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = mod
     spec.loader.exec_module(mod)
     return mod
 
