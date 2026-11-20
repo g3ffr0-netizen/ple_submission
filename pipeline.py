@@ -1,63 +1,121 @@
 # pipeline.py
-"""Offline contract checks for HarnessExecutionEngine."""
+"""Offline contract & regression test suite for HarnessExecutionEngine and serve.py."""
 
+import asyncio
+import json
 import unittest
-from unittest.mock import patch
 
-from harness import HarnessExecutionEngine
+from harness import (
+    DEFAULT_MODEL,
+    HarnessExecutionEngine,
+    load_submission_config,
+    normalize_model_name,
+)
+from serve import handle_ws_message
 
 
 class HarnessContractTests(unittest.TestCase):
     def setUp(self):
-        client_patcher = patch("harness.genai.Client")
-        self.mock_client = client_patcher.start()
-        self.addCleanup(client_patcher.stop)
-
         self.engine = HarnessExecutionEngine(
-            api_key="test-key-not-for-real-use",
-            max_failures=3,
+            model="google-cloud/gemini-3.8-flash",
+            config_path="nonexistent_submission.yaml",
+            max_retries=3,
+            max_failures=2,
+            max_output_tokens=4096,
+            fallback_models=["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-pro"],
         )
 
-    def test_initial_state(self):
-        self.assertEqual(self.engine.max_failures, 3)
-        self.assertEqual(self.engine.failed_attempts, 0)
-        self.assertFalse(self.engine.verification_passed)
-        self.assertIsInstance(self.engine.history, list)
-        self.assertGreater(self.engine.max_steps, 0)
+    def test_initial_state_and_normalization(self):
+        self.assertEqual(self.engine.model, "gemini-3.8-flash")
+        self.assertEqual(self.engine.fallback_models, ["gemini-3.5-flash", "gemini-3.1-pro"])
+        self.assertEqual(self.engine.max_retries, 3)
+        self.assertEqual(self.engine.max_failures, 2)
+        self.assertEqual(self.engine.max_output_tokens, 4096)
+        self.assertEqual(self.engine.failure_count, 0)
+        self.assertFalse(self.engine.locked)
+        self.assertEqual(normalize_model_name(None), DEFAULT_MODEL)
+        self.assertEqual(load_submission_config("nonexistent.yaml"), {})
 
     def test_required_methods_are_callable(self):
-        for method_name in ("run_harness", "reset_harness"):
+        for method_name in ("run_with_verification", "reset"):
             with self.subTest(method=method_name):
-                method = getattr(self.engine, method_name, None)
-                self.assertTrue(callable(method))
+                self.assertTrue(callable(getattr(self.engine, method_name, None)))
 
-    def test_reset_harness_restores_initial_state(self):
-        self.engine.failed_attempts = 2
-        self.engine.verification_passed = True
-        self.engine.history.append({"unexpected": "entry"})
+    def test_safe_int_guards_clamp_invalid_and_boolean_values(self):
+        guarded = HarnessExecutionEngine(
+            config_path="nonexistent.yaml",
+            max_retries=True,
+            max_failures=-5,
+            max_output_tokens=10,
+        )
+        self.assertEqual(guarded.max_retries, 3)
+        self.assertEqual(guarded.max_failures, 1)
+        self.assertEqual(guarded.max_output_tokens, 64)
 
-        self.engine.reset_harness()
+    def test_invalid_prompt_does_not_penalize_circuit_breaker(self):
+        res = self.engine.run_with_verification(
+            "   ",
+            lambda p, m, t: "ignored",
+            lambda o: (True, "ok"),
+        )
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["status"], "invalid_prompt")
+        self.assertEqual(self.engine.failure_count, 0)
+        self.assertFalse(self.engine.locked)
 
-        self.assertEqual(self.engine.failed_attempts, 0)
-        self.assertFalse(self.engine.verification_passed)
-        self.assertEqual(self.engine.history, [])
+    def test_retry_rotation_and_exception_recovery(self):
+        models_called = []
 
-    def test_reset_harness_is_safe_after_initialization(self):
-        self.engine.reset_harness()
-        self.engine.reset_harness()
+        def flaky_generate(prompt, model, max_tokens):
+            models_called.append(model)
+            if len(models_called) == 1:
+                raise RuntimeError("Transient 503")
+            if len(models_called) == 2:
+                return "draft_v1"
+            return "verified_answer"
 
-        self.assertEqual(self.engine.failed_attempts, 0)
-        self.assertFalse(self.engine.verification_passed)
+        def verify_fn(output):
+            if output == "draft_v1":
+                return False, "Missing final verification token"
+            return output == "verified_answer", "All checks passed"
 
-    def test_invalid_max_failures_values_are_rejected(self):
-        for value in (-1, 0):
-            with self.subTest(max_failures=value):
-                with self.assertRaises(ValueError):
-                    HarnessExecutionEngine(
-                        api_key="test-key-not-for-real-use",
-                        max_failures=value,
-                    )
+        res = self.engine.run_with_verification("Run task", flaky_generate, verify_fn)
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["status"], "verified")
+        self.assertEqual(res["attempt"], 3)
+        self.assertEqual(models_called, ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-pro"])
+        self.assertEqual(len(res["history"]), 3)
+        self.assertEqual(self.engine.failure_count, 0)
+
+    def test_circuit_breaker_lock_and_reset(self):
+        engine = HarnessExecutionEngine(config_path="nonexistent.yaml", max_retries=1, max_failures=2)
+
+        r1 = engine.run_with_verification("Task", lambda p, m, t: "bad", lambda o: (False, "wrong"))
+        self.assertEqual(r1["status"], "verification_retries_exhausted")
+        self.assertFalse(engine.locked)
+        self.assertEqual(engine.failure_count, 1)
+
+        r2 = engine.run_with_verification("Task", lambda p, m, t: "bad", lambda o: (False, "wrong"))
+        self.assertEqual(r2["status"], "locked")
+        self.assertTrue(engine.locked)
+        self.assertEqual(engine.failure_count, 2)
+
+        # Locked engine must refuse execution until reset
+        r3 = engine.run_with_verification("Task", lambda p, m, t: "good", lambda o: (True, "ok"))
+        self.assertEqual(r3["status"], "locked")
+
+        state = engine.reset()
+        self.assertEqual(state["status"], "reset")
+        self.assertFalse(engine.locked)
+        self.assertEqual(engine.failure_count, 0)
+
+        r4 = engine.run_with_verification("Task", lambda p, m, t: "good", lambda o: (True, "ok"))
+        self.assertTrue(r4["ok"])
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+class ServeWebSocketContractTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = HarnessExecutionEngine(config_path="nonexistent.yaml", max_retries=1, max_failures=1)
+
+    def _send(self, raw_message, runner=None):
+        return json.loads(asyncio.run(
