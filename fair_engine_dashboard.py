@@ -7,9 +7,11 @@ import streamlit as st
 try:
     from google import genai
     from google.genai import types
+    from google.genai.errors import APIError
 except ImportError:
     genai = None  # type: ignore[assignment]
     types = None  # type: ignore[assignment]
+    APIError = Exception  # type: ignore[assignment,misc]
 
 try:
     from harness import (
@@ -29,7 +31,7 @@ except ImportError:
         for prefix in ("models/", "google-cloud/"):
             if raw.startswith(prefix):
                 raw = raw[len(prefix) :]
-        return raw or "gemini-2.5-flash"
+        return raw or "gemini-3.8-flash"
 
 
 class _FallbackHarnessEngine:
@@ -189,15 +191,21 @@ def verify_response(
         return False, "Missing a Markdown summary comparison table."
 
     if "48 v" in lowered or "48v" in lowered:
-        amps_48v = _extract_floats(r"48\s*v[^0-9\n]{0,80}?(\d+(?:\.\d+)?)\s*a\b", cleaned)
-        amps_48v += _extract_floats(r"\b(\d+(?:\.\d+)?)\s*a\b[^0-9\n]{0,40}?48\s*v", cleaned)
+        amps_48v = _extract_floats(
+            r"48\s*v(?![^\n]{0,30}?400\s*v)[^0-9\n]{0,30}?(\d+(?:\.\d+)?)\s*a\b",
+            cleaned,
+        )
+        amps_48v += _extract_floats(r"\b(\d+(?:\.\d+)?)\s*a\b[^0-9\n]{0,25}?48\s*v", cleaned)
         for val in amps_48v:
             if not (180.0 <= val <= 250.0):
                 return False, f"Implausible 48 V current value ({val} A) for a 10 kW system."
 
     if "400 v" in lowered or "400v" in lowered:
-        amps_400v = _extract_floats(r"400\s*v[^0-9\n]{0,80}?(\d+(?:\.\d+)?)\s*a\b", cleaned)
-        amps_400v += _extract_floats(r"\b(\d+(?:\.\d+)?)\s*a\b[^0-9\n]{0,40}?400\s*v", cleaned)
+        amps_400v = _extract_floats(
+            r"400\s*v(?![^\n]{0,30}?48\s*v)[^0-9\n]{0,30}?(\d+(?:\.\d+)?)\s*a\b",
+            cleaned,
+        )
+        amps_400v += _extract_floats(r"\b(\d+(?:\.\d+)?)\s*a\b[^0-9\n]{0,25}?400\s*v", cleaned)
         for val in amps_400v:
             if not (15.0 <= val <= 40.0):
                 return False, f"Implausible 400 V current value ({val} A) for a 10 kW system."
@@ -227,24 +235,32 @@ def load_gemini_key() -> Optional[str]:
 
 
 def call_gemini(prompt: str, model_name: str, max_tokens: int, api_key: str) -> str:
-    """Call the Gemini API using google-genai."""
+    """Call the Gemini API using google-genai and surface API errors cleanly."""
     if genai is None:
         raise RuntimeError("google-genai is not installed. Add `google-genai` to requirements.txt.")
 
-    client = genai.Client(api_key=api_key)
-    config = types.GenerateContentConfig(max_output_tokens=max_tokens) if types is not None else None
-    response = client.models.generate_content(
-        model=normalize_model_name(model_name),
-        contents=prompt,
-        config=config,
-    )
-    return getattr(response, "text", "") or ""
+    resolved_model = normalize_model_name(model_name)
+    try:
+        client = genai.Client(api_key=api_key)
+        config = types.GenerateContentConfig(max_output_tokens=max_tokens) if types is not None else None
+        response = client.models.generate_content(
+            model=resolved_model,
+            contents=prompt,
+            config=config,
+        )
+        return getattr(response, "text", "") or ""
+    except APIError as exc:
+        code = getattr(exc, "code", None)
+        status = getattr(exc, "status", None)
+        message = getattr(exc, "message", None) or str(exc)
+        details = " — ".join(str(part) for part in (code, status, message) if part)
+        raise RuntimeError(f"Gemini API error ({resolved_model}): {details}") from exc
 
 
 def init_state() -> None:
     """Initialize Streamlit session state and execution engine."""
     cfg = load_submission_config()
-    default_model = normalize_model_name(cfg.get("model", "gemini-2.5-flash"))
+    default_model = normalize_model_name(cfg.get("model", "gemini-3.8-flash"))
     max_retries = int(cfg.get("max_retries", 3))
     max_failures = int(cfg.get("max_failures", 3))
     max_tokens = int(cfg.get("max_output_tokens", 4096))
@@ -340,32 +356,35 @@ def main() -> None:
             st.error("Missing `GEMINI_API_KEY` in Streamlit Secrets or environment variables.")
         else:
             with st.spinner("Running verification loop..."):
-                result = engine.run_with_verification(
-                    prompt=full_prompt,
-                    generate_fn=lambda p, m, max_tok: call_gemini(
-                        p,
-                        st.session_state.model_name or m,
-                        max_tok,
-                        api_key,
-                    ),
-                    verify_fn=lambda out: verify_response(
-                        out,
-                        required_terms=required_terms,
-                        require_table=require_table,
-                    ),
-                )
-            status_label = (
-                f"VERIFIED (attempt {result.get('attempts', 1)})"
-                if result.get("ok")
-                else f"{str(result.get('status', 'FAILED')).upper()}: {result.get('reason', '')}"
-            )
-            st.session_state.runs.insert(
-                0,
-                {
-                    "status": status_label,
-                    "output": result.get("output", ""),
-                },
-            )
+                try:
+                    result = engine.run_with_verification(
+                        prompt=full_prompt,
+                        generate_fn=lambda p, m, max_tok: call_gemini(
+                            p,
+                            st.session_state.model_name or m,
+                            max_tok,
+                            api_key,
+                        ),
+                        verify_fn=lambda out: verify_response(
+                            out,
+                            required_terms=required_terms,
+                            require_table=require_table,
+                        ),
+                    )
+                    status_label = (
+                        f"VERIFIED (attempt {result.get('attempts', 1)})"
+                        if result.get("ok")
+                        else f"{str(result.get('status', 'FAILED')).upper()}: {result.get('reason', '')}"
+                    )
+                    st.session_state.runs.insert(
+                        0,
+                        {
+                            "status": status_label,
+                            "output": result.get("output", ""),
+                        },
+                    )
+                except RuntimeError as exc:
+                    st.error(str(exc))
 
     st.subheader("Recent Runs")
     if not st.session_state.runs:
