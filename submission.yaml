@@ -1,8 +1,33 @@
-model: google-cloud/gemini-3.8-flash
-harness:
-  max_retries: 3
-  max_failures: 3
-  max_output_tokens: 4096
-  fallback_models:
-    - google-cloud/gemini-3.5-flash
-    - google-cloud/gemini-3.1-pro
+name: Unit Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          fi
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -p "test_app.py" -v
