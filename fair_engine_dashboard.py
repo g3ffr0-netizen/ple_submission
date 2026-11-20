@@ -242,3 +242,139 @@ def call_gemini(prompt: str, model_name: str, max_tokens: int, api_key: str) -> 
 
 
 def init_state() -> None:
+    """Initialize Streamlit session state and execution engine."""
+    cfg = load_submission_config()
+    default_model = normalize_model_name(cfg.get("model", "gemini-2.5-flash"))
+    max_retries = int(cfg.get("max_retries", 3))
+    max_failures = int(cfg.get("max_failures", 3))
+    max_tokens = int(cfg.get("max_output_tokens", 4096))
+
+    if "engine" not in st.session_state:
+        st.session_state.engine = build_engine(
+            model=default_model,
+            max_retries=max_retries,
+            max_failures=max_failures,
+            max_output_tokens=max_tokens,
+        )
+    if "runs" not in st.session_state:
+        st.session_state.runs = []
+    if "model_name" not in st.session_state:
+        st.session_state.model_name = default_model
+
+
+def main() -> None:
+    st.set_page_config(page_title="Fair Engine Dashboard", layout="wide")
+    init_state()
+
+    engine = st.session_state.engine
+    api_key = load_gemini_key()
+
+    with st.sidebar:
+        st.header("Engine Controls")
+        st.session_state.model_name = st.text_input("Model", value=st.session_state.model_name)
+        st.metric("Failures", engine.failure_count)
+        st.metric("Failure Cap", engine.max_failures)
+        st.write("**Engine State:**", "Locked" if engine.locked else "Ready")
+        st.write("**API Key:**", "Configured" if api_key else "Missing (`GEMINI_API_KEY`)")
+
+        dry_run = st.checkbox("Dry Run (No API Call)", value=False)
+        require_table = st.checkbox("Require Markdown Table", value=True)
+        required_terms_raw = st.text_input(
+            "Required Terms (comma-separated)",
+            value="current, loss, 48 v, 400 v, verdict",
+        )
+
+        if st.button("Reset Engine"):
+            engine.reset()
+            st.rerun()
+
+    st.title("Fair Engine Dashboard")
+
+    default_prompt = (
+        "Compare two off-grid solar + LFP battery architectures for a residential property in New South Wales:\n"
+        "1. 48 V DC system with a 10 kW inverter and 15 kWh LFP bank\n"
+        "2. 400 V DC / high-voltage hybrid system with a 10 kW inverter and 15 kWh LFP bank\n\n"
+        "Include nominal battery current at 10 kW discharge, I^2 * R conduction loss scaling, wiring gauge, "
+        "safety/isolation, inverter efficiency, a summary table, and a verdict for a 25 m cable run."
+    )
+    prompt = st.text_area("Task Prompt", value=default_prompt, height=180)
+    uploaded = st.file_uploader(
+        "Optional context file (.txt, .md, .csv, .json, .yaml)",
+        type=["txt", "md", "csv", "json", "yaml", "yml"],
+    )
+
+    full_prompt = prompt
+    if uploaded is not None:
+        try:
+            file_text = uploaded.getvalue().decode("utf-8", errors="replace")
+            full_prompt = f"{prompt}\n\n[Attached File: {uploaded.name}]\n{file_text}"
+        except Exception as exc:
+            st.warning(f"Could not read uploaded file: {exc}")
+
+    if st.button("Run Task", type="primary"):
+        required_terms = [term.strip() for term in required_terms_raw.split(",") if term.strip()]
+
+        if dry_run:
+            sample_output = (
+                "### 48 V vs 400 V Architecture\n"
+                "At 10 kW discharge, current is ~208.3 A on 48 V and 25.0 A on 400 V. "
+                "Conduction loss scales by I^2 * R (~69.4x higher at 48 V for equal resistance).\n\n"
+                "| Metric | 48 V | 400 V |\n"
+                "| --- | --- | --- |\n"
+                "| Current | ~208.3 A | 25.0 A |\n\n"
+                "**Verdict:** 400 V is better for a 25 m cable run."
+            )
+            ok, reason = verify_response(
+                sample_output,
+                required_terms=required_terms,
+                require_table=require_table,
+            )
+            st.session_state.runs.insert(
+                0,
+                {
+                    "status": "VERIFIED (DRY RUN)" if ok else f"FAILED ({reason})",
+                    "output": sample_output,
+                },
+            )
+        elif not api_key:
+            st.error("Missing `GEMINI_API_KEY` in Streamlit Secrets or environment variables.")
+        else:
+            with st.spinner("Running verification loop..."):
+                result = engine.run_with_verification(
+                    prompt=full_prompt,
+                    generate_fn=lambda p, m, max_tok: call_gemini(
+                        p,
+                        st.session_state.model_name or m,
+                        max_tok,
+                        api_key,
+                    ),
+                    verify_fn=lambda out: verify_response(
+                        out,
+                        required_terms=required_terms,
+                        require_table=require_table,
+                    ),
+                )
+            status_label = (
+                f"VERIFIED (attempt {result.get('attempts', 1)})"
+                if result.get("ok")
+                else f"{str(result.get('status', 'FAILED')).upper()}: {result.get('reason', '')}"
+            )
+            st.session_state.runs.insert(
+                0,
+                {
+                    "status": status_label,
+                    "output": result.get("output", ""),
+                },
+            )
+
+    st.subheader("Recent Runs")
+    if not st.session_state.runs:
+        st.info("No runs yet. Click **Run Task** to start.")
+    else:
+        for idx, run in enumerate(st.session_state.runs, start=1):
+            with st.expander(f"Run #{idx} — {run['status']}", expanded=(idx == 1)):
+                st.markdown(run["output"] or "_No output_")
+
+
+if __name__ == "__main__":
+    main()
