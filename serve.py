@@ -22,7 +22,7 @@ async def handle_ws_message(raw_message: str, engine: Any, run_harness_fn: Any) 
     try:
         payload = json.loads(raw_message)
     except (json.JSONDecodeError, TypeError):
-        return _dumps({
+        return _dumps({...})
             "type": "error",
             "code": "invalid_json",
             "message": "Message must be valid JSON.",
