@@ -6,7 +6,7 @@ import pandas as pd
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
-from harness import HarnessExecutionEngine
+from pipeline import HarnessExecutionEngine  # or from engine import HarnessExecutionEngine
 
 try:
     from google import genai
