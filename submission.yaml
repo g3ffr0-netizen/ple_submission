@@ -1,7 +1,9 @@
 model: gemini-3.8-flash
 
 harness:
-  fallback_models: []
+  fallback_models:
+    - gemini-3.5-flash-lite
+    - gemini-3.1-flash-lite
   max_retries: 3
   max_failures: 3
   max_output_tokens: 4096
