@@ -1,12 +1,13 @@
 import json
 import os
-from typing import Tuple
+from typing import Any, Dict, Tuple
 
 import pandas as pd
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
 
 from pipeline import HarnessExecutionEngine
+
 try:
     from google import genai
     from google.genai import types
@@ -35,7 +36,7 @@ def make_generate_fn(api_key: str):
             )
         config = (
             types.GenerateContentConfig(max_output_tokens=max_output_tokens)
-            if types
+            if types is not None and max_output_tokens
             else None
         )
         response = client.models.generate_content(
@@ -89,14 +90,91 @@ def make_verify_fn(min_chars: int, required_phrase: str, require_json: bool):
 
 def _init_session_state() -> None:
     """Initialize required Streamlit session state keys once per session."""
-    if "engine" not in st.session_state:
-        st.session_state.engine = HarnessExecutionEngine(config_path="submission.yaml")
     if "last_result" not in st.session_state:
         st.session_state.last_result = None
     if "is_running" not in st.session_state:
         st.session_state.is_running = False
     if "ui_error" not in st.session_state:
         st.session_state.ui_error = None
+    if "engine" not in st.session_state:
+        try:
+            st.session_state.engine = HarnessExecutionEngine(
+                config_path="submission.yaml"
+            )
+        except Exception as exc:
+            st.session_state.engine = None
+            st.session_state.ui_error = f"Failed to load submission.yaml: {exc}"
+
+
+def _render_sidebar(engine: Any, api_key: str) -> None:
+    """Render engine status and controls in the sidebar."""
+    with st.sidebar:
+        st.header("⚙️ Engine Status")
+        if engine is None:
+            st.markdown("**State:** 🔴 UNAVAILABLE")
+            st.write(f"**API key:** {'Configured' if api_key else 'Not configured'}")
+            if st.button("Retry engine init", disabled=st.session_state.is_running):
+                st.session_state.pop("engine", None)
+                st.session_state.ui_error = None
+                st.rerun()
+            return
+
+        st.markdown(f"**State:** {'🔒 LOCKED' if engine.locked else '🟢 READY'}")
+        st.write(f"**Primary model:** `{engine.model}`")
+        if getattr(engine, "fallback_models", None):
+            st.write(f"**Fallbacks:** `{', '.join(engine.fallback_models)}`")
+        st.write(
+            f"**Consecutive failures:** {engine.failure_count} / {engine.max_failures}"
+        )
+        st.write(f"**Max retries per run:** {engine.max_retries}")
+        st.write(f"**API key:** {'Configured' if api_key else 'Not configured'}")
+
+        if st.button(
+            "Reset locked harness",
+            disabled=not engine.locked or st.session_state.is_running,
+        ):
+            engine.reset()
+            st.session_state.last_result = None
+            st.session_state.ui_error = None
+            st.rerun()
+
+        if st.button(
+            "Clear result",
+            disabled=st.session_state.last_result is None or st.session_state.is_running,
+        ):
+            st.session_state.last_result = None
+            st.rerun()
+
+
+def _render_result(result: Dict[str, Any], engine: Any) -> None:
+    """Render the latest run outcome and attempt history."""
+    st.subheader("Latest result")
+    if result.get("ok"):
+        st.success(
+            f"Verified on attempt {result.get('attempt', '?')} using `{result.get('model', '')}`."
+        )
+        st.markdown(result.get("output", ""))
+    else:
+        st.error(
+            result.get("error")
+            or result.get("last_reason")
+            or "The task could not be verified."
+        )
+        if result.get("output"):
+            with st.expander("Last generated output"):
+                st.text(result["output"])
+
+    history = result.get("history", [])
+    if history:
+        st.subheader("Attempt history")
+        st.dataframe(pd.DataFrame(history), hide_index=True)
+
+    failure_count = engine.failure_count if engine is not None else "n/a"
+    st.caption(
+        f"Status: {result.get('status', 'unknown')} · "
+        f"Elapsed: {result.get('elapsed_ms', 0)} ms · "
+        f"Consecutive failures: {failure_count}"
+    )
 
 
 def main() -> None:
@@ -112,28 +190,9 @@ def main() -> None:
     )
 
     _init_session_state()
-    engine: HarnessExecutionEngine = st.session_state.engine
+    engine = st.session_state.engine
     api_key = get_gemini_api_key()
-
-    with st.sidebar:
-        st.header("⚙️ Engine Status")
-        st.markdown(f"**State:** {'🔒 LOCKED' if engine.locked else '🟢 READY'}")
-        st.write(f"**Primary model:** `{engine.model}`")
-        if engine.fallback_models:
-            st.write(f"**Fallbacks:** `{', '.join(engine.fallback_models)}`")
-        st.write(f"**Consecutive failures:** {engine.failure_count} / {engine.max_failures}")
-        st.write(f"**Max retries per run:** {engine.max_retries}")
-        st.write(f"**API key:** {'Configured' if api_key else 'Not configured'}")
-
-        if st.button(
-            "Reset locked harness",
-            disabled=not engine.locked or st.session_state.is_running,
-            use_container_width=True,
-        ):
-            engine.reset()
-            st.session_state.last_result = None
-            st.session_state.ui_error = None
-            st.rerun()
+    _render_sidebar(engine, api_key)
 
     if not api_key:
         st.warning(
@@ -154,7 +213,7 @@ def main() -> None:
         "Task prompt",
         placeholder="Describe the task you want Gemini to complete…",
         height=180,
-        disabled=st.session_state.is_running,
+        disabled=st.session_state.is_running or engine is None,
     )
 
     with st.expander("Verification requirements", expanded=False):
@@ -163,19 +222,20 @@ def main() -> None:
             min_value=1,
             value=1,
             step=1,
-            disabled=st.session_state.is_running,
+            disabled=st.session_state.is_running or engine is None,
         )
         required_phrase = st.text_input(
             "Required phrase (optional)",
-            disabled=st.session_state.is_running,
+            disabled=st.session_state.is_running or engine is None,
         )
         require_json = st.checkbox(
             "Require valid JSON output",
-            disabled=st.session_state.is_running,
+            disabled=st.session_state.is_running or engine is None,
         )
 
     can_run = bool(
-        api_key
+        engine is not None
+        and api_key
         and genai is not None
         and not engine.locked
         and not st.session_state.is_running
@@ -201,33 +261,8 @@ def main() -> None:
             st.session_state.is_running = False
             st.rerun()
 
-    result = st.session_state.last_result
-    if result:
-        st.subheader("Latest result")
-        if result.get("ok"):
-            st.success(
-                f"Verified on attempt {result.get('attempt', '?')} using `{result.get('model', '')}`."
-            )
-            st.markdown(result.get("output", ""))
-        else:
-            st.error(
-                result.get("error")
-                or result.get("last_reason")
-                or "The task could not be verified."
-            )
-            if result.get("output"):
-                with st.expander("Last generated output"):
-                    st.text(result["output"])
-
-        history = result.get("history", [])
-        if history:
-            st.subheader("Attempt history")
-            st.dataframe(pd.DataFrame(history), use_container_width=True, hide_index=True)
-        st.caption(
-            f"Status: {result.get('status', 'unknown')} · "
-            f"Elapsed: {result.get('elapsed_ms', 0)} ms · "
-            f"Consecutive failures: {engine.failure_count}"
-        )
+    if st.session_state.last_result:
+        _render_result(st.session_state.last_result, engine)
 
 
 if __name__ == "__main__":
