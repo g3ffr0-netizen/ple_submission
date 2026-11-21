@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,9 @@ except ImportError:
 
 
 DEFAULT_MODEL = "gemini-3.8-flash"
+
+GenerateFn = Callable[[str, str, int], str]
+VerifyFn = Callable[[str], Tuple[bool, str]]
 
 
 def load_submission_config(config_path: str = "submission.yaml") -> Dict[str, Any]:
@@ -45,6 +49,13 @@ def _safe_positive_int(value: Any, default: int, minimum: int = 1) -> int:
         return max(minimum, parsed)
     except (TypeError, ValueError):
         return default
+
+
+def _truncate_snippet(text: str, limit: int = 800) -> str:
+    cleaned = text.strip()
+    if len(cleaned) <= limit:
+        return cleaned
+    return f"{cleaned[:limit]}\n...[truncated]"
 
 
 @dataclass
@@ -96,9 +107,9 @@ class HarnessExecutionEngine:
         )
         seen = {self.model}
         cleaned_fallbacks: List[str] = []
-        for m in raw_fallbacks:
-            if isinstance(m, str) and m.strip():
-                norm = normalize_model_name(m)
+        for item in raw_fallbacks:
+            if isinstance(item, str) and item.strip():
+                norm = normalize_model_name(item, fallback=self.model)
                 if norm not in seen:
                     seen.add(norm)
                     cleaned_fallbacks.append(norm)
@@ -121,18 +132,20 @@ class HarnessExecutionEngine:
         )
         self.reset_failures_on_success = bool(reset_failures_on_success)
 
+        self._state_lock = threading.Lock()
         self.failure_count = 0
         self.locked = False
 
     def reset(self) -> Dict[str, Any]:
         """Unlock the harness and reset the consecutive failure counter."""
-        self.failure_count = 0
-        self.locked = False
-        return {
-            "status": "reset",
-            "locked": self.locked,
-            "failure_count": self.failure_count,
-        }
+        with self._state_lock:
+            self.failure_count = 0
+            self.locked = False
+            return {
+                "status": "reset",
+                "locked": self.locked,
+                "failure_count": self.failure_count,
+            }
 
     def _build_retry_prompt(
         self,
@@ -141,12 +154,8 @@ class HarnessExecutionEngine:
         last_output: str,
     ) -> str:
         """Build a cumulative feedback prompt so the model fixes new issues without regressing on prior ones."""
-        history_lines = "\n".join(
-            f"- Attempt {att}: {reason}" for att, reason in feedback_log
-        )
-        snippet = last_output.strip()
-        if len(snippet) > 800:
-            snippet = snippet[:800] + "\n...[truncated]"
+        history_lines = "\n".join(f"- Attempt {att}: {reason}" for att, reason in feedback_log)
+        snippet = _truncate_snippet(last_output, limit=800)
 
         parts = [
             base_prompt,
@@ -163,35 +172,61 @@ class HarnessExecutionEngine:
 
     def _select_model_for_attempt(self, attempt: int) -> str:
         """Use the primary model first, rotating through configured fallback models on later retries if available."""
-        if attempt == 1 or not self.fallback_models:
+        if attempt <= 1 or not self.fallback_models:
             return self.model
         idx = (attempt - 2) % len(self.fallback_models)
         return self.fallback_models[idx]
 
+    def _record_failure(
+        self,
+        history: List[AttemptRecord],
+        feedback_log: List[Tuple[int, str]],
+        attempt: int,
+        model: str,
+        elapsed_ms: float,
+        reason: str,
+        error: Optional[str] = None,
+    ) -> str:
+        clean_reason = reason.strip() or "Verification check failed."
+        feedback_log.append((attempt, clean_reason))
+        history.append(
+            AttemptRecord(
+                attempt=attempt,
+                model=model,
+                passed=False,
+                reason=clean_reason,
+                elapsed_ms=elapsed_ms,
+                error=error,
+            )
+        )
+        return clean_reason
+
     def run_with_verification(
         self,
         prompt: str,
-        generate_fn: Callable[[str, str, int], str],
-        verify_fn: Callable[[str], Tuple[bool, str]],
+        generate_fn: GenerateFn,
+        verify_fn: VerifyFn,
     ) -> Dict[str, Any]:
-        if self.locked:
-            return {
-                "ok": False,
-                "status": "locked",
-                "error": "Harness is locked due to repeated failures. Call reset() to unlock.",
-                "failure_count": self.failure_count,
-                "locked": True,
-                "elapsed_ms": 0.0,
-                "history": [],
-            }
+        with self._state_lock:
+            if self.locked:
+                return {
+                    "ok": False,
+                    "status": "locked",
+                    "error": "Harness is locked due to repeated failures. Call reset() to unlock.",
+                    "failure_count": self.failure_count,
+                    "locked": True,
+                    "elapsed_ms": 0.0,
+                    "history": [],
+                }
+            current_failures = self.failure_count
 
         if not isinstance(prompt, str) or not prompt.strip():
             return {
                 "ok": False,
                 "status": "invalid_prompt",
                 "error": "Prompt must be a non-empty string.",
-                "failure_count": self.failure_count,
-                "locked": self.locked,
+                "failure_count": current_failures,
+                "locked": False,
                 "elapsed_ms": 0.0,
                 "history": [],
             }
@@ -213,53 +248,53 @@ class HarnessExecutionEngine:
             except Exception as exc:
                 elapsed_ms = (time.perf_counter() - attempt_start) * 1000.0
                 err_msg = f"Generation error ({type(exc).__name__}): {exc}"
-                last_reason = err_msg
-                feedback_log.append((attempt, err_msg))
-                history.append(
-                    AttemptRecord(
-                        attempt=attempt,
-                        model=active_model,
-                        passed=False,
-                        reason=err_msg,
-                        elapsed_ms=elapsed_ms,
-                        error=err_msg,
-                    )
+                last_reason = self._record_failure(
+                    history=history,
+                    feedback_log=feedback_log,
+                    attempt=attempt,
+                    model=active_model,
+                    elapsed_ms=elapsed_ms,
+                    reason=err_msg,
+                    error=err_msg,
                 )
+                active_prompt = self._build_retry_prompt(prompt, feedback_log, last_output)
                 continue
 
             try:
                 ver_result = verify_fn(last_output)
                 if not isinstance(ver_result, tuple) or len(ver_result) != 2:
                     raise TypeError("verify_fn must return a (bool, str) tuple.")
-                passed, reason = bool(ver_result[0]), (str(ver_result[1]) if ver_result[1] is not None else "").strip()
+                passed = bool(ver_result[0])
+                reason = str(ver_result[1]) if ver_result[1] is not None else ""
             except Exception as exc:
                 elapsed_ms = (time.perf_counter() - attempt_start) * 1000.0
                 err_msg = f"Verification error ({type(exc).__name__}): {exc}"
-                last_reason = err_msg
-                feedback_log.append((attempt, err_msg))
-                history.append(
-                    AttemptRecord(
-                        attempt=attempt,
-                        model=active_model,
-                        passed=False,
-                        reason=err_msg,
-                        elapsed_ms=elapsed_ms,
-                        error=err_msg,
-                    )
+                last_reason = self._record_failure(
+                    history=history,
+                    feedback_log=feedback_log,
+                    attempt=attempt,
+                    model=active_model,
+                    elapsed_ms=elapsed_ms,
+                    reason=err_msg,
+                    error=err_msg,
                 )
                 active_prompt = self._build_retry_prompt(prompt, feedback_log, last_output)
                 continue
 
             elapsed_ms = (time.perf_counter() - attempt_start) * 1000.0
             if passed:
-                if self.reset_failures_on_success:
-                    self.failure_count = 0
+                with self._state_lock:
+                    if self.reset_failures_on_success:
+                        self.failure_count = 0
+                    updated_failures = self.failure_count
+                    is_locked = self.locked
+
                 history.append(
                     AttemptRecord(
                         attempt=attempt,
                         model=active_model,
                         passed=True,
-                        reason=reason or "Verified.",
+                        reason=reason.strip() or "Verified.",
                         elapsed_ms=elapsed_ms,
                     )
                 )
@@ -269,38 +304,40 @@ class HarnessExecutionEngine:
                     "attempt": attempt,
                     "model": active_model,
                     "output": last_output,
-                    "locked": self.locked,
-                    "failure_count": self.failure_count,
+                    "locked": is_locked,
+                    "failure_count": updated_failures,
                     "elapsed_ms": round((time.perf_counter() - run_start) * 1000.0, 2),
                     "history": [rec.to_dict() for rec in history],
                 }
 
-            last_reason = reason or "Verification check failed."
-            feedback_log.append((attempt, last_reason))
-            history.append(
-                AttemptRecord(
-                    attempt=attempt,
-                    model=active_model,
-                    passed=False,
-                    reason=last_reason,
-                    elapsed_ms=elapsed_ms,
-                )
+            last_reason = self._record_failure(
+                history=history,
+                feedback_log=feedback_log,
+                attempt=attempt,
+                model=active_model,
+                elapsed_ms=elapsed_ms,
+                reason=reason or "Verification check failed.",
             )
             active_prompt = self._build_retry_prompt(prompt, feedback_log, last_output)
 
-        self.failure_count += 1
+        with self._state_lock:
+            self.failure_count += 1
+            updated_failures = self.failure_count
+            if updated_failures >= self.max_failures:
+                self.locked = True
+            is_locked = self.locked
+
         total_ms = round((time.perf_counter() - run_start) * 1000.0, 2)
 
-        if self.failure_count >= self.max_failures:
-            self.locked = True
+        if is_locked:
             return {
                 "ok": False,
                 "status": "locked",
-                "error": f"Verification retries exhausted; harness locked after {self.failure_count} failures.",
+                "error": f"Verification retries exhausted; harness locked after {updated_failures} failures.",
                 "last_reason": last_reason,
                 "output": last_output,
                 "locked": True,
-                "failure_count": self.failure_count,
+                "failure_count": updated_failures,
                 "elapsed_ms": total_ms,
                 "history": [rec.to_dict() for rec in history],
             }
@@ -312,7 +349,7 @@ class HarnessExecutionEngine:
             "last_reason": last_reason,
             "output": last_output,
             "locked": False,
-            "failure_count": self.failure_count,
+            "failure_count": updated_failures,
             "elapsed_ms": total_ms,
             "history": [rec.to_dict() for rec in history],
         }
