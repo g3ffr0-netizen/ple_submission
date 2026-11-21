@@ -1,4 +1,3 @@
-# pipeline.py
 """Offline contract & regression test suite for HarnessExecutionEngine and serve.py."""
 
 import asyncio
@@ -22,12 +21,19 @@ class HarnessContractTests(unittest.TestCase):
             max_retries=3,
             max_failures=2,
             max_output_tokens=4096,
-            fallback_models=["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-pro"],
+            fallback_models=[
+                "gemini-3.8-flash",
+                "gemini-3.5-flash",
+                "gemini-3.1-pro",
+            ],
         )
 
     def test_initial_state_and_normalization(self):
         self.assertEqual(self.engine.model, "gemini-3.8-flash")
-        self.assertEqual(self.engine.fallback_models, ["gemini-3.5-flash", "gemini-3.1-pro"])
+        self.assertEqual(
+            self.engine.fallback_models,
+            ["gemini-3.5-flash", "gemini-3.1-pro"],
+        )
         self.assertEqual(self.engine.max_retries, 3)
         self.assertEqual(self.engine.max_failures, 2)
         self.assertEqual(self.engine.max_output_tokens, 4096)
@@ -83,25 +89,43 @@ class HarnessContractTests(unittest.TestCase):
         self.assertTrue(res["ok"])
         self.assertEqual(res["status"], "verified")
         self.assertEqual(res["attempt"], 3)
-        self.assertEqual(models_called, ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-pro"])
+        self.assertEqual(
+            models_called,
+            ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-pro"],
+        )
         self.assertEqual(len(res["history"]), 3)
         self.assertEqual(self.engine.failure_count, 0)
 
     def test_circuit_breaker_lock_and_reset(self):
-        engine = HarnessExecutionEngine(config_path="nonexistent.yaml", max_retries=1, max_failures=2)
-
-        r1 = engine.run_with_verification("Task", lambda p, m, t: "bad", lambda o: (False, "wrong"))
+        engine = HarnessExecutionEngine(
+            config_path="nonexistent.yaml",
+            max_retries=1,
+            max_failures=2,
+        )
+        r1 = engine.run_with_verification(
+            "Task",
+            lambda p, m, t: "bad",
+            lambda o: (False, "wrong"),
+        )
         self.assertEqual(r1["status"], "verification_retries_exhausted")
         self.assertFalse(engine.locked)
         self.assertEqual(engine.failure_count, 1)
 
-        r2 = engine.run_with_verification("Task", lambda p, m, t: "bad", lambda o: (False, "wrong"))
+        r2 = engine.run_with_verification(
+            "Task",
+            lambda p, m, t: "bad",
+            lambda o: (False, "wrong"),
+        )
         self.assertEqual(r2["status"], "locked")
         self.assertTrue(engine.locked)
         self.assertEqual(engine.failure_count, 2)
 
         # Locked engine must refuse execution until reset
-        r3 = engine.run_with_verification("Task", lambda p, m, t: "good", lambda o: (True, "ok"))
+        r3 = engine.run_with_verification(
+            "Task",
+            lambda p, m, t: "good",
+            lambda o: (True, "ok"),
+        )
         self.assertEqual(r3["status"], "locked")
 
         state = engine.reset()
@@ -109,13 +133,65 @@ class HarnessContractTests(unittest.TestCase):
         self.assertFalse(engine.locked)
         self.assertEqual(engine.failure_count, 0)
 
-        r4 = engine.run_with_verification("Task", lambda p, m, t: "good", lambda o: (True, "ok"))
+        r4 = engine.run_with_verification(
+            "Task",
+            lambda p, m, t: "good",
+            lambda o: (True, "ok"),
+        )
         self.assertTrue(r4["ok"])
 
 
 class ServeWebSocketContractTests(unittest.TestCase):
     def setUp(self):
-        self.engine = HarnessExecutionEngine(config_path="nonexistent.yaml", max_retries=1, max_failures=1)
+        self.engine = HarnessExecutionEngine(
+            config_path="nonexistent.yaml",
+            max_retries=1,
+            max_failures=1,
+        )
 
     def _send(self, raw_message, runner=None):
-        return json.loads(asyncio.run(
+        async def _invoke():
+            return await handle_ws_message(
+                raw_message,
+                self.engine,
+                run_harness_fn=runner,
+            )
+
+        return json.loads(asyncio.run(_invoke()))
+
+    def test_ping_and_status(self):
+        pong = self._send('{"type": "ping"}')
+        self.assertEqual(pong["type"], "pong")
+
+        status = self._send('{"type": "status"}')
+        self.assertFalse(status["locked"])
+        self.assertEqual(status["failure_count"], 0)
+
+    def test_invalid_json_returns_error(self):
+        resp = self._send("{not valid json")
+        self.assertEqual(resp["type"], "error")
+
+    def test_execute_and_reset(self):
+        def fake_runner(prompt):
+            return {
+                "ok": True,
+                "status": "verified",
+                "output": f"echo:{prompt}",
+                "model": self.engine.model,
+            }
+
+        ok_resp = self._send(
+            '{"type": "execute", "prompt": "hello"}',
+            runner=fake_runner,
+        )
+        self.assertEqual(ok_resp["type"], "result")
+        self.assertTrue(ok_resp["ok"])
+        self.assertEqual(ok_resp["output"], "echo:hello")
+
+        reset_resp = self._send('{"type": "reset"}')
+        self.assertEqual(reset_resp["type"], "status")
+        self.assertFalse(reset_resp["locked"])
+
+
+if __name__ == "__main__":
+    unittest.main()
