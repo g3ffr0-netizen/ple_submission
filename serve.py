@@ -117,7 +117,7 @@ async def handle_ws_message(raw_message: str, engine: Any, run_harness_fn: Any) 
         }, request_id)
 
     if result.get("locked") or result.get("status") == "locked":
-        return _dumps({
+        return _dumps(...}
             "type": "lockout",
             "status": "locked",
             "locked": True,
