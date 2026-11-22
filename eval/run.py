@@ -12,7 +12,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from harness import HarnessExecutionEngine
+from harness import HarnessExecutionEngine, extract_json_payload
 
 try:
     from google import genai
@@ -59,10 +59,7 @@ def build_task_verifier(task: Dict[str, Any]) -> Callable[[str], Tuple[bool, str
         if missing:
             return False, f"Missing required terms: {', '.join(map(str, missing))}."
         if require_json:
-            cleaned = text
-            if cleaned.startswith("```"):
-                lines = cleaned.splitlines()
-                cleaned = "\n".join(lines[1:-1] if len(lines) >= 3 and lines[-1].strip() == "```" else lines[1:])
+            cleaned = extract_json_payload(text)
             try:
                 json.loads(cleaned)
             except json.JSONDecodeError as exc:
@@ -191,4 +188,11 @@ def main() -> None:
     args.out.write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(
         f"Evaluated {report['total_tasks']} tasks ({report['mode']}): "
-        f"{report['passed']}/{report['total_tasks']} passed ({report['pass_rate'] * 100:.1f
+        f"{report['passed']}/{report['total_tasks']} passed "
+        f"({report['pass_rate'] * 100:.1f}%), "
+        f"{report['lockouts']} lockout(s). Report saved to {args.out}"
+    )
+
+
+if __name__ == "__main__":
+    main()

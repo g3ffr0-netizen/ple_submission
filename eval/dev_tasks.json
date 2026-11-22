@@ -1,0 +1,25 @@
+{
+  "tasks": [
+    {
+      "id": "task_01_basic_summary",
+      "prompt": "Summarize the bounded execution harness in one concise sentence.",
+      "min_chars": 20,
+      "required_terms": ["verified"],
+      "require_json": false
+    },
+    {
+      "id": "task_02_microgrid_phrase",
+      "prompt": "Confirm microgrid status and include the phrase 'microgrid verified'.",
+      "min_chars": 20,
+      "required_terms": ["microgrid verified"],
+      "require_json": false
+    },
+    {
+      "id": "task_03_json_status",
+      "prompt": "Return a JSON object reporting status ok and microgrid readiness.",
+      "min_chars": 15,
+      "required_terms": ["status", "ok"],
+      "require_json": true
+    }
+  ]
+}

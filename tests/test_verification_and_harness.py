@@ -1,13 +1,20 @@
 import json
 import os
+import sys
 import tempfile
 import unittest
+from pathlib import Path
 
-from app import _extract_json_payload, make_verify_fn
-from harness import HarnessExecutionEngine
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from harness import HarnessExecutionEngine, extract_json_payload, make_verify_fn
 
 
-def _make_engine(tmp_dir: str, max_retries: int = 3, max_failures: int = 3) -> HarnessExecutionEngine:
+def _make_engine(
+    tmp_dir: str, max_retries: int = 3, max_failures: int = 3
+) -> HarnessExecutionEngine:
     config_path = os.path.join(tmp_dir, "submission.yaml")
     with open(config_path, "w", encoding="utf-8") as fh:
         fh.write(
@@ -26,7 +33,7 @@ def _make_engine(tmp_dir: str, max_retries: int = 3, max_failures: int = 3) -> H
 class TestVerificationAndHarness(unittest.TestCase):
     def test_extract_json_payload_strips_fenced_block(self):
         raw = '```json\n{"status": "ok", "bus_kv": 1.0}\n```'
-        parsed = json.loads(_extract_json_payload(raw))
+        parsed = json.loads(extract_json_payload(raw))
         self.assertEqual(parsed, {"status": "ok", "bus_kv": 1.0})
 
     def test_verify_rejects_malformed_json_even_with_required_phrase(self):
@@ -41,14 +48,20 @@ class TestVerificationAndHarness(unittest.TestCase):
 
     def test_verify_min_chars_exact_boundary(self):
         payload = '{"status":"ok","note":"microgrid verified and operational"}'
-        verify_exact = make_verify_fn(min_chars=len(payload), required_phrase="", require_json=True)
-        verify_over = make_verify_fn(min_chars=len(payload) + 1, required_phrase="", require_json=True)
+        verify_exact = make_verify_fn(
+            min_chars=len(payload), required_phrase="", require_json=True
+        )
+        verify_over = make_verify_fn(
+            min_chars=len(payload) + 1, required_phrase="", require_json=True
+        )
 
         self.assertTrue(verify_exact(payload)[0])
         self.assertFalse(verify_over(payload)[0])
 
     def test_verify_phrase_case_insensitive_and_missing(self):
-        verify = make_verify_fn(min_chars=1, required_phrase="Microgrid Verified", require_json=False)
+        verify = make_verify_fn(
+            min_chars=1, required_phrase="Microgrid Verified", require_json=False
+        )
         self.assertTrue(verify("prefix microgrid verified suffix")[0])
         self.assertFalse(verify("missing the target text")[0])
 
@@ -59,7 +72,10 @@ class TestVerificationAndHarness(unittest.TestCase):
             seen_calls.append((model, prompt, max_output_tokens))
             if len(seen_calls) == 1:
                 return '{"status": "ok"}'
-            return '{"status": "ok", "detail": "padded response that easily exceeds the minimum length requirement"}'
+            return (
+                '{"status": "ok", "detail": "padded response that easily exceeds '
+                'the minimum length requirement of one hundred twenty characters"}'
+            )
 
         verify = make_verify_fn(min_chars=120, required_phrase="", require_json=True)
         with tempfile.TemporaryDirectory() as tmp_dir:

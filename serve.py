@@ -42,7 +42,12 @@ async def handle_ws_message(raw_message: str, engine: Any, run_harness_fn: Any) 
         )
 
     request_id = payload.get("request_id")
-    action = str(payload.get("action", "execute")).strip().lower()
+    raw_action = (
+        payload.get("action")
+        if payload.get("action") is not None
+        else payload.get("type", "execute")
+    )
+    action = str(raw_action).strip().lower()
 
     if action == "ping":
         return _dumps(

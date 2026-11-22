@@ -160,10 +160,15 @@ class ServeWebSocketContractTests(unittest.TestCase):
         return json.loads(asyncio.run(_invoke()))
 
     def test_ping_and_status(self):
-        pong = self._send('{"type": "ping"}')
+        pong = self._send('{"action": "ping"}')
         self.assertEqual(pong["type"], "pong")
 
-        status = self._send('{"type": "status"}')
+        # Backward-compatible `type` alias
+        pong_alias = self._send('{"type": "ping"}')
+        self.assertEqual(pong_alias["type"], "pong")
+
+        status = self._send('{"action": "status"}')
+        self.assertEqual(status["type"], "status")
         self.assertFalse(status["locked"])
         self.assertEqual(status["failure_count"], 0)
 
@@ -172,7 +177,8 @@ class ServeWebSocketContractTests(unittest.TestCase):
         self.assertEqual(resp["type"], "error")
 
     def test_execute_and_reset(self):
-        def fake_runner(prompt):
+        def fake_runner(payload):
+            prompt = payload.get("prompt", "") if isinstance(payload, dict) else str(payload)
             return {
                 "ok": True,
                 "status": "verified",
@@ -181,15 +187,15 @@ class ServeWebSocketContractTests(unittest.TestCase):
             }
 
         ok_resp = self._send(
-            '{"type": "execute", "prompt": "hello"}',
+            '{"action": "execute", "prompt": "hello"}',
             runner=fake_runner,
         )
         self.assertEqual(ok_resp["type"], "result")
         self.assertTrue(ok_resp["ok"])
         self.assertEqual(ok_resp["output"], "echo:hello")
 
-        reset_resp = self._send('{"type": "reset"}')
-        self.assertEqual(reset_resp["type"], "status")
+        reset_resp = self._send('{"action": "reset"}')
+        self.assertEqual(reset_resp["type"], "reset")
         self.assertFalse(reset_resp["locked"])
 
 
