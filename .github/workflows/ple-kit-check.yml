@@ -1,0 +1,213 @@
+name: PLE Kit Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ple-kit-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out submission repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python and uv
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: python -m pip install --upgrade pip uv
+
+      - name: Clone official PLE starter kit and install dependencies
+        run: |
+          rm -rf "$RUNNER_TEMP/ple_kit"
+          git clone --depth 1 https://github.com/google-research/ple.git "$RUNNER_TEMP/ple_kit"
+          cd "$RUNNER_TEMP/ple_kit"
+          uv sync
+
+      - name: Run kit validate on submission
+        run: |
+          cd "$RUNNER_TEMP/ple_kit"
+          uv run python -m kit validate "$GITHUB_WORKSPACE"
+
+      - name: Run kit build and capture serve image
+        run: |
+          cd "$RUNNER_TEMP/ple_kit"
+          uv run python -m kit build "$GITHUB_WORKSPACE" 2>&1 | tee "$RUNNER_TEMP/kit_build.log"
+          SERVE_IMAGE=$(sed -n 's/.*serve image \([^[:space:]]*\).*/\1/p' "$RUNNER_TEMP/kit_build.log" | tail -n 1)
+          if [ -z "$SERVE_IMAGE" ]; then
+            echo "::error::Could not determine built serve image tag from kit build output"
+            docker images
+            exit 1
+          fi
+          echo "SERVE_IMAGE=$SERVE_IMAGE" >> "$GITHUB_ENV"
+          echo "Built serve image: $SERVE_IMAGE"
+
+      - name: Verify serve.py listens in hardened container
+        run: |
+          cd "$RUNNER_TEMP/ple_kit"
+          SERVE_CMD=$(uv run python -c "
+          from kit import spec
+          sub = spec.load('$GITHUB_WORKSPACE')
+          print(spec.fill(sub.serve, 8765))
+          ")
+          echo "Starting container with serve command: $SERVE_CMD"
+          docker rm -f ple-ci-serve || true
+          docker run -d \
+            --name ple-ci-serve \
+            --user 1000:1000 \
+            --read-only \
+            --tmpfs /tmp:rw,exec,nosuid,size=1g,mode=1777 \
+            --tmpfs /home/harness:rw,exec,nosuid,size=1g,uid=1000,gid=1000 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            -p 127.0.0.1:8765:8765 \
+            -e PORT=8765 \
+            -e HOME=/home/harness \
+            -e USER=harness \
+            -e MODEL_NAME=gemini-3.8-flash \
+            -e OPENAI_BASE_URL=http://127.0.0.1:4000/v1 \
+            -e OPENAI_API_KEY=ci-probe-placeholder \
+            "$SERVE_IMAGE" \
+            bash -c "$SERVE_CMD"
+
+          uv run python -c "
+          import asyncio, json, time
+          import websockets
+
+          async def probe():
+              deadline = time.monotonic() + 30.0
+              last_err = None
+              while time.monotonic() < deadline:
+                  try:
+                      async with websockets.connect(
+                          'ws://127.0.0.1:8765',
+                          max_size=16 << 20,
+                          ping_interval=None,
+                      ) as ws:
+                          await ws.send(json.dumps({'type': 'probe'}))
+                          raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                          msg = json.loads(raw)
+                          assert msg.get('type') == 'error', msg
+                          assert 'expected a task message first' in msg.get('message', ''), msg
+                          print('Listen probe response OK:', msg)
+                          return
+                  except Exception as exc:
+                      last_err = exc
+                      await asyncio.sleep(0.5)
+              raise RuntimeError(f'WebSocket probe failed within 30s: {last_err}')
+
+          asyncio.run(probe())
+          "
+
+          LOGS=$(docker logs ple-ci-serve 2>&1)
+          echo "$LOGS"
+          printf '%s\n' "$LOGS" | grep -q "listening on 8765"
+          RUNNING=$(docker inspect -f '{{.State.Running}}' ple-ci-serve)
+          test "$RUNNING" = "true"
+
+      - name: Verify PLE Protocol v1 dry-run task lifecycle in built container
+        run: |
+          cd "$RUNNER_TEMP/ple_kit"
+          docker rm -f ple-ci-dryrun || true
+          docker run -d \
+            --name ple-ci-dryrun \
+            --user 1000:1000 \
+            --read-only \
+            --tmpfs /tmp:rw,exec,nosuid,size=1g,mode=1777 \
+            --tmpfs /home/harness:rw,exec,nosuid,size=1g,uid=1000,gid=1000 \
+            --cap-drop ALL \
+            --security-opt no-new-privileges \
+            -p 127.0.0.1:8766:8765 \
+            -e PORT=8765 \
+            -e HOME=/home/harness \
+            -e USER=harness \
+            "$SERVE_IMAGE" \
+            /opt/harness/venv/bin/python /opt/harness/src/serve.py --dry-run
+
+          uv run python -c "
+          import asyncio, base64, json, time
+          import websockets
+
+          async def drive():
+              deadline = time.monotonic() + 30.0
+              ws = None
+              last_err = None
+              while time.monotonic() < deadline:
+                  try:
+                      ws = await websockets.connect(
+                          'ws://127.0.0.1:8766',
+                          max_size=16 << 20,
+                          ping_interval=None,
+                      )
+                      break
+                  except Exception as exc:
+                      last_err = exc
+                      await asyncio.sleep(0.5)
+              if ws is None:
+                  raise RuntimeError(f'Could not connect to dry-run container: {last_err}')
+
+              files = {}
+              counts = {'exec': 0, 'read_file': 0, 'write_file': 0, 'log': 0, 'usage': 0}
+              async with ws:
+                  await ws.send(json.dumps({
+                      'type': 'task',
+                      'protocol': 1,
+                      'session': 'ci-dryrun',
+                      'instruction': 'Write HELLO to /app/hello.txt and summarize.',
+                      'workdir': '/app',
+                      'limits': {'agent_timeout_sec': 120, 'exec_timeout_sec': 60},
+                      'mcp_servers': [],
+                  }))
+                  while True:
+                      msg = json.loads(await asyncio.wait_for(ws.recv(), timeout=15.0))
+                      kind = msg.get('type')
+                      if kind in ('log', 'usage'):
+                          counts[kind] += 1
+                          continue
+                      if kind == 'done':
+                          assert str(msg.get('final_message', '')).strip(), msg
+                          assert files.get('/app/hello.txt') == b'HELLO\n', files
+                          print('Dry-run Protocol v1 lifecycle OK:', counts, msg['final_message'])
+                          return
+                      if kind == 'error':
+                          raise AssertionError(f'Unexpected error frame: {msg}')
+                      rid = msg['id']
+                      counts[kind] = counts.get(kind, 0) + 1
+                      if kind == 'exec':
+                          reply = {'type': 'result', 'id': rid, 'ok': True, 'exit_code': 0, 'output': '/app\n', 'truncated': False, 'timed_out': False}
+                      elif kind == 'read_file':
+                          data = files.get(msg['path'])
+                          if data is None:
+                              reply = {'type': 'result', 'id': rid, 'ok': False, 'error': 'missing'}
+                          else:
+                              reply = {'type': 'result', 'id': rid, 'ok': True, 'content_b64': base64.b64encode(data).decode(), 'size': len(data), 'truncated': False}
+                      elif kind == 'write_file':
+                          data = base64.b64decode(msg['content_b64'])
+                          prev = files.get(msg['path'], b'') if msg.get('append') else b''
+                          files[msg['path']] = prev + data
+                          reply = {'type': 'result', 'id': rid, 'ok': True, 'size': len(files[msg['path']])}
+                      else:
+                          reply = {'type': 'result', 'id': rid, 'ok': False, 'error': f'unsupported {kind}'}
+                      await ws.send(json.dumps(reply))
+
+          asyncio.run(drive())
+          "
+
+      - name: Clean up containers and print logs on failure
+        if: always()
+        run: |
+          for name in ple-ci-serve ple-ci-dryrun; do
+            if docker container inspect "$name" >/dev/null 2>&1; then
+              echo "=== $name logs ==="
+              docker logs "$name" 2>&1 || true
+            fi
+          done
+          docker rm -f ple-ci-serve ple-ci-dryrun >/dev/null 2>&1 || true
