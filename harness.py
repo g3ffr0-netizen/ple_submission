@@ -11,10 +11,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemini-4-hydrogen"
+DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_FALLBACK_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.5-flash-lite",
+    "gemini-4-argon",
+    "gemini-3.1-pro-preview",
 ]
 
 _CLOSED_FENCE_RE = re.compile(r"```([A-Za-z0-9_+-]*)[ \t]*\r?\n(.*?)```", re.DOTALL)
@@ -62,6 +62,43 @@ def extract_json_payload(text: Any) -> str:
         return "\n".join(lines[1:]).strip()
 
     return cleaned
+
+
+def is_pass_verdict(verdict: Any) -> bool:
+    """Return True if a verifier reply unambiguously indicates PASS."""
+    parsed_dict: Optional[Dict[str, Any]] = None
+    if isinstance(verdict, dict):
+        parsed_dict = verdict
+    elif isinstance(verdict, str):
+        stripped = verdict.strip("`*_.,!:; \r\n\t")
+        if stripped.upper() == "PASS":
+            return True
+        payload = extract_json_payload(verdict)
+        if payload:
+            try:
+                decoded = json.loads(payload)
+                if isinstance(decoded, dict):
+                    parsed_dict = decoded
+            except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
+                return False
+    else:
+        return False
+
+    if parsed_dict is None:
+        return False
+
+    for key in ("pass", "ok", "passed"):
+        if isinstance(parsed_dict.get(key), bool):
+            return bool(parsed_dict[key])
+    for key in ("verdict", "status", "result"):
+        val = parsed_dict.get(key)
+        if isinstance(val, str) and val.strip("`*_.,!:; \r\n\t").upper() in (
+            "PASS",
+            "PASSED",
+            "OK",
+        ):
+            return True
+    return False
 
 
 def make_verify_fn(
@@ -136,6 +173,36 @@ def load_submission_config(config_path: str = "submission.yaml") -> Dict[str, An
             return {}
 
 
+class CircuitBreaker:
+    """Tracks consecutive failures and locks execution past `max_failures`."""
+
+    def __init__(self, max_failures: int = 3) -> None:
+        self.max_failures = _safe_int(max_failures, default=3, minimum=1)
+        self.failure_count = 0
+        self.locked = False
+
+    def record_success(self) -> None:
+        """Reset consecutive failure streak on a verified/clean success."""
+        self.failure_count = 0
+
+    def record_failure(self) -> bool:
+        """Increment failure count and lock once max_failures is reached."""
+        self.failure_count += 1
+        if self.failure_count >= self.max_failures:
+            self.locked = True
+        return self.locked
+
+    def reset(self) -> Dict[str, Any]:
+        """Reset consecutive failure count and clear lockout state."""
+        self.failure_count = 0
+        self.locked = False
+        return {
+            "status": "reset",
+            "locked": self.locked,
+            "failure_count": self.failure_count,
+        }
+
+
 class HarnessExecutionEngine:
     """Executes prompts with verification retries, model rotation, and circuit breaking."""
 
@@ -150,15 +217,23 @@ class HarnessExecutionEngine:
     ) -> None:
         cfg = load_submission_config(config_path)
         harness_cfg = cfg.get("harness") if isinstance(cfg.get("harness"), dict) else {}
+        env_cfg = cfg.get("env") if isinstance(cfg.get("env"), dict) else {}
 
-        raw_model = model if model is not None else cfg.get("model", DEFAULT_MODEL)
+        if model is not None:
+            raw_model: Any = model
+        elif "model_api" in cfg:
+            raw_model = cfg.get("model_api")
+        else:
+            raw_model = cfg.get("model", DEFAULT_MODEL)
         self.model = normalize_model_name(raw_model)
 
-        raw_fallbacks = (
-            fallback_models
-            if fallback_models is not None
-            else harness_cfg.get("fallback_models", DEFAULT_FALLBACK_MODELS)
-        )
+        if fallback_models is not None:
+            raw_fallbacks: Any = fallback_models
+        elif "fallback_models" in harness_cfg:
+            raw_fallbacks = harness_cfg.get("fallback_models")
+        else:
+            raw_fallbacks = DEFAULT_FALLBACK_MODELS
+
         normalized_fallbacks: List[str] = []
         if isinstance(raw_fallbacks, list):
             for candidate in raw_fallbacks:
@@ -167,36 +242,72 @@ class HarnessExecutionEngine:
                     normalized_fallbacks.append(norm)
         self.fallback_models = normalized_fallbacks
 
-        self.max_retries = _safe_int(
-            max_retries if max_retries is not None else harness_cfg.get("max_retries"),
-            default=3,
-            minimum=1,
+        raw_retries = (
+            max_retries
+            if max_retries is not None
+            else (
+                harness_cfg.get("max_retries")
+                if "max_retries" in harness_cfg
+                else env_cfg.get("MAX_RETRIES")
+            )
         )
-        self.max_failures = _safe_int(
-            max_failures if max_failures is not None else harness_cfg.get("max_failures"),
-            default=3,
-            minimum=1,
+        raw_failures = (
+            max_failures
+            if max_failures is not None
+            else (
+                harness_cfg.get("max_failures")
+                if "max_failures" in harness_cfg
+                else env_cfg.get("MAX_FAILURES")
+            )
         )
-        self.max_output_tokens = _safe_int(
+        raw_output_tokens = (
             max_output_tokens
             if max_output_tokens is not None
-            else harness_cfg.get("max_output_tokens"),
-            default=4096,
-            minimum=64,
+            else (
+                harness_cfg.get("max_output_tokens")
+                if "max_output_tokens" in harness_cfg
+                else env_cfg.get("MAX_OUTPUT_TOKENS")
+            )
         )
 
-        self.failure_count = 0
-        self.locked = False
+        self.max_retries = _safe_int(raw_retries, default=3, minimum=1)
+        self._breaker = CircuitBreaker(
+            max_failures=_safe_int(raw_failures, default=3, minimum=1)
+        )
+        self.max_output_tokens = _safe_int(
+            raw_output_tokens, default=4096, minimum=64
+        )
+
+    @property
+    def max_failures(self) -> int:
+        return self._breaker.max_failures
+
+    @max_failures.setter
+    def max_failures(self, value: int) -> None:
+        self._breaker.max_failures = _safe_int(value, default=3, minimum=1)
+
+    @property
+    def failure_count(self) -> int:
+        return self._breaker.failure_count
+
+    @failure_count.setter
+    def failure_count(self, value: int) -> None:
+        self._breaker.failure_count = int(value)
+
+    @property
+    def locked(self) -> bool:
+        return self._breaker.locked
+
+    @locked.setter
+    def locked(self, value: bool) -> None:
+        self._breaker.locked = bool(value)
 
     def reset(self) -> Dict[str, Any]:
         """Reset circuit-breaker state and failure counter."""
-        self.failure_count = 0
-        self.locked = False
+        state = self._breaker.reset()
         logger.info("Harness circuit breaker reset (model=%s).", self.model)
         return {
-            "status": "reset",
-            "locked": self.locked,
-            "failure_count": self.failure_count,
+            **state,
             "model": self.model,
         }
 
@@ -265,7 +376,7 @@ class HarnessExecutionEngine:
                     }
                 )
                 if ok:
-                    self.failure_count = 0
+                    self._breaker.record_success()
                     return {
                         "ok": True,
                         "status": "verified",
@@ -312,9 +423,7 @@ class HarnessExecutionEngine:
                     "Please try again cleanly."
                 )
 
-        self.failure_count += 1
-        if self.failure_count >= self.max_failures:
-            self.locked = True
+        if self._breaker.record_failure():
             status = "locked"
             logger.warning(
                 "Circuit breaker locked after %d consecutive failures.",
@@ -334,4 +443,3 @@ class HarnessExecutionEngine:
             "elapsed_ms": _elapsed_ms(),
             "history": history,
         }
-

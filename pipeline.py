@@ -1,16 +1,23 @@
-"""Offline contract & regression test suite for HarnessExecutionEngine and serve.py."""
+"""Offline contract & regression test suite for HarnessExecutionEngine and PLE Protocol v1 serve.py."""
 
 import asyncio
 import json
+import os
 import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import yaml
 
 from harness import (
     DEFAULT_MODEL,
     HarnessExecutionEngine,
+    is_pass_verdict,
     load_submission_config,
     normalize_model_name,
 )
-from serve import handle_ws_message
+import serve
+import taskbridge
 
 
 class HarnessContractTests(unittest.TestCase):
@@ -23,8 +30,8 @@ class HarnessContractTests(unittest.TestCase):
             max_output_tokens=4096,
             fallback_models=[
                 "gemini-3.8-flash",
-                "gemini-3.5-flash",
-                "gemini-3.1-pro",
+                "gemini-4-argon",
+                "gemini-3.1-pro-preview",
             ],
         )
 
@@ -32,7 +39,7 @@ class HarnessContractTests(unittest.TestCase):
         self.assertEqual(self.engine.model, "gemini-3.8-flash")
         self.assertEqual(
             self.engine.fallback_models,
-            ["gemini-3.5-flash", "gemini-3.1-pro"],
+            ["gemini-4-argon", "gemini-3.1-pro-preview"],
         )
         self.assertEqual(self.engine.max_retries, 3)
         self.assertEqual(self.engine.max_failures, 2)
@@ -91,7 +98,7 @@ class HarnessContractTests(unittest.TestCase):
         self.assertEqual(res["attempt"], 3)
         self.assertEqual(
             models_called,
-            ["gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.1-pro"],
+            ["gemini-3.8-flash", "gemini-4-argon", "gemini-3.1-pro-preview"],
         )
         self.assertEqual(len(res["history"]), 3)
         self.assertEqual(self.engine.failure_count, 0)
@@ -120,7 +127,6 @@ class HarnessContractTests(unittest.TestCase):
         self.assertTrue(engine.locked)
         self.assertEqual(engine.failure_count, 2)
 
-        # Locked engine must refuse execution until reset
         r3 = engine.run_with_verification(
             "Task",
             lambda p, m, t: "good",
@@ -141,62 +147,101 @@ class HarnessContractTests(unittest.TestCase):
         self.assertTrue(r4["ok"])
 
 
-class ServeWebSocketContractTests(unittest.TestCase):
-    def setUp(self):
-        self.engine = HarnessExecutionEngine(
-            config_path="nonexistent.yaml",
-            max_retries=1,
-            max_failures=1,
+class ServeProtocolV1ContractTests(unittest.TestCase):
+    def test_submission_yaml_ple_schema_contract(self):
+        cfg_path = Path(__file__).resolve().parent / "submission.yaml"
+        data = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual(data["name"], "ple-submission")
+        self.assertEqual(data["model_api"], "google-cloud/gemini-3.8-flash")
+        self.assertTrue(
+            set(data.keys()).issubset({"name", "model_api", "model_base_url", "install", "serve", "env"})
         )
 
-    def _send(self, raw_message, runner=None):
-        async def _invoke():
-            return await handle_ws_message(
-                raw_message,
-                self.engine,
-                run_harness_fn=runner,
-            )
+    def test_solve_with_dry_run_client_and_session(self):
+        class _FakeSession:
+            instruction = "Write /app/hello.txt with HELLO"
+            workdir = "/app"
+            mcp_servers = []
+            limits = {"agent_timeout_sec": 300}
+            final_message = ""
+            cancelled = asyncio.Event()
 
-        return json.loads(asyncio.run(_invoke()))
+            def __init__(self):
+                self.files = {}
+                self.logs = []
+                self.usages = []
 
-    def test_ping_and_status(self):
-        pong = self._send('{"action": "ping"}')
-        self.assertEqual(pong["type"], "pong")
+            def time_left(self):
+                return 300.0
 
-        # Backward-compatible `type` alias
-        pong_alias = self._send('{"type": "ping"}')
-        self.assertEqual(pong_alias["type"], "pong")
+            async def exec(self, command, timeout_sec=120):
+                return {"exit_code": 0, "output": "/app\n", "truncated": False}
 
-        status = self._send('{"action": "status"}')
-        self.assertEqual(status["type"], "status")
-        self.assertFalse(status["locked"])
-        self.assertEqual(status["failure_count"], 0)
+            async def read_file(self, path):
+                if path not in self.files:
+                    raise taskbridge.TaskError(f"missing {path}")
+                return self.files[path]
 
-    def test_invalid_json_returns_error(self):
-        resp = self._send("{not valid json")
-        self.assertEqual(resp["type"], "error")
+            async def write_file(self, path, data, append=False):
+                raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+                self.files[path] = raw
+                return len(raw)
 
-    def test_execute_and_reset(self):
-        def fake_runner(payload):
-            prompt = payload.get("prompt", "") if isinstance(payload, dict) else str(payload)
-            return {
-                "ok": True,
-                "status": "verified",
-                "output": f"echo:{prompt}",
-                "model": self.engine.model,
-            }
+            async def log(self, text):
+                self.logs.append(text)
 
-        ok_resp = self._send(
-            '{"action": "execute", "prompt": "hello"}',
-            runner=fake_runner,
-        )
-        self.assertEqual(ok_resp["type"], "result")
-        self.assertTrue(ok_resp["ok"])
-        self.assertEqual(ok_resp["output"], "echo:hello")
+            async def usage(self, model, inp, out, cached=0):
+                self.usages.append((model, inp, out, cached))
 
-        reset_resp = self._send('{"action": "reset"}')
-        self.assertEqual(reset_resp["type"], "reset")
-        self.assertFalse(reset_resp["locked"])
+        async def _run():
+            sess = _FakeSession()
+            answer = await serve.solve(sess, dry_run=True)  # type: ignore[arg-type]
+            self.assertTrue(answer.strip())
+            self.assertEqual(sess.files.get("/app/hello.txt"), b"HELLO\n")
+            self.assertGreaterEqual(len(sess.usages), 3)
+
+        asyncio.run(_run())
+
+    def test_run_tool_argument_sanitization_and_verdict_parser(self):
+        class _MinSession:
+            workdir = "/app"
+            limits = {}
+
+        async def _run():
+            fn = {"name": "bash", "arguments": '{"command": "echo ok"}'}
+            # Only verify error handling without live exec mock here: invalid JSON
+            bad_fn = {"name": "bash", "arguments": "{not json"}
+            err = await serve.run_tool(_MinSession(), bad_fn)  # type: ignore[arg-type]
+            self.assertTrue(err.startswith("error:"))
+            self.assertEqual(bad_fn["arguments"], "{}")
+            # NaN must be rejected and sanitized
+            nan_fn = {"name": "bash", "arguments": '{"command": NaN}'}
+            nan_err = await serve.run_tool(_MinSession(), nan_fn)  # type: ignore[arg-type]
+            self.assertTrue(nan_err.startswith("error:"))
+            self.assertEqual(nan_fn["arguments"], "{}")
+            return fn
+
+        asyncio.run(_run())
+        self.assertTrue(is_pass_verdict("PASS"))
+        self.assertTrue(is_pass_verdict("**pass.**"))
+        self.assertTrue(is_pass_verdict('{"verdict": "PASS"}'))
+        self.assertFalse(is_pass_verdict("1. Output file is missing."))
+        self.assertFalse(is_pass_verdict(""))
+
+    def test_resolve_runtime_config_uses_evaluator_env_vars(self):
+        with patch.dict(
+            os.environ,
+            {
+                "MODEL_NAME": "gemini-4-argon",
+                "OPENAI_BASE_URL": "http://127.0.0.1:4000/v1",
+                "OPENAI_API_KEY": "proxy-key",
+            },
+            clear=False,
+        ):
+            cfg = serve.resolve_runtime_config()
+            self.assertEqual(cfg["model"], "gemini-4-argon")
+            self.assertEqual(cfg["base_url"], "http://127.0.0.1:4000/v1")
+            self.assertEqual(cfg["api_key"], "proxy-key")
 
 
 if __name__ == "__main__":

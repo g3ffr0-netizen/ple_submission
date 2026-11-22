@@ -5,13 +5,14 @@ Covers 5 stress areas:
   1. Circuit Breaker & Lockout
   2. Fallback Rotation & Retry Feedback
   3. Hostile Output Parsing (extract_json_payload & make_verify_fn)
-  4. WebSocket Concurrency & Fuzzing (serve.py)
+  4. PLE Serve Protocol v1 Concurrency, Fuzzing & Tool Breaker Stress Tests
   5. Config & Eval Resilience (harness.py & eval/run.py --dry-run on 25 mixed tasks)
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import subprocess
 import sys
@@ -25,16 +26,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import websockets
+
 from eval.run import build_task_verifier, evaluate_tasks, make_dry_run_generate_fn
 from harness import (
     DEFAULT_FALLBACK_MODELS,
     DEFAULT_MODEL,
+    CircuitBreaker,
     HarnessExecutionEngine,
     extract_json_payload,
     load_submission_config,
     make_verify_fn,
 )
-from serve import handle_ws_message
+import serve
+import taskbridge
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +81,6 @@ class TestStressCircuitBreaker(unittest.TestCase):
         self.assertTrue(all(s == "locked" for s in statuses[3:]))
         self.assertTrue(engine.locked)
         self.assertEqual(engine.failure_count, 3)
-        # Exactly 3 failing runs * 2 retries = 6 calls; remaining 17 runs blocked before generation
         self.assertEqual(gen_calls, 6)
         self.assertEqual(verify_calls, 6)
 
@@ -86,20 +90,17 @@ class TestStressCircuitBreaker(unittest.TestCase):
             max_retries=1,
             max_failures=3,
         )
-        # 2 consecutive failures -> not locked yet
         for _ in range(2):
             r = engine.run_with_verification("t", lambda *_: "bad", lambda _: (False, "no"))
             self.assertFalse(r["ok"])
             self.assertFalse(engine.locked)
         self.assertEqual(engine.failure_count, 2)
 
-        # 1 success -> streak resets to 0
         ok_r = engine.run_with_verification("t", lambda *_: "good", lambda _: (True, "ok"))
         self.assertTrue(ok_r["ok"])
         self.assertEqual(engine.failure_count, 0)
         self.assertFalse(engine.locked)
 
-        # 3 more failures -> locks; reset -> recovers -> subsequent call works cleanly
         for _ in range(3):
             engine.run_with_verification("t", lambda *_: "bad", lambda _: (False, "no"))
         self.assertTrue(engine.locked)
@@ -139,12 +140,12 @@ class TestStressFallbackAndRetry(unittest.TestCase):
             max_failures=3,
         )
         expected_models = [
-            "gemini-4-hydrogen",
             "gemini-3.8-flash",
-            "gemini-3.5-flash-lite",
-            "gemini-3.8-flash",
-            "gemini-3.5-flash-lite",
-            "gemini-3.8-flash",
+            "gemini-4-argon",
+            "gemini-3.1-pro-preview",
+            "gemini-4-argon",
+            "gemini-3.1-pro-preview",
+            "gemini-4-argon",
         ]
         seen_models: List[str] = []
         seen_prompts: List[str] = []
@@ -175,13 +176,11 @@ class TestStressFallbackAndRetry(unittest.TestCase):
         self.assertEqual(seen_models, expected_models)
         self.assertEqual(len(res["history"]), 6)
 
-        # Verify every retry prompt received the specific prior failure reason
         self.assertIn("upstream deadline exceeded", seen_prompts[1])
         self.assertIn("HTTP 503 overloaded", seen_prompts[2])
         self.assertIn("Output is empty", seen_prompts[3])
         self.assertIn("Output is empty", seen_prompts[4])
         self.assertIn("microgrid verified", seen_prompts[5].lower())
-        # Ensure retry prompt does not compound endlessly
         self.assertLess(len(seen_prompts[5]), 400)
 
     def test_verifier_exception_is_caught_cleanly(self):
@@ -198,7 +197,6 @@ class TestStressFallbackAndRetry(unittest.TestCase):
         self.assertEqual(len(res["history"]), 2)
 
     def test_elapsed_ms_is_reported_by_engine(self):
-        """app.py and eval/run.py read result['elapsed_ms']; verify engine populates it."""
         engine = HarnessExecutionEngine(
             config_path="nonexistent.yaml", max_retries=1, max_failures=2
         )
@@ -298,121 +296,150 @@ class TestStressHostileOutputParsing(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 4. WebSocket Concurrency & Fuzzing (serve.py)
+# 4. PLE Serve Protocol v1 Concurrency, Fuzzing & Tool Breaker Stress Tests
 # ---------------------------------------------------------------------------
-class TestStressWebSocketServe(unittest.TestCase):
-    def test_60_concurrent_fuzzed_messages_never_crash(self):
-        engine = HarnessExecutionEngine(
-            config_path="nonexistent.yaml", max_retries=1, max_failures=5
-        )
-
-        async def mixed_runner(payload: Dict[str, Any]) -> Any:
-            await asyncio.sleep(0.002)
-            prompt = payload.get("prompt")
-            if prompt == "explode":
-                raise RuntimeError("runner exploded")
-            if prompt == "bad_type":
-                return "not-a-dict"
-            if not isinstance(prompt, str) or not prompt.strip():
-                return {"ok": False, "status": "invalid_prompt", "error": "Empty prompt."}
-            return {
-                "ok": True,
-                "status": "verified",
-                "output": f"ok:{prompt}",
-                "model": engine.model,
-            }
-
-        messages: List[Any] = [
-            '{"action": "ping", "request_id": "p1"}',
-            '{"type": "ping", "request_id": "p2"}',
-            '{"action": "status", "request_id": "s1"}',
-            '{"type": "status", "request_id": "s2"}',
-            '{"action": "execute", "prompt": "hello", "request_id": "e1"}',
-            '{"type": "execute", "prompt": "hello_alias", "request_id": "e2"}',
-            '{"action": "execute", "prompt": "explode", "request_id": "e3"}',
-            '{"action": "execute", "prompt": "bad_type", "request_id": "e4"}',
-            '{"action": "execute", "request_id": "e5_missing_prompt"}',
-            '{"action": "reset", "request_id": "r1"}',
-            '{"action": "unknown_op", "request_id": "u1"}',
-            '{"action": "", "request_id": "u2"}',
-            '{"action": null, "request_id": "u3"}',
-            '{"action": 12345, "request_id": "u4"}',
-            "{}",
-            "{not json",
-            "",
-            "null",
-            "[1, 2, 3]",
-            '"bare string"',
-            None,
-            42,
-            b'{"action": "ping"}',
-        ]
-        batch = messages * 3  # 69 concurrent requests
-
-        async def _run_batch():
-            return await asyncio.gather(
-                *(handle_ws_message(msg, engine, mixed_runner) for msg in batch)
-            )
-
-        raw_responses = asyncio.run(_run_batch())
-        self.assertEqual(len(raw_responses), len(batch))
-        for raw in raw_responses:
-            parsed = json.loads(raw)
-            self.assertIsInstance(parsed, dict)
-            self.assertIn("type", parsed)
-            self.assertIn(
-                parsed["type"], {"pong", "status", "reset", "result", "error", "lockout"}
-            )
-
-    def test_concurrent_failing_executes_enforce_lockout_without_race_overshoot(self):
-        """
-        Fire 20 concurrent async execute requests that always fail against an engine
-        with max_failures=3. A lock-safe handler must not allow failure_count to
-        overshoot max_failures due to TOCTOU races across await points.
-        """
-        engine = HarnessExecutionEngine(
-            config_path="nonexistent.yaml", max_retries=1, max_failures=3
-        )
-        runner_invocations = 0
-
-        async def slow_failing_runner(payload: Dict[str, Any]) -> Dict[str, Any]:
-            nonlocal runner_invocations
-            runner_invocations += 1
-            await asyncio.sleep(0.01)
-            return engine.run_with_verification(
-                payload.get("prompt", "fail"),
-                lambda *_: "bad",
-                lambda _: (False, "fail"),
-            )
-
-        async def _fire_20():
-            return await asyncio.gather(
-                *(
-                    handle_ws_message(
-                        json.dumps(
-                            {
-                                "action": "execute",
-                                "prompt": f"job_{i}",
-                                "request_id": i,
-                            }
-                        ),
-                        engine,
-                        slow_failing_runner,
+class TestStressPLEProtocolV1(unittest.TestCase):
+    def test_concurrent_protocol_v1_connections_and_fuzzed_frames(self):
+        async def _drive_valid(uri: str, idx: int) -> str:
+            files: Dict[str, bytes] = {}
+            async with websockets.connect(
+                uri, max_size=taskbridge.MAX_FRAME, ping_interval=None
+            ) as ws:
+                await ws.send(
+                    json.dumps(
+                        {
+                            "type": "task",
+                            "protocol": 1,
+                            "session": f"stress-{idx}",
+                            "instruction": f"Task {idx}",
+                            "workdir": "/app",
+                            "limits": {"agent_timeout_sec": 120},
+                        }
                     )
-                    for i in range(20)
                 )
-            )
+                while True:
+                    msg = json.loads(await ws.recv())
+                    mtype = msg.get("type")
+                    if mtype in ("log", "usage"):
+                        continue
+                    if mtype in ("done", "error"):
+                        return str(mtype)
+                    rid = msg["id"]
+                    if mtype == "exec":
+                        reply = {
+                            "type": "result",
+                            "id": rid,
+                            "ok": True,
+                            "exit_code": 0,
+                            "output": "/app\n",
+                            "truncated": False,
+                            "timed_out": False,
+                        }
+                    elif mtype == "write_file":
+                        data = base64.b64decode(msg["content_b64"])
+                        files[msg["path"]] = data
+                        reply = {"type": "result", "id": rid, "ok": True, "size": len(data)}
+                    elif mtype == "read_file":
+                        data = files.get(msg["path"], b"HELLO\n")
+                        reply = {
+                            "type": "result",
+                            "id": rid,
+                            "ok": True,
+                            "content_b64": base64.b64encode(data).decode(),
+                            "size": len(data),
+                            "truncated": False,
+                        }
+                    else:
+                        reply = {"type": "result", "id": rid, "ok": False, "error": "bad"}
+                    await ws.send(json.dumps(reply))
 
-        responses = [json.loads(r) for r in asyncio.run(_fire_20())]
-        self.assertTrue(engine.locked)
-        self.assertEqual(engine.failure_count, 3)
-        self.assertEqual(
-            runner_invocations,
-            3,
-            f"Concurrency TOCTOU race: runner invoked {runner_invocations} times despite max_failures=3",
-        )
-        lockouts = [r for r in responses if r.get("type") == "lockout"]
-        self.assertGreaterEqual(len(lockouts), 18)
+        async def _drive_hostile(uri: str, frame: str) -> str:
+            async with websockets.connect(uri) as ws:
+                if frame == "__DISCONNECT__":
+                    return "disconnected"
+                await ws.send(frame)
+                msg = json.loads(await ws.recv())
+                return str(msg.get("type"))
+
+        async def _scenario() -> None:
+            server = await serve.start_ple_server(
+                host="127.0.0.1",
+                port=0,
+                config_path=str(REPO_ROOT / "submission.yaml"),
+                dry_run=True,
+            )
+            try:
+                port = server.sockets[0].getsockname()[1]
+                uri = f"ws://127.0.0.1:{port}"
+                tasks = []
+                for i in range(8):
+                    tasks.append(_drive_valid(uri, i))
+                hostile_frames = [
+                    "{malformed json",
+                    "null",
+                    "[1, 2, 3]",
+                    '{"type": "status"}',
+                    '{"type": "task", "instruction": 123}',
+                    "",
+                    "__DISCONNECT__",
+                    '{"type": "cancel", "reason": "early"}',
+                ]
+                for frame in hostile_frames * 2:
+                    tasks.append(_drive_hostile(uri, frame))
+
+                outcomes = await asyncio.gather(*tasks)
+                self.assertEqual(outcomes[:8], ["done"] * 8)
+                for res in outcomes[8:]:
+                    self.assertIn(res, {"error", "disconnected"})
+            finally:
+                server.close()
+                await server.wait_closed()
+
+        asyncio.run(_scenario())
+
+    def test_hostile_run_tool_arguments_and_tool_circuit_breaker(self):
+        class _DummySession:
+            workdir = "/app"
+            limits = {"exec_timeout_sec": 60}
+            mcp_servers: List[Dict[str, Any]] = []
+
+            async def exec(self, command: str, timeout_sec: int = 120) -> Dict[str, Any]:
+                return {"exit_code": 0, "output": command}
+
+            async def read_file(self, path: str) -> bytes:
+                raise taskbridge.TaskError(f"missing {path}")
+
+            async def write_file(self, path: str, data: bytes | str, append: bool = False) -> int:
+                return len(data)
+
+        async def _scenario() -> None:
+            sess = _DummySession()
+            hostile_calls = [
+                {"name": "bash", "arguments": "{bad"},
+                {"name": "bash", "arguments": '{"command": NaN}'},
+                {"name": "bash", "arguments": "[1, 2, 3]"},
+                {"name": "bash", "arguments": '{"command": ""}'},
+                {"name": "read_file", "arguments": '{"path": ""}'},
+                {"name": "read_file", "arguments": '{"path": "missing.txt"}'},
+                {"name": "write_file", "arguments": '{"path": "/app/a.txt"}'},
+                {"name": "edit_file", "arguments": '{"path": "x.py", "old_text": "", "new_text": "y"}'},
+                {"name": "nonexistent_tool", "arguments": "{}"},
+                {"name": "bash", "arguments": '{"command": "' + ("x" * 25000) + '"}'},
+            ]
+            breaker = CircuitBreaker(max_failures=3)
+            trips = 0
+            for call in hostile_calls:
+                out = await serve.run_tool(sess, dict(call))  # type: ignore[arg-type]
+                self.assertIsInstance(out, str)
+                if out.startswith("error:"):
+                    if breaker.record_failure():
+                        trips += 1
+                        breaker.reset()
+                else:
+                    breaker.record_success()
+            self.assertGreaterEqual(trips, 2)
+
+        asyncio.run(_scenario())
 
 
 # ---------------------------------------------------------------------------
@@ -423,20 +450,15 @@ class TestStressConfigAndEval(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp = Path(tmp_dir)
 
-            # 1. Nonexistent path
             self.assertEqual(load_submission_config(str(tmp / "does_not_exist.yaml")), {})
-
-            # 2. Directory path instead of file
             self.assertEqual(load_submission_config(str(tmp)), {})
 
-            # 3. Empty file
             empty_f = tmp / "empty.yaml"
             empty_f.write_text("", encoding="utf-8")
             e_empty = HarnessExecutionEngine(config_path=str(empty_f))
             self.assertEqual(e_empty.model, DEFAULT_MODEL)
             self.assertEqual(e_empty.fallback_models, DEFAULT_FALLBACK_MODELS)
 
-            # 4. Malformed YAML syntax
             bad_yaml = tmp / "bad.yaml"
             bad_yaml.write_text(
                 "model: [unclosed\n  harness: : :\n\t::invalid", encoding="utf-8"
@@ -444,12 +466,10 @@ class TestStressConfigAndEval(unittest.TestCase):
             e_bad = HarnessExecutionEngine(config_path=str(bad_yaml))
             self.assertEqual(e_bad.model, DEFAULT_MODEL)
 
-            # 5. Valid YAML but non-dict root (list)
             list_yaml = tmp / "list.yaml"
             list_yaml.write_text("- item1\n- item2\n", encoding="utf-8")
             self.assertEqual(load_submission_config(str(list_yaml)), {})
 
-            # 6. Hostile field types (JSON is valid YAML too)
             hostile_cfg = tmp / "hostile.yaml"
             hostile_cfg.write_text(
                 json.dumps(
@@ -474,7 +494,6 @@ class TestStressConfigAndEval(unittest.TestCase):
 
     def test_eval_dry_run_25_mixed_pass_fail_tasks_and_lockout_recovery(self):
         tasks: List[Dict[str, Any]] = []
-        # 15 passing tasks
         for i in range(15):
             tasks.append(
                 {
@@ -485,7 +504,6 @@ class TestStressConfigAndEval(unittest.TestCase):
                     "require_json": (i % 3 == 0),
                 }
             )
-        # 10 failing tasks
         for j in range(10):
             tasks.append(
                 {
@@ -497,7 +515,6 @@ class TestStressConfigAndEval(unittest.TestCase):
                     "mock_output": "too short",
                 }
             )
-        # Interleave: 4 fail -> 8 pass -> 6 fail -> 7 pass (25 tasks total)
         mixed_tasks: List[Dict[str, Any]] = []
         mixed_tasks.extend(tasks[15:19])
         mixed_tasks.extend(tasks[0:8])
@@ -505,7 +522,6 @@ class TestStressConfigAndEval(unittest.TestCase):
         mixed_tasks.extend(tasks[8:15])
         self.assertEqual(len(mixed_tasks), 25)
 
-        # Part A: CLI end-to-end subprocess check with auto-reset on lockout
         with tempfile.TemporaryDirectory() as tmp_dir:
             tasks_path = Path(tmp_dir) / "tasks_25.json"
             out_path = Path(tmp_dir) / "results_25.json"
@@ -538,8 +554,6 @@ class TestStressConfigAndEval(unittest.TestCase):
             self.assertEqual(report["lockouts"], 3)
             self.assertAlmostEqual(report["pass_rate"], 15 / 25, places=4)
 
-        # Part B: --no-reset-on-lockout keeps harness locked for remaining 22 tasks
-        # Expects all 23 locked outcomes (task #3 locks + tasks #4..#25 blocked) to report locked=True
         engine = HarnessExecutionEngine(
             config_path="nonexistent.yaml", max_retries=1, max_failures=3
         )

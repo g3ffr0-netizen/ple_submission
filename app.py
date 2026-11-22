@@ -38,7 +38,19 @@ def get_gemini_api_key() -> str:
 
 def make_generate_fn(api_key: str) -> Callable[[str, str, int], str]:
     """Build the generation callback expected by HarnessExecutionEngine."""
-    client = genai.Client(api_key=api_key, vertexai=False) if genai is not None else None
+    base_url = os.environ.get("GOOGLE_GEMINI_BASE_URL", "").strip()
+    if genai is not None:
+        client = (
+            genai.Client(
+                api_key=api_key,
+                vertexai=False,
+                http_options={"base_url": base_url},
+            )
+            if base_url
+            else genai.Client(api_key=api_key, vertexai=False)
+        )
+    else:
+        client = None
 
     def _generate(prompt: str, model: str, max_output_tokens: int) -> str:
         if genai is None or client is None:

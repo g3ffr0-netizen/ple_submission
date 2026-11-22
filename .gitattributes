@@ -1,0 +1,9 @@
+# Force Unix LF line endings for Linux Docker containers and scripts
+*.py text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.sh text eol=lf
+*.bash text eol=lf
+*.txt text eol=lf
+*.md text eol=lf
+*.json text eol=lf

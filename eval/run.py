@@ -104,7 +104,16 @@ def make_live_generate_fn(api_key: str) -> Callable[[str, str, int], str]:
         raise RuntimeError(
             "google-genai is not installed. Run `pip install google-genai`."
         )
-    client = genai.Client(api_key=api_key, vertexai=False)
+    base_url = os.environ.get("GOOGLE_GEMINI_BASE_URL", "").strip()
+    client = (
+        genai.Client(
+            api_key=api_key,
+            vertexai=False,
+            http_options={"base_url": base_url},
+        )
+        if base_url
+        else genai.Client(api_key=api_key, vertexai=False)
+    )
 
     def _generate(prompt: str, model: str, max_output_tokens: int) -> str:
         config = (
