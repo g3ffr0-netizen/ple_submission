@@ -1,5 +1,10 @@
+"""Streamlit portal for executing and verifying Gemini tasks via the bounded harness."""
+
+from __future__ import annotations
+
+import logging
 import os
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 import pandas as pd
 import streamlit as st
@@ -7,6 +12,7 @@ from streamlit.errors import StreamlitSecretNotFoundError
 
 from harness import HarnessExecutionEngine, extract_json_payload, make_verify_fn
 
+logger = logging.getLogger(__name__)
 _extract_json_payload = extract_json_payload
 
 try:
@@ -18,15 +24,19 @@ except ImportError:
 
 
 def get_gemini_api_key() -> str:
-    """Read the key from Streamlit secrets or a local environment variable."""
+    """Read the key from Streamlit secrets first, falling back to GEMINI_API_KEY."""
+    secret_key: Any = ""
     try:
         secret_key = st.secrets.get("GEMINI_API_KEY", "")
-    except StreamlitSecretNotFoundError:
+    except (StreamlitSecretNotFoundError, KeyError, FileNotFoundError):
         secret_key = ""
-    return (str(secret_key) or os.environ.get("GEMINI_API_KEY", "")).strip()
+    cleaned_secret = secret_key.strip() if isinstance(secret_key, str) else ""
+    env_key = os.environ.get("GEMINI_API_KEY", "")
+    cleaned_env = env_key.strip() if isinstance(env_key, str) else ""
+    return cleaned_secret or cleaned_env
 
 
-def make_generate_fn(api_key: str):
+def make_generate_fn(api_key: str) -> Callable[[str, str, int], str]:
     """Build the generation callback expected by HarnessExecutionEngine."""
     client = genai.Client(api_key=api_key, vertexai=False) if genai is not None else None
 
@@ -45,7 +55,7 @@ def make_generate_fn(api_key: str):
             contents=prompt,
             config=config,
         )
-        return (response.text or "").strip()
+        return (getattr(response, "text", None) or "").strip()
 
     return _generate
 
@@ -109,11 +119,23 @@ def _render_sidebar(engine: Any, api_key: str) -> None:
 
 
 def _render_result(result: Dict[str, Any], engine: Any) -> None:
-    """Render the latest run outcome and attempt history."""
+    """Render the latest run outcome, model role, elapsed time, and attempt history."""
     st.subheader("Latest result")
+    used_model = str(result.get("model") or "").strip()
+    primary_model = str(getattr(engine, "model", "") or "").strip()
+    used_fallback = bool(used_model and primary_model and used_model != primary_model)
+
     if result.get("ok"):
+        if used_model:
+            role_label = (
+                f"fallback model `{used_model}`"
+                if used_fallback
+                else f"primary model `{used_model}`"
+            )
+        else:
+            role_label = "configured model"
         st.success(
-            f"Verified on attempt {result.get('attempt', '?')} using `{result.get('model', '')}`."
+            f"Verified on attempt {result.get('attempt', '?')} using {role_label}."
         )
         st.markdown(result.get("output", ""))
     else:
@@ -124,18 +146,35 @@ def _render_result(result: Dict[str, Any], engine: Any) -> None:
         )
         if result.get("output"):
             with st.expander("Last generated output"):
-                st.text(result["output"])
+                st.write(result["output"])
 
-    history = result.get("history", [])
-    if history:
+    history = result.get("history")
+    if isinstance(history, list) and history:
         st.subheader("Attempt history")
         st.dataframe(pd.DataFrame(history), hide_index=True)
 
+    try:
+        elapsed_ms = float(result.get("elapsed_ms", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        elapsed_ms = 0.0
+
+    breaker_state = (
+        "LOCKED"
+        if getattr(engine, "locked", False)
+        else ("READY" if engine is not None else "UNAVAILABLE")
+    )
     failure_count = engine.failure_count if engine is not None else "n/a"
+    max_failures = getattr(engine, "max_failures", "n/a") if engine is not None else "n/a"
+    model_note = (
+        f"{used_model} ({'fallback' if used_fallback else 'primary'})"
+        if used_model
+        else "n/a"
+    )
     st.caption(
         f"Status: {result.get('status', 'unknown')} · "
-        f"Elapsed: {result.get('elapsed_ms', 0)} ms · "
-        f"Consecutive failures: {failure_count}"
+        f"Model: {model_note} · "
+        f"Elapsed: {elapsed_ms:.1f} ms · "
+        f"Circuit breaker: {breaker_state} ({failure_count}/{max_failures})"
     )
 
 
@@ -169,6 +208,12 @@ def main() -> None:
 
     if st.session_state.ui_error:
         st.error(st.session_state.ui_error)
+
+    if engine is not None and engine.locked:
+        st.error(
+            "Circuit breaker is locked after consecutive failures. "
+            "Click **Reset locked harness** in the sidebar before running new tasks."
+        )
 
     st.subheader("Run a task")
     prompt = st.text_area(

@@ -1,8 +1,15 @@
+"""Core execution harness with verification retries, fallback rotation, and circuit breaking."""
+
+from __future__ import annotations
+
 import json
+import logging
 import os
 import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gemini-4-hydrogen"
 DEFAULT_FALLBACK_MODELS = [
@@ -185,6 +192,7 @@ class HarnessExecutionEngine:
         """Reset circuit-breaker state and failure counter."""
         self.failure_count = 0
         self.locked = False
+        logger.info("Harness circuit breaker reset (model=%s).", self.model)
         return {
             "status": "reset",
             "locked": self.locked,
@@ -221,6 +229,10 @@ class HarnessExecutionEngine:
         clean_prompt = prompt.strip()
 
         if self.locked:
+            logger.warning(
+                "Harness execution blocked: circuit breaker is locked (failures=%d).",
+                self.failure_count,
+            )
             return {
                 "ok": False,
                 "status": "locked",
@@ -265,6 +277,13 @@ class HarnessExecutionEngine:
                         "history": history,
                     }
                 last_reason = reason
+                logger.warning(
+                    "Attempt %d/%d failed verification on model=%s: %s",
+                    attempt_num,
+                    self.max_retries,
+                    model_name,
+                    reason,
+                )
                 active_prompt = (
                     f"{clean_prompt}\n\n"
                     f"Previous attempt ({attempt_num}) failed verification: {reason}. "
@@ -272,6 +291,13 @@ class HarnessExecutionEngine:
                 )
             except Exception as exc:
                 last_reason = str(exc) or exc.__class__.__name__
+                logger.warning(
+                    "Attempt %d/%d raised error on model=%s: %s",
+                    attempt_num,
+                    self.max_retries,
+                    model_name,
+                    last_reason,
+                )
                 history.append(
                     {
                         "attempt": attempt_num,
@@ -290,6 +316,10 @@ class HarnessExecutionEngine:
         if self.failure_count >= self.max_failures:
             self.locked = True
             status = "locked"
+            logger.warning(
+                "Circuit breaker locked after %d consecutive failures.",
+                self.failure_count,
+            )
         else:
             status = "verification_retries_exhausted"
 
