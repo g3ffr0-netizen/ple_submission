@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 DEFAULT_MODEL = "gemini-4-hydrogen"
@@ -8,30 +10,68 @@ DEFAULT_FALLBACK_MODELS = [
     "gemini-3.5-flash-lite",
 ]
 
+_CLOSED_FENCE_RE = re.compile(r"```([A-Za-z0-9_+-]*)[ \t]*\r?\n(.*?)```", re.DOTALL)
 
-def extract_json_payload(text: str) -> str:
-    """Extract JSON content, stripping markdown code fences if wrapped."""
-    cleaned = (text or "").strip()
+
+def _safe_int(value: Any, default: int, minimum: int = 1) -> int:
+    """Safely parse positive integers while rejecting booleans."""
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, parsed)
+
+
+def extract_json_payload(text: Any) -> str:
+    """Extract JSON content, stripping prose and markdown code fences if wrapped."""
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    elif not isinstance(text, str):
+        return ""
+
+    cleaned = text.strip()
+    if not cleaned:
+        return ""
+
+    closed_blocks = _CLOSED_FENCE_RE.findall(cleaned)
+    if closed_blocks:
+        prioritized = sorted(
+            closed_blocks,
+            key=lambda item: 0 if item[0].strip().lower() == "json" else 1,
+        )
+        candidates = [body.strip() for _, body in prioritized]
+        for candidate in candidates:
+            try:
+                json.loads(candidate)
+                return candidate
+            except (json.JSONDecodeError, RecursionError):
+                continue
+        return candidates[0]
+
     if cleaned.startswith("```"):
         lines = cleaned.splitlines()
-        if len(lines) >= 3 and lines[-1].strip() == "```":
-            cleaned = "\n".join(lines[1:-1])
-        else:
-            cleaned = "\n".join(lines[1:])
-    return cleaned.strip()
+        return "\n".join(lines[1:]).strip()
+
+    return cleaned
 
 
 def make_verify_fn(
     min_chars: int = 1,
     required_phrase: str = "",
     require_json: bool = False,
-) -> Callable[[str], Tuple[bool, str]]:
+) -> Callable[[Any], Tuple[bool, str]]:
     """Build a verifier for output length, required phrase, and optional JSON."""
-    phrase = (required_phrase or "").strip()
-    min_len = max(1, int(min_chars))
+    phrase = required_phrase.strip() if isinstance(required_phrase, str) else ""
+    min_len = _safe_int(min_chars, default=1, minimum=1)
 
-    def _verify(output: str) -> Tuple[bool, str]:
-        text = (output or "").strip()
+    def _verify(output: Any) -> Tuple[bool, str]:
+        if output is None:
+            return False, "Output is empty."
+        if not isinstance(output, str):
+            return False, f"Output must be a string (got {type(output).__name__})."
+        text = output.strip()
         if not text:
             return False, "Output is empty."
         if len(text) < min_len:
@@ -47,6 +87,8 @@ def make_verify_fn(
                 json.loads(payload)
             except json.JSONDecodeError as exc:
                 return False, f"Output must be valid JSON ({exc.msg})."
+            except RecursionError:
+                return False, "Output JSON exceeds maximum nesting depth."
         return True, "All verification checks passed."
 
     return _verify
@@ -85,17 +127,6 @@ def load_submission_config(config_path: str = "submission.yaml") -> Dict[str, An
             return loaded if isinstance(loaded, dict) else {}
         except Exception:
             return {}
-
-
-def _safe_int(value: Any, default: int, minimum: int = 1) -> int:
-    """Safely parse positive integers while rejecting booleans."""
-    if isinstance(value, bool) or value is None:
-        return default
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return default
-    return max(minimum, parsed)
 
 
 class HarnessExecutionEngine:
@@ -174,21 +205,29 @@ class HarnessExecutionEngine:
         verify_fn: Callable[[str], Tuple[bool, str]],
     ) -> Dict[str, Any]:
         """Run prompt with retries and model rotation until verified or circuit locks."""
-        clean_prompt = (prompt or "").strip()
-        if not clean_prompt:
+        started = time.perf_counter()
+
+        def _elapsed_ms() -> float:
+            return round((time.perf_counter() - started) * 1000.0, 2)
+
+        if not isinstance(prompt, str) or not prompt.strip():
             return {
                 "ok": False,
                 "status": "invalid_prompt",
-                "error": "Prompt cannot be empty.",
+                "error": "Prompt must be a non-empty string.",
+                "elapsed_ms": _elapsed_ms(),
                 "history": [],
             }
+        clean_prompt = prompt.strip()
 
         if self.locked:
             return {
                 "ok": False,
                 "status": "locked",
+                "locked": True,
                 "error": "Circuit breaker is locked. Reset required before running.",
                 "failure_count": self.failure_count,
+                "elapsed_ms": _elapsed_ms(),
                 "history": [],
             }
 
@@ -202,8 +241,9 @@ class HarnessExecutionEngine:
             model_name = self._model_for_attempt(idx)
             try:
                 output = generate_fn(active_prompt, model_name, self.max_output_tokens)
-                last_output = output or ""
-                ok, reason = verify_fn(last_output)
+                last_output = output if isinstance(output, str) else ""
+                verify_input = "" if output is None else output
+                ok, reason = verify_fn(verify_input)
                 history.append(
                     {
                         "attempt": attempt_num,
@@ -221,6 +261,7 @@ class HarnessExecutionEngine:
                         "model": model_name,
                         "output": last_output,
                         "reason": reason,
+                        "elapsed_ms": _elapsed_ms(),
                         "history": history,
                     }
                 last_reason = reason
@@ -260,6 +301,7 @@ class HarnessExecutionEngine:
             "output": last_output,
             "failure_count": self.failure_count,
             "locked": self.locked,
+            "elapsed_ms": _elapsed_ms(),
             "history": history,
         }
 

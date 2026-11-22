@@ -1,8 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import weakref
 from typing import Any, Dict
+
+_LOOP_ENGINE_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, Dict[int, asyncio.Lock]]" = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _get_engine_lock(engine: Any) -> asyncio.Lock:
+    """Return a per-event-loop asyncio.Lock keyed by the engine instance."""
+    loop = asyncio.get_running_loop()
+    locks = _LOOP_ENGINE_LOCKS.setdefault(loop, {})
+    key = id(engine)
+    lock = locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        locks[key] = lock
+    return lock
 
 
 def _dumps(data: Dict[str, Any], request_id: Any = None) -> str:
@@ -73,21 +91,22 @@ async def handle_ws_message(raw_message: str, engine: Any, run_harness_fn: Any) 
         )
 
     if action == "reset":
-        state = (
-            engine.reset()
-            if hasattr(engine, "reset")
-            else {"locked": False, "failure_count": 0}
-        )
-        return _dumps(
-            {
-                "type": "reset",
-                "status": "ok",
-                "locked": bool(state.get("locked", False)),
-                "failure_count": int(state.get("failure_count", 0)),
-                "message": "Harness state reset.",
-            },
-            request_id,
-        )
+        async with _get_engine_lock(engine):
+            state = (
+                engine.reset()
+                if hasattr(engine, "reset")
+                else {"locked": False, "failure_count": 0}
+            )
+            return _dumps(
+                {
+                    "type": "reset",
+                    "status": "ok",
+                    "locked": bool(state.get("locked", False)),
+                    "failure_count": int(state.get("failure_count", 0)),
+                    "message": "Harness state reset.",
+                },
+                request_id,
+            )
 
     if action != "execute":
         return _dumps(
@@ -102,97 +121,98 @@ async def handle_ws_message(raw_message: str, engine: Any, run_harness_fn: Any) 
             request_id,
         )
 
-    if getattr(engine, "locked", False):
-        return _dumps(
-            {
-                "type": "lockout",
-                "status": "locked",
-                "locked": True,
-                "failure_count": int(getattr(engine, "failure_count", 0)),
-                "requires_reset": True,
-                "message": (
-                    "Execution locked due to consecutive failures. "
-                    "Send action='reset' to unlock."
-                ),
-            },
-            request_id,
-        )
-
-    try:
-        if callable(run_harness_fn):
-            maybe_result = run_harness_fn(payload)
-            result = (
-                await maybe_result
-                if inspect.isawaitable(maybe_result)
-                else maybe_result
+    async with _get_engine_lock(engine):
+        if getattr(engine, "locked", False):
+            return _dumps(
+                {
+                    "type": "lockout",
+                    "status": "locked",
+                    "locked": True,
+                    "failure_count": int(getattr(engine, "failure_count", 0)),
+                    "requires_reset": True,
+                    "message": (
+                        "Execution locked due to consecutive failures. "
+                        "Send action='reset' to unlock."
+                    ),
+                },
+                request_id,
             )
-        else:
-            result = run_harness_fn
-    except Exception as exc:
+
+        try:
+            if callable(run_harness_fn):
+                maybe_result = run_harness_fn(payload)
+                result = (
+                    await maybe_result
+                    if inspect.isawaitable(maybe_result)
+                    else maybe_result
+                )
+            else:
+                result = run_harness_fn
+        except Exception as exc:
+            return _dumps(
+                {
+                    "type": "error",
+                    "code": "execution_error",
+                    "locked": bool(getattr(engine, "locked", False)),
+                    "failure_count": int(getattr(engine, "failure_count", 0)),
+                    "message": f"Harness execution failed ({type(exc).__name__}): {exc}",
+                },
+                request_id,
+            )
+
+        if not isinstance(result, dict):
+            return _dumps(
+                {
+                    "type": "error",
+                    "code": "invalid_result",
+                    "locked": bool(getattr(engine, "locked", False)),
+                    "failure_count": int(getattr(engine, "failure_count", 0)),
+                    "message": "Harness runner returned an invalid non-dict result.",
+                },
+                request_id,
+            )
+
+        if result.get("status") == "invalid_prompt":
+            return _dumps(
+                {
+                    "type": "error",
+                    "code": "invalid_prompt",
+                    "status": "invalid_prompt",
+                    "locked": bool(result.get("locked", getattr(engine, "locked", False))),
+                    "failure_count": int(
+                        result.get("failure_count", getattr(engine, "failure_count", 0))
+                    ),
+                    "message": result.get("error", "Prompt must be a non-empty string."),
+                },
+                request_id,
+            )
+
+        if result.get("locked") or result.get("status") == "locked":
+            return _dumps(
+                {
+                    "type": "lockout",
+                    "status": "locked",
+                    "locked": True,
+                    "failure_count": int(
+                        result.get("failure_count", getattr(engine, "failure_count", 0))
+                    ),
+                    "requires_reset": True,
+                    "error": result.get("error", "Harness locked."),
+                    "last_reason": result.get("last_reason", result.get("error", "")),
+                },
+                request_id,
+            )
+
         return _dumps(
             {
-                "type": "error",
-                "code": "execution_error",
-                "locked": bool(getattr(engine, "locked", False)),
-                "failure_count": int(getattr(engine, "failure_count", 0)),
-                "message": f"Harness execution failed ({type(exc).__name__}): {exc}",
+                "type": "result",
+                "status": result.get("status", "ok"),
+                "ok": bool(result.get("ok", True)),
+                "output": result.get("output", ""),
+                "model": result.get("model", getattr(engine, "model", "")),
+                "attempt": result.get("attempt"),
+                "reason": result.get("reason", ""),
+                "history": result.get("history", []),
             },
             request_id,
         )
-
-    if not isinstance(result, dict):
-        return _dumps(
-            {
-                "type": "error",
-                "code": "invalid_result",
-                "locked": bool(getattr(engine, "locked", False)),
-                "failure_count": int(getattr(engine, "failure_count", 0)),
-                "message": "Harness runner returned an invalid non-dict result.",
-            },
-            request_id,
-        )
-
-    if result.get("status") == "invalid_prompt":
-        return _dumps(
-            {
-                "type": "error",
-                "code": "invalid_prompt",
-                "status": "invalid_prompt",
-                "locked": bool(result.get("locked", getattr(engine, "locked", False))),
-                "failure_count": int(
-                    result.get("failure_count", getattr(engine, "failure_count", 0))
-                ),
-                "message": result.get("error", "Prompt must be a non-empty string."),
-            },
-            request_id,
-        )
-
-    if result.get("locked") or result.get("status") == "locked":
-        return _dumps(
-            {
-                "type": "lockout",
-                "status": "locked",
-                "locked": True,
-                "failure_count": int(
-                    result.get("failure_count", getattr(engine, "failure_count", 0))
-                ),
-                "requires_reset": True,
-                "error": result.get("error", "Harness locked."),
-                "last_reason": result.get("last_reason", result.get("error", "")),
-            },
-            request_id,
-        )
-
-    return _dumps(
-        {
-            "type": "result",
-            "status": result.get("status", "ok"),
-            "ok": bool(result.get("ok", True)),
-            "output": result.get("output", ""),
-            "model": result.get("model", getattr(engine, "model", "")),
-            "attempt": result.get("attempt"),
-            "reason": result.get("reason", ""),
-            "history": result.get("history", []),
-        },
-        request_id,
-    )
