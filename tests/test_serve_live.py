@@ -1479,6 +1479,196 @@ class TestPLEAlignmentUnitContracts(unittest.TestCase):
             self.assertTrue(audit_client.seen_audit_precheck)
             self.assertTrue(audit_client.fix_ran)
 
+    def test_programmatic_audit_mep_bvh_flags_zero_mm_joints_and_allows_6mm_gap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pkgdir = tmp_path / "fake_pkgs"
+            (pkgdir / "ifcopenshell").mkdir(parents=True)
+
+            fake_ifc = textwrap.dedent(
+                """
+                import os
+
+                class _Entity:
+                    def __init__(self, eid, cls, gid, name="", obj_type="", repr_=True):
+                        self._eid = eid
+                        self._cls = cls
+                        self.GlobalId = gid
+                        self.Name = name
+                        self.ObjectType = obj_type
+                        self.Representation = repr_
+                        self.IsDecomposedBy = []
+                        self.ContainsElements = []
+                    def id(self):
+                        return self._eid
+                    def is_a(self, target=None):
+                        return self._cls == target if target else self._cls
+                    def __str__(self):
+                        return f"#{self._eid}={self._cls}"
+
+                class _RelConnects:
+                    def __init__(self, e1, e2):
+                        self.RelatingElement = e1
+                        self.RelatedElement = e2
+
+                class _Model:
+                    def __init__(self, path):
+                        clean = "clean" in os.path.basename(path)
+                        gap = 0.006 if clean else 0.0
+                        tray_ov = 0.006 if clean else -0.0005
+                        tray_z0 = 3.18 if clean else 2.996
+                        spr_z0 = 2.70 if clean else 1.89
+
+                        self.floor = _Entity(1, "IfcSlab", "FLOOR_1", "ACCESS-FLOOR")
+                        self.pdu = _Entity(2, "IfcElectricDistributionBoard", "PDU_1", "PDU-01", "PDU")
+                        self.pipe1 = _Entity(3, "IfcPipeSegment", "PIPE_1", "CHW-1-SEG-01")
+                        self.pipe2 = _Entity(4, "IfcPipeSegment", "PIPE_2", "CHW-1-SEG-02")
+                        self.tray1 = _Entity(5, "IfcCableCarrierSegment", "TRAY_1", "CT-1-SEG-01", "CableTray")
+                        self.tray2 = _Entity(6, "IfcCableCarrierSegment", "TRAY_2", "CT-1-SEG-02", "CableTray")
+                        self.chw_under = _Entity(7, "IfcPipeSegment", "CHW_U", "CHW-1-UNDER")
+                        self.spr = _Entity(8, "IfcFireSuppressionTerminal", "SPR_A1", "SPR-A01", "Sprinkler")
+
+                        self._boxes = {
+                            1: (0.0, 12.0, 0.0, 12.0, -0.035, 0.0),
+                            2: (10.0, 11.0, 1.0, 2.0, 0.0, 1.96),
+                            3: (0.0, 2.0, 1.0, 1.2, 2.70, 2.86),
+                            4: (2.0 + gap, 4.0, 1.0, 1.2, 2.70, 2.86),
+                            5: (5.0, 7.0, 1.0, 1.6, tray_z0, tray_z0 + 0.127),
+                            6: (7.0 + tray_ov, 8.0, 1.0, 1.6, tray_z0, tray_z0 + 0.127),
+                            7: (5.0, 7.0, 1.0, 1.2, 2.70, 2.86),
+                            8: (9.5, 9.6, 5.0, 5.1, spr_z0, spr_z0 + 0.10),
+                        }
+                        self.products = [
+                            self.floor, self.pdu, self.pipe1, self.pipe2,
+                            self.tray1, self.tray2, self.chw_under, self.spr,
+                        ]
+                        for _p in self.products:
+                            _p._box = self._boxes[_p.id()]
+                        self.rels = [_RelConnects(self.pipe1, self.pipe2)]
+
+                    def by_type(self, name):
+                        if name == "IfcProduct":
+                            return self.products
+                        if name == "IfcRelConnectsElements":
+                            return self.rels
+                        return []
+
+                def open(path):
+                    return _Model(path)
+                """
+            ).lstrip()
+
+            fake_geom = textwrap.dedent(
+                """
+                class settings:
+                    USE_WORLD_COORDS = "use-world-coords"
+                    def set(self, k, v):
+                        pass
+
+                class _Shape:
+                    def __init__(self, eid, gid, verts, faces, box):
+                        self.id = eid
+                        self.guid = gid
+                        self.geometry = type("_Geo", (), {"verts": verts, "faces": faces})()
+                        self._box = box
+
+                def create_shape(_settings, elem):
+                    box = getattr(elem, "_box", None)
+                    if box is None:
+                        # Look up from caller model boxes stashed via helper or reconstruct on elem
+                        raise ValueError("missing box")
+                    x0, x1, y0, y1, z0, z1 = box
+                    verts = [
+                        x0, y0, z0, x1, y0, z0, x1, y1, z0, x0, y1, z0,
+                        x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1,
+                    ]
+                    faces = [
+                        0, 1, 2, 0, 2, 3,
+                        4, 5, 6, 4, 6, 7,
+                        0, 1, 5, 0, 5, 4,
+                        1, 2, 6, 1, 6, 5,
+                        2, 3, 7, 2, 7, 6,
+                        3, 0, 4, 3, 4, 7,
+                    ]
+                    return _Shape(elem.id(), elem.GlobalId, verts, faces, box)
+
+                class tree:
+                    def __init__(self):
+                        self._items = {}
+
+                    def add_element(self, shape):
+                        self._items[shape.id] = shape
+
+                    def _touches_or_overlaps(self, b1, b2, tol=0.0):
+                        return (
+                            min(b1[1], b2[1]) - max(b1[0], b2[0]) >= -tol
+                            and min(b1[3], b2[3]) - max(b1[2], b2[2]) >= -tol
+                            and min(b1[5], b2[5]) - max(b1[4], b2[4]) >= -tol
+                        )
+
+                    def select(self, elem):
+                        s1 = self._items.get(elem.id())
+                        if s1 is None:
+                            return []
+                        hits = []
+                        for eid, s2 in self._items.items():
+                            if eid != s1.id and self._touches_or_overlaps(s1._box, s2._box, tol=1e-6):
+                                hits.append(eid)
+                        return hits
+
+                    def clash_intersection_many(self, set_a, set_b, tolerance=0.0, check_all=True, allow_touching=False):
+                        out = []
+                        ids_b = {e.id() for e in set_b}
+                        for ea in set_a:
+                            s1 = self._items.get(ea.id())
+                            if s1 is None:
+                                continue
+                            for eb_id in ids_b:
+                                if eb_id == s1.id:
+                                    continue
+                                s2 = self._items.get(eb_id)
+                                if s2 and self._touches_or_overlaps(s1._box, s2._box, tol=1e-6):
+                                    out.append((s1.id, s2.id))
+                        return out
+                """
+            ).lstrip()
+            (pkgdir / "ifcopenshell" / "__init__.py").write_text(fake_ifc, encoding="utf-8")
+            (pkgdir / "ifcopenshell" / "geom.py").write_text(fake_geom, encoding="utf-8")
+
+            env = dict(os.environ)
+            env["PYTHONPATH"] = str(pkgdir) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+
+            def _run_case(dir_name: str, filename: str) -> Dict[str, Any]:
+                w = tmp_path / dir_name
+                w.mkdir()
+                (w / filename).write_text("ISO-10303-21;END-ISO-10303-21;", encoding="utf-8")
+                proc = subprocess.run(
+                    [sys.executable, "-"],
+                    input=serve._build_programmatic_audit_script(),
+                    cwd=w,
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                line = next(l for l in proc.stdout.splitlines() if l.startswith(serve.AUDIT_MARKER))
+                return json.loads(line[len(serve.AUDIT_MARKER):])
+
+            bad = _run_case("bad_case", "mep_bad.ifc")
+            bad_errs = "\n".join(bad["errors"])
+            bad_warns = "\n".join(bad["warnings"])
+            self.assertIn("CHW-1-SEG-01", bad_errs)
+            self.assertIn("CHW-1-SEG-02", bad_errs)
+            self.assertIn("CT-1-SEG-01", bad_errs)
+            self.assertIn("CT-1-SEG-02", bad_errs)
+            self.assertNotIn("PDU-01", bad_errs)
+            self.assertIn("tray-stack vertical headroom 136.0mm < 300mm", bad_warns)
+            self.assertIn("overhead clear height 1890.0mm < 2600mm", bad_warns)
+
+            clean = _run_case("clean_case", "mep_clean.ifc")
+            self.assertEqual(clean["errors"], [])
+            self.assertEqual(clean["warnings"], [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

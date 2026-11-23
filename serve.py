@@ -95,7 +95,8 @@ PLANNER = (
     "constraint / threshold / register or tag ID format, the data and method "
     "to use, and concrete self-verification checks (for spreadsheets/CSVs: schema, "
     "header/row alignment, non-null IDs, totals; for IFC/BIM models: schema "
-    "validation, coordinate clearances, and 3D solid clash/boundary checks)."
+    "validation, ifcopenshell.geom.tree BVH clash checks across all elements with "
+    "5-10 mm non-touching joint gaps, coordinate clearances, and boundary checks)."
 )
 
 WORKER = (
@@ -113,13 +114,21 @@ WORKER = (
     "hard constraint, threshold, summation, and cross-table ID / register / tag "
     "consistency (zero missing/shifted columns, zero NaN/N/A/TBD values or "
     "formula errors); (2) if creating or modifying .ifc BIM deliverables, run "
-    "a Python validation script using ifcopenshell.validate plus 3D geometry / "
-    "clearance / solid-clash checks against existing elements and site "
-    "buildings/roads, and reroute or adjust elevations until zero unintentional "
-    "clashes or invalid boundary crossings remain. After any edit or fix, "
-    "immediately regenerate and re-run verification checks on the actual "
-    "deliverable file before replying. When done, reply without calling a tool: "
-    "summarize each deliverable, its exact path, and the verified results."
+    "ifcopenshell.validate plus ifcopenshell.geom.tree BVH clash checks across "
+    "ALL elements (including same-service MEP segments—never exempt "
+    "IfcRelConnects* links or 0 mm touching butt-joints). Because BVH flags "
+    "0 mm touching faces as hard clashes, trim L-corners, T-junctions, and "
+    "inline segment joints to leave clean 5-10 mm non-touching air gaps (well "
+    "within connectivity joint tolerance such as 250 mm) so BVH reports zero "
+    "clashes while keeping full graph connectivity, and verify all code "
+    "clearances from tessellated 3D geometry (tray-to-busway >= 300 mm, "
+    "tray-stack/access headroom >= 300 mm above/below trays per TIA-569-B, "
+    "overhead clear height >= 2600 mm AFF unless explicitly permitted, "
+    "sprinkler clearance >= 457 mm, PDU clear zones, and site building/road "
+    "non-intersection). After any edit or fix, immediately regenerate and re-run "
+    "verification checks on the actual deliverable file before replying. When "
+    "done, reply without calling a tool: summarize each deliverable, its exact "
+    "path, and the verified results."
 )
 
 VERIFIER = (
@@ -133,13 +142,16 @@ VERIFIER = (
     "format, has no shifted CSV columns, formula errors, duplicate rows, or "
     "missing/unpopulated register/device IDs, and satisfies every hard "
     "constraint and tolerance recomputed directly from the file. For .ifc "
-    "deliverables, run Python geometry/schema/clash checks with ifcopenshell "
-    "(including 3D solid intersection, tray-to-busway clearance, and road vs. "
-    "building footprint non-intersection) rather than trusting the summary. "
-    "Do not create or change any file. If every requirement and pre-check passes "
-    "with zero errors, reply with the single word PASS and nothing else. "
-    "Otherwise reply with a numbered list of every gap, each specific enough "
-    "to fix."
+    "deliverables, run Python checks using ifcopenshell.geom.tree BVH across "
+    "ALL elements without exempting IfcRelConnects* or 0 mm butt-joints "
+    "(verify 5-10 mm non-touching gaps at L-corners/T-junctions/joints so "
+    "BVH clash count is 0 while connectivity holds) plus 3D clearances "
+    "(tray-to-busway >= 300 mm, tray-stack headroom >= 300 mm, overhead clear "
+    "height >= 2600 mm AFF, sprinkler >= 457 mm, PDU clear zones, road vs. "
+    "building non-intersection) rather than trusting the summary. Do not "
+    "create or change any file. If every requirement and pre-check passes with "
+    "zero errors, reply with the single word PASS and nothing else. Otherwise "
+    "reply with a numbered list of every gap, each specific enough to fix."
 )
 
 
@@ -1252,6 +1264,7 @@ AUDIT_MARKER = "__PLE_AUDIT_JSON__:"
 
 _PROGRAMMATIC_AUDIT_SCRIPT = r'''
 import csv
+import inspect
 import json
 import math
 import os
@@ -1344,6 +1357,7 @@ ROAD_NAME_RE = re.compile(r"(?:^|[^a-z0-9])(road|roadway|driveway|access_road|st
 TRAY_RE = re.compile(r"tray", re.I)
 BUSWAY_RE = re.compile(r"(?:^|[^a-z0-9])(busway|bus_?duct|bus-duct|bus)(?:[^a-z0-9]|$)", re.I)
 MEP_NAME_RE = re.compile(r"(tray|busway|bus_?duct|conduit|pipe|duct|chilled|cable)", re.I)
+SPRINKLER_RE = re.compile(r"(sprinkler|(?:^|[^a-z0-9])spr[-_])", re.I)
 SUMMARY_ROW_RE = re.compile(
     r"^(total|subtotal|grand\s+total|summary|sum|average|avg|mean|min|max|note|notes)\b",
     re.I,
@@ -1909,7 +1923,58 @@ if ifc_files:
 
         all_elems = []
         building_groups = {}
-        connected_pairs = set()
+        reported_clash_pairs = set()
+        clash_count = 0
+
+        def _is_mep(e):
+            return e["cls"] in MEP_CLASSES or (
+                e["cls"] in {"IfcBuildingElementProxy", "IfcCivilElement", "IfcProxy"}
+                and bool(MEP_NAME_RE.search(e["text"]))
+            )
+
+        def _is_floor_rest(ra, rb):
+            for eq, slab in ((ra, rb), (rb, ra)):
+                if slab["cls"] == "IfcSlab" and not _is_mep(slab):
+                    if abs(eq["aabb"][2] - slab["aabb"][5]) <= 0.001 and eq["aabb"][5] > slab["aabb"][5]:
+                        return True
+            return False
+
+        def _emit_mep_clash(r1, r2, msg):
+            global clash_count
+            if r1 is None or r2 is None or (r1["file"], r1["gid"]) == (r2["file"], r2["gid"]):
+                return False
+            if _is_floor_rest(r1, r2):
+                return False
+            pkey = tuple(sorted(((r1["file"], r1["gid"]), (r2["file"], r2["gid"]))))
+            if pkey in reported_clash_pairs:
+                return False
+            reported_clash_pairs.add(pkey)
+            clash_count += 1
+            if clash_count <= 15:
+                errors.append(msg)
+            return True
+
+        def _rec_from_bvh_ref(ref, p_map, g_map):
+            if ref is None:
+                return None
+            if isinstance(ref, int):
+                return p_map.get(ref)
+            rid = getattr(ref, "id", None)
+            if callable(rid):
+                try:
+                    found = p_map.get(rid())
+                    if found is not None:
+                        return found
+                except Exception:
+                    pass
+            elif isinstance(rid, int):
+                found = p_map.get(rid)
+                if found is not None:
+                    return found
+            rgid = getattr(ref, "GlobalId", None) or getattr(ref, "guid", None)
+            if rgid:
+                return g_map.get(str(rgid))
+            return None
 
         for ifc_path in ifc_files:
             rel = _rel(ifc_path)
@@ -1960,31 +2025,6 @@ if ifc_files:
             except Exception as exc:
                 warnings.append(f"{rel}: polyline check skipped: {exc}")
 
-            # Connected pairs via IfcRelConnects* / IfcRelNests / IfcRelAggregates
-            def _port_owner(port):
-                for rn in getattr(port, "ContainedIn", []) or []:
-                    return getattr(rn, "RelatingObject", None)
-                for rn in getattr(port, "Nests", []) or []:
-                    return getattr(rn, "RelatingObject", None)
-                return None
-
-            try:
-                for rel_name in ("IfcRelConnectsElements", "IfcRelConnectsWithRealizingElements"):
-                    for r in model.by_type(rel_name):
-                        e1 = getattr(r, "RelatingElement", None)
-                        e2 = getattr(r, "RelatedElement", None)
-                        if e1 and e2 and getattr(e1, "GlobalId", None) and getattr(e2, "GlobalId", None):
-                            connected_pairs.add((rel, min(e1.GlobalId, e2.GlobalId), max(e1.GlobalId, e2.GlobalId)))
-                for r in model.by_type("IfcRelConnectsPorts"):
-                    p1 = getattr(r, "RelatingPort", None)
-                    p2 = getattr(r, "RelatedPort", None)
-                    o1 = _port_owner(p1) if p1 else None
-                    o2 = _port_owner(p2) if p2 else None
-                    if o1 and o2 and getattr(o1, "GlobalId", None) and getattr(o2, "GlobalId", None):
-                        connected_pairs.add((rel, min(o1.GlobalId, o2.GlobalId), max(o1.GlobalId, o2.GlobalId)))
-            except Exception:
-                pass
-
             # Map element id -> building id
             elem_to_bldg = {}
             bldg_labels = {}
@@ -2008,6 +2048,17 @@ if ifc_files:
                                 queue.append(child)
             except Exception:
                 pass
+
+            bvh_tree = None
+            if hasattr(ifcopenshell.geom, "tree"):
+                try:
+                    bvh_tree = ifcopenshell.geom.tree()
+                except Exception:
+                    bvh_tree = None
+            pid_to_rec = {}
+            gid_to_rec = {}
+            mep_prods = []
+            all_prods = []
 
             for prod in model.by_type("IfcProduct"):
                 if time.monotonic() - START_T > 25.0:
@@ -2045,6 +2096,7 @@ if ifc_files:
                     "file": rel,
                     "cls": cls,
                     "gid": gid,
+                    "pid": prod.id(),
                     "name": name or gid,
                     "label": f"{cls} {name or gid}",
                     "text": f"{cls} {name} {obj_t}",
@@ -2056,10 +2108,80 @@ if ifc_files:
                     "aabb": _aabb_of(verts),
                 }
                 all_elems.append(rec)
+                pid_to_rec[prod.id()] = rec
+                gid_to_rec[gid] = rec
+                all_prods.append(prod)
+                if _is_mep(rec):
+                    mep_prods.append(prod)
+                if bvh_tree is not None:
+                    try:
+                        bvh_tree.add_element(shape)
+                    except Exception:
+                        pass
                 if bid and cls != "IfcBuilding":
                     building_groups.setdefault(bid, []).append(rec)
                 elif cls == "IfcBuilding":
                     building_groups.setdefault(bid or f"{rel}::{gid}", []).append(rec)
+
+            # Per-model BVH clash checks (do NOT exempt IfcRelConnects* or 0mm butt-joints)
+            if bvh_tree is not None and mep_prods:
+                cim = getattr(bvh_tree, "clash_intersection_many", None)
+                if cim is not None:
+                    try:
+                        sig = inspect.signature(cim)
+                        pnames = set(sig.parameters.keys())
+                        kw = {}
+                        if "tolerance" in pnames:
+                            kw["tolerance"] = 0.0
+                        if "check_all" in pnames:
+                            kw["check_all"] = True
+                        if "allow_touching" in pnames:
+                            kw["allow_touching"] = False
+                        hits = cim(mep_prods, all_prods, **kw)
+                    except Exception:
+                        hits = []
+                    for h in hits or []:
+                        if isinstance(h, (tuple, list)) and len(h) >= 2:
+                            r1 = _rec_from_bvh_ref(h[0], pid_to_rec, gid_to_rec)
+                            r2 = _rec_from_bvh_ref(h[1], pid_to_rec, gid_to_rec)
+                        else:
+                            r1 = _rec_from_bvh_ref(
+                                getattr(h, "a", getattr(h, "id1", getattr(h, "a_id", None))),
+                                pid_to_rec,
+                                gid_to_rec,
+                            )
+                            r2 = _rec_from_bvh_ref(
+                                getattr(h, "b", getattr(h, "id2", getattr(h, "b_id", None))),
+                                pid_to_rec,
+                                gid_to_rec,
+                            )
+                        if r1 is not None and r2 is not None:
+                            _emit_mep_clash(
+                                r1,
+                                r2,
+                                f"MEP BVH clash (0mm/touching or overlapping): {r1['label']} ({r1['file']}) vs {r2['label']} ({r2['file']})",
+                            )
+
+                sel_fn = getattr(bvh_tree, "select", None)
+                if sel_fn is not None:
+                    for mp in mep_prods:
+                        if time.monotonic() - START_T > 30.0:
+                            break
+                        r1 = pid_to_rec.get(mp.id())
+                        if r1 is None:
+                            continue
+                        try:
+                            matched = sel_fn(mp)
+                        except Exception:
+                            matched = []
+                        for other in matched or []:
+                            r2 = _rec_from_bvh_ref(other, pid_to_rec, gid_to_rec)
+                            if r2 is not None:
+                                _emit_mep_clash(
+                                    r1,
+                                    r2,
+                                    f"MEP BVH clash (0mm/touching or overlapping): {r1['label']} ({r1['file']}) vs {r2['label']} ({r2['file']})",
+                                )
 
         # Site checks: Road vs Building intersection & Building vs Building overlap
         roads = [
@@ -2111,16 +2233,10 @@ if ifc_files:
                     l2 = building_groups[b2][0]["bldg_label"] or b2
                     errors.append(f"building overlap between {l1!r} and {l2!r} (area={area:.3f} m^2)")
 
-        # MEP solid clashes (> 2mm) and tray-to-busway separation (< 300mm)
-        def _is_mep(e):
-            return e["cls"] in MEP_CLASSES or (
-                e["cls"] in {"IfcBuildingElementProxy", "IfcCivilElement", "IfcProxy"}
-                and bool(MEP_NAME_RE.search(e["text"]))
-            )
-
+        # MEP touching/overlapping clashes, tray-to-busway (<300mm), tray-stack headroom, and clear height
         mep_flags = [_is_mep(e) for e in all_elems]
+        stack_warns = 0
         if any(mep_flags):
-            clash_count = 0
             for i in range(len(all_elems)):
                 if time.monotonic() - START_T > 30.0:
                     warnings.append("MEP clash scan stopped at 30s time budget")
@@ -2130,15 +2246,23 @@ if ifc_files:
                     if not (mep_flags[i] or mep_flags[j]):
                         continue
                     ej = all_elems[j]
-                    if ei["file"] == ej["file"] and (ei["file"], min(ei["gid"], ej["gid"]), max(ei["gid"], ej["gid"])) in connected_pairs:
-                        continue
-                    if _aabb_overlap(ei["aabb"], ej["aabb"], tol=0.002) and _meshes_clash_gt_2mm(ei, ej, tol=0.002):
-                        clash_count += 1
-                        if clash_count <= 15:
-                            errors.append(
-                                f"MEP solid clash (>2mm): {ei['label']} ({ei['file']}) vs {ej['label']} ({ej['file']})"
+                    pkey = tuple(sorted(((ei["file"], ei["gid"]), (ej["file"], ej["gid"]))))
+                    if pkey not in reported_clash_pairs and not _is_floor_rest(ei, ej):
+                        if mep_flags[i] and mep_flags[j]:
+                            if _aabb_dist(ei["aabb"], ej["aabb"]) < 0.002 and _mesh_clearance(ei, ej) < 0.002:
+                                _emit_mep_clash(
+                                    ei,
+                                    ej,
+                                    f"MEP touching/overlapping clash (<2mm gap; leave 5-10mm gap at joints): "
+                                    f"{ei['label']} ({ei['file']}) vs {ej['label']} ({ej['file']})",
+                                )
+                        elif _aabb_overlap(ei["aabb"], ej["aabb"], tol=0.0005) and _meshes_clash_gt_2mm(ei, ej, tol=0.0005):
+                            _emit_mep_clash(
+                                ei,
+                                ej,
+                                f"MEP solid clash (>0.5mm): {ei['label']} ({ei['file']}) vs {ej['label']} ({ej['file']})",
                             )
-                    # Check tray <-> busway 300mm separation
+                    # Check tray <-> busway 300mm separation & tray-stack vertical headroom
                     ti = bool(TRAY_RE.search(ei["text"])) and not bool(BUSWAY_RE.search(ei["text"]))
                     bj = bool(BUSWAY_RE.search(ej["text"]))
                     tj = bool(TRAY_RE.search(ej["text"])) and not bool(BUSWAY_RE.search(ej["text"]))
@@ -2155,8 +2279,35 @@ if ifc_files:
                                 warnings.append(
                                     f"tray-busway borderline clearance {clr * 1000:.1f}mm (< 300mm): {tray_e['label']} vs {bus_e['label']}"
                                 )
+                    if stack_warns < 10 and ((ti and mep_flags[j]) or (tj and mep_flags[i])):
+                        tray_e, other_e = (ei, ej) if ti else (ej, ei)
+                        ta, oa = tray_e["aabb"], other_e["aabb"]
+                        xy_dx = min(ta[3], oa[3]) - max(ta[0], oa[0])
+                        xy_dy = min(ta[4], oa[4]) - max(ta[1], oa[1])
+                        if xy_dx > 0.01 and xy_dy > 0.01 and (oa[2] > ta[5] or ta[2] > oa[5]):
+                            vgap = max(0.0, oa[2] - ta[5], ta[2] - oa[5])
+                            if 0.0 < vgap < 0.299:
+                                stack_warns += 1
+                                warnings.append(
+                                    f"tray-stack vertical headroom {vgap * 1000:.1f}mm < 300mm "
+                                    f"(check TIA-569-B access clearance): {tray_e['label']} vs {other_e['label']}"
+                                )
             if clash_count > 15:
                 errors.append(f"... plus {clash_count - 15} additional MEP solid clash(es)")
+
+        # Overhead clear-height check (>= 2600mm AFF for suspended MEP / sprinkler items)
+        clear_warns = 0
+        for e in all_elems:
+            if clear_warns >= 10:
+                break
+            if _is_mep(e) or SPRINKLER_RE.search(e["text"]):
+                z_bot = e["aabb"][2]
+                if 1.20 <= z_bot < 2.599:
+                    clear_warns += 1
+                    warnings.append(
+                        f"overhead clear height {z_bot * 1000:.1f}mm < 2600mm "
+                        f"(check TIA-942 clear-height rule): {e['label']} ({e['file']})"
+                    )
 
 print("__PLE_AUDIT_JSON__:" + json.dumps({"errors": errors[:30], "warnings": warnings[:30]}))
 '''
