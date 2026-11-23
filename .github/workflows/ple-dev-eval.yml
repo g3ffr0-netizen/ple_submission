@@ -18,6 +18,11 @@ on:
         required: false
         default: false
         type: boolean
+      tasks:
+        description: "Optional comma-separated dev task IDs overriding task_limit (e.g. frame-extension-method,data-hall-device-takeoff)"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
@@ -39,6 +44,7 @@ jobs:
           TASK_LIMIT: ${{ inputs.task_limit }}
           MAX_PARALLEL: ${{ inputs.max_parallel }}
           COMMIT_ARTIFACTS: ${{ inputs.commit_artifacts }}
+          TASKS_INPUT: ${{ inputs.tasks }}
         run: |
           python3 - <<'PY'
           import json
@@ -89,7 +95,8 @@ jobs:
 
           print(
               f"Validated inputs: task_limit={limit}, max_parallel={max_p}, "
-              f"commit_artifacts={os.environ.get('COMMIT_ARTIFACTS')}"
+              f"commit_artifacts={os.environ.get('COMMIT_ARTIFACTS')}, "
+              f"tasks={os.environ.get('TASKS_INPUT', '').strip()!r}"
           )
           PY
 
@@ -176,26 +183,47 @@ jobs:
         env:
           TASK_LIMIT: ${{ inputs.task_limit }}
           MAX_PARALLEL: ${{ inputs.max_parallel }}
+          TASKS_INPUT: ${{ inputs.tasks }}
         run: |
           cd "$RUNNER_TEMP/ple_kit"
           uv run python - <<'PY'
           import json
           import os
+          import sys
           import yaml
           from pathlib import Path
 
-          limit = int(os.environ.get("TASK_LIMIT", "3") or "3")
-          max_p = min(limit, int(os.environ.get("MAX_PARALLEL", "3") or "3"))
+          raw_tasks = os.environ.get("TASKS_INPUT", "").strip()
           dev_set = yaml.safe_load((Path(os.environ["RUNNER_TEMP"]) / "ple_kit" / "eval" / "dev_set.yaml").read_text(encoding="utf-8"))
           tasks = dev_set["tasks"]
-          if limit >= len(tasks):
-              selected = [t["id"] for t in tasks]
+          known_ids = {t["id"] for t in tasks}
+
+          if raw_tasks:
+              requested = []
+              for part in raw_tasks.split(","):
+                  tid = part.strip()
+                  if tid and tid not in requested:
+                      requested.append(tid)
+              if not requested:
+                  print(f"::error::tasks input must contain at least one task id (got {raw_tasks!r})", file=sys.stderr)
+                  sys.exit(1)
+              unknown = [tid for tid in requested if tid not in known_ids]
+              if unknown:
+                  print(f"::error::Unknown task id(s): {', '.join(unknown)}", file=sys.stderr)
+                  sys.exit(1)
+              selected = requested
+              max_p = min(len(selected), int(os.environ.get("MAX_PARALLEL", "3") or "3"))
           else:
-              ordered = sorted(
-                  tasks,
-                  key=lambda t: (0 if t.get("grading") == "checks" else (1 if t.get("grading") == "checks-judge" else 2)),
-              )
-              selected = [t["id"] for t in ordered[:limit]]
+              limit = int(os.environ.get("TASK_LIMIT", "3") or "3")
+              max_p = min(limit, int(os.environ.get("MAX_PARALLEL", "3") or "3"))
+              if limit >= len(tasks):
+                  selected = [t["id"] for t in tasks]
+              else:
+                  ordered = sorted(
+                      tasks,
+                      key=lambda t: (0 if t.get("grading") == "checks" else (1 if t.get("grading") == "checks-judge" else 2)),
+                  )
+                  selected = [t["id"] for t in ordered[:limit]]
 
           print(f"Selected {len(selected)} task(s) with max_parallel={max_p}: {selected}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
@@ -229,7 +257,9 @@ jobs:
 
       - name: Reclaim runner disk space for container images
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/boost /usr/local/share/chromium /usr/local/lib/node_modules || true
+          sudo docker system prune -af --volumes || true
+          sudo apt-get clean || true
           df -h
 
       - name: Set up Python 3.12
@@ -387,13 +417,7 @@ jobs:
           logs_dir.mkdir(parents=True, exist_ok=True)
           seen = set()
 
-          def _stage_tail(src: Path, rel_name: str, max_lines: int) -> None:
-              if not src.is_file() or src.stat().st_size > 2 * 1024 * 1024:
-                  return
-              resolved = src.resolve()
-              if resolved in seen:
-                  return
-              seen.add(resolved)
+          def _unique_out_path(rel_name: str) -> Path:
               out_path = logs_dir / rel_name
               if out_path.exists():
                   stem, suffix = out_path.stem, out_path.suffix
@@ -401,21 +425,58 @@ jobs:
                   while (logs_dir / f"{stem}_{idx}{suffix}").exists():
                       idx += 1
                   out_path = logs_dir / f"{stem}_{idx}{suffix}"
+              return out_path
+
+          def _stage_log_file(
+              src: Path,
+              rel_name: str,
+              max_lines: int,
+              *,
+              keep_head: bool = False,
+              max_raw_bytes: int = 2 * 1024 * 1024,
+              max_out_bytes: int = 2 * 1024 * 1024,
+          ) -> None:
+              if not src.is_file() or src.stat().st_size > max_raw_bytes:
+                  return
+              resolved = src.resolve()
+              if resolved in seen:
+                  return
+              seen.add(resolved)
+              out_path = _unique_out_path(rel_name)
               lines = src.read_text(encoding="utf-8", errors="replace").splitlines()
               if len(lines) > max_lines:
-                  lines = lines[-max_lines:]
-              out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                  if keep_head:
+                      head_n = max_lines // 2
+                      tail_n = max_lines - head_n
+                      omitted = len(lines) - max_lines
+                      lines = lines[:head_n] + [f"... [omitted {omitted} line(s)] ..."] + lines[-tail_n:]
+                  else:
+                      lines = lines[-max_lines:]
+              text_out = "\n".join(lines) + "\n"
+              raw_bytes = text_out.encode("utf-8", errors="replace")
+              if len(raw_bytes) > max_out_bytes:
+                  half_b = max(1024, (max_out_bytes - 256) // 2)
+                  marker = b"\n... [truncated middle due to byte limit] ...\n"
+                  raw_bytes = raw_bytes[:half_b] + marker + raw_bytes[-half_b:]
+                  text_out = raw_bytes.decode("utf-8", errors="replace")
+              out_path.write_text(text_out, encoding="utf-8")
 
-          for pattern, limit in (
-              ("attempt*/harbor.log", 200),
-              ("attempt*/jobs/dev/*/agent/serve.log", 200),
-              ("attempt*/jobs/dev/*/agent/*.txt", 200),
-              ("attempt*/jobs/dev/*/result.json", 400),
+          for pattern, limit, keep_head in (
+              ("attempt*/harbor.log", 200, False),
+              ("attempt*/jobs/dev/*/agent/serve.log", 400, False),
+              ("attempt*/jobs/dev/*/agent/*.txt", 200, False),
+              ("attempt*/jobs/dev/*/result.json", 1200, True),
           ):
               for match in sorted(eval_dir.glob(pattern)):
                   if match.is_file():
                       rel = "_".join(match.relative_to(eval_dir).parts[-4:])
-                      _stage_tail(match, rel, limit)
+                      _stage_log_file(
+                          match,
+                          rel,
+                          limit,
+                          keep_head=keep_head,
+                          max_raw_bytes=(20 * 1024 * 1024 if keep_head else 2 * 1024 * 1024),
+                      )
 
           for ver_dir in sorted(eval_dir.glob("attempt*/jobs/dev/*/verifier")):
               if not ver_dir.is_dir():
@@ -424,7 +485,13 @@ jobs:
               for vf in sorted(ver_dir.rglob("*")):
                   if vf.is_file():
                       sub_rel = "_".join(vf.relative_to(ver_dir).parts)
-                      _stage_tail(vf, f"{prefix}_{sub_rel}", 400)
+                      _stage_log_file(
+                          vf,
+                          f"{prefix}_{sub_rel}",
+                          1200,
+                          keep_head=True,
+                          max_raw_bytes=20 * 1024 * 1024,
+                      )
           PY
 
       - name: Upload per-task artifact
