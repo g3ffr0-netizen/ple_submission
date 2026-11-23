@@ -419,5 +419,277 @@ jobs:
           ):
               for match in sorted(eval_dir.glob(pattern)):
                   if match.is_file():
-                      rel = "_".join(match.relative_
+              rel = "_".join(match.relative_to(eval_dir).parts[-4:])
+                      _stage_log_file(
+                          match,
+                          rel,
+                          limit,
+                          keep_head=keep_head,
+                          max_raw_bytes=(20 * 1024 * 1024 if keep_head else 2 * 1024 * 1024),
+                      )
+          for ver_dir in sorted(eval_dir.glob("attempt*/jobs/dev/*/verifier")):
+              if not ver_dir.is_dir():
+                  continue
+              prefix = "_".join(ver_dir.relative_to(eval_dir).parts[-3:])
+              for vf in sorted(ver_dir.rglob("*")):
+                  if vf.is_file():
+                      sub_rel = "_".join(vf.relative_to(ver_dir).parts)
+                      _stage_log_file(
+                          vf,
+                          f"{prefix}_{sub_rel}",
+                          1200,
+                          keep_head=True,
+                          max_raw_bytes=20 * 1024 * 1024,
+                      )
+          PY
+      - name: Upload per-task artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ple-task-${{ matrix.task_id }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/task_bundle
+          retention-days: 14
+          if-no-files-found: warn
+      - name: Stop model proxy, clean secrets, and check task exit code
+        if: always()
+        env:
+          EVAL_EXIT: ${{ steps.run_task.outputs.eval_exit }}
+        run: |
+          if [ -n "${PROXY_PID:-}" ]; then
+            kill "$PROXY_PID" 2>/dev/null || true
+          fi
+          rm -f "$RUNNER_TEMP/gcp-sa-key.json" "$RUNNER_TEMP/local.env"
+          if [ -n "${EVAL_EXIT:-}" ] && [ "$EVAL_EXIT" != "0" ]; then
+            echo "::error::eval/run.py exited with status $EVAL_EXIT"
+            exit 1
+          fi
+  aggregate:
+    needs: [plan-and-check, eval-task]
+    if: always() && needs.plan-and-check.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out submission repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        run: python -m pip install --upgrade pip uv
+      - name: Clone official PLE starter kit
+        run: |
+          rm -rf "$RUNNER_TEMP/ple_kit"
+          git clone --depth 1 https://github.com/google-research/ple.git "$RUNNER_TEMP/ple_kit"
+          cd "$RUNNER_TEMP/ple_kit"
+          uv sync
+      - name: Download all per-task artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ple-task-*-${{ github.run_id }}
+          path: ${{ runner.temp }}/task_artifacts
+      - name: Merge artifacts and compute combined evaluation summary
+        id: summary
+        env:
+          TASKS_JSON: ${{ needs.plan-and-check.outputs.tasks_json }}
+        run: |
+          cd "$RUNNER_TEMP/ple_kit"
+          uv run python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import shutil
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, os.getcwd())
+          from kit import export, artifacts
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          task_art_root = Path(os.environ["RUNNER_TEMP"]) / "task_artifacts"
+          bundle = Path(os.environ["RUNNER_TEMP"]) / "upload_bundle"
+          if bundle.exists():
+              shutil.rmtree(bundle)
+          bundle.mkdir(parents=True, exist_ok=True)
+          selected_ids = json.loads(os.environ["TASKS_JSON"])
+          results_by_task = {}
+          submission_name = "ple-submission"
+          model_api = "google-cloud/gemini-3.8-flash"
+          judge_model = "claude-opus-5-5"
+          for sub_dir in sorted(task_art_root.glob("ple-task-*")):
+              res_file = sub_dir / "results.json"
+              if res_file.is_file():
+                  data = json.loads(res_file.read_text(encoding="utf-8"))
+                  submission_name = str(data.get("submission") or submission_name)
+                  model_api = str(data.get("model") or model_api)
+                  judge_model = str(data.get("judge_model") or judge_model)
+                  for row in data.get("tasks") or []:
+                      if isinstance(row, dict) and row.get("id"):
+                          results_by_task[row["id"]] = row
+              art_src = sub_dir / "artifacts"
+              if (art_src / "manifest.json").is_file():
+                  try:
+                      msgs = export.import_run(workspace, art_src)
+                      print(f"Imported {sub_dir.name}: {'; '.join(msgs)}")
+                  except export.ExportError as exc:
+                      print(f"::warning::Could not import artifacts from {sub_dir.name}: {exc}")
+              log_src = sub_dir / "logs"
+              if log_src.is_dir():
+                  shutil.copytree(log_src, bundle / "logs" / sub_dir.name, dirs_exist_ok=True)
+          if (workspace / "artifacts").is_dir():
+              shutil.copytree(workspace / "artifacts", bundle / "artifacts", dirs_exist_ok=True)
+              try:
+                  rv = artifacts.review_directory(workspace, artifacts.load_dev_set(artifacts.DEV_SET_FILE))
+                  print("--- Official artifacts review ---")
+                  print("\n".join(rv.lines()))
+              except Exception as exc:
+                  print(f"::warning::Artifact review note: {exc}")
+          RATES = {
+              "gemini-3.8-flash": {"input": 0.15, "cache": 0.04, "output": 0.60},
+              "gemini-4-argon": {"input": 1.25, "cache": 0.31, "output": 10.00},
+              "gemini-3.1-pro-preview": {"input": 1.25, "cache": 0.31, "output": 10.00},
+              "claude-opus-5-5": {"input": 15.00, "cache": 1.50, "output": 75.00},
+          }
+          DEFAULT_RATE = {"input": 0.50, "cache": 0.12, "output": 2.00}
+          rate = RATES.get(model_api.split("/")[-1], DEFAULT_RATE)
+          total_in = 0
+          total_cache = 0
+          total_out = 0
+          total_score = 0.0
+          passed = 0
+          measured_count = 0
+          rows_md = []
+          task_summaries = []
+          for tid in selected_ids:
+              t = results_by_task.get(tid) or {"id": tid, "score": 0.0, "measured": False, "status": "missing"}
+              score = float(t.get("score") or 0.0)
+              measured = bool(t.get("measured"))
+              status = str(t.get("status") or "")
+              seconds = t.get("seconds")
+              tokens = t.get("tokens") or {}
+              in_tok = int(tokens.get("input") or 0)
+              cache_tok = int(tokens.get("cache") or 0)
+              out_tok = int(tokens.get("output") or 0)
+              total_in += in_tok
+              total_cache += cache_tok
+              total_out += out_tok
+              total_score += score
+              uncached_in = max(0, in_tok - cache_tok)
+              est_cost = (
+                  (uncached_in / 1_000_000.0) * rate["input"]
+                  + (cache_tok / 1_000_000.0) * rate["cache"]
+                  + (out_tok / 1_000_000.0) * rate["output"]
+              )
+              if not measured:
+                  verdict = "UNMEASURED"
+              elif score >= 0.5:
+                  verdict = "PASS"
+                  passed += 1
+              else:
+                  verdict = "FAIL"
+              if measured:
+                  measured_count += 1
+              sec_str = f"{float(seconds):.0f}s" if isinstance(seconds, (int, float)) else "-"
+              rows_md.append(
+                  f"| `{tid}` | **{verdict}** | {score:.3f} | {status} | {sec_str} | "
+                  f"{in_tok:,} / {cache_tok:,} / {out_tok:,} | ~${est_cost:.4f} |"
+              )
+              task_summaries.append(
+                  {
+                      "id": tid,
+                      "verdict": verdict,
+                      "score": score,
+                      "measured": measured,
+                      "status": status,
+                      "seconds": seconds,
+                      "tokens": {"input": in_tok, "cache": cache_tok, "output": out_tok},
+                      "estimated_cost_usd": round(est_cost, 6),
+                  }
+              )
+          total_tasks = len(selected_ids)
+          overall_score = (total_score / total_tasks) if total_tasks else 0.0
+          total_uncached = max(0, total_in - total_cache)
+          total_est_cost = (
+              (total_uncached / 1_000_000.0) * rate["input"]
+              + (total_cache / 1_000_000.0) * rate["cache"]
+              + (total_out / 1_000_000.0) * rate["output"]
+          )
+          summary_lines = [
+              "## PLE Dev Eval Summary",
+              "",
+              f"- **Submission:** `{submission_name}`",
+              f"- **Model:** `{model_api}` (judge: `{judge_model}`)",
+              f"- **Overall Mean Score:** `{overall_score:.4f}` (`{passed}/{total_tasks}` passed score >= 0.5; `{measured_count}/{total_tasks}` measured)",
+              f"- **Total Tokens (in / cache / out):** `{total_in:,} / {total_cache:,} / {total_out:,}`",
+              f"- **Estimated Harness Cost (approx. list rates):** `~${total_est_cost:.4f}` *(excludes separate LLM judge calls)*",
+              "",
+              "| Task | Result | Score | Status | Time | Tokens (in / cache / out) | Est. Cost |",
+              "| :--- | :--- | ---: | :--- | ---: | ---: | ---: |",
+              *rows_md,
+              "",
+          ]
+          report_text = "\n".join(summary_lines)
+          (bundle / "summary.md").write_text(report_text, encoding="utf-8")
+          (bundle / "summary.json").write_text(
+              json.dumps(
+                  {
+                      "submission": submission_name,
+                      "model": model_api,
+                      "judge_model": judge_model,
+                      "overall_score": round(overall_score, 6),
+                      "passed_tasks": passed,
+                      "measured_tasks": measured_count,
+                      "total_tasks": total_tasks,
+                      "tokens": {
+                          "input": total_in,
+                          "cache": total_cache,
+                          "output": total_out,
+                      },
+                      "estimated_cost_usd": round(total_est_cost, 6),
+                      "tasks": task_summaries,
+                  },
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+          print(report_text)
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary:
+              with open(step_summary, "a", encoding="utf-8") as fh:
+                  fh.write(report_text)
+          all_measured = str(measured_count == total_tasks and total_tasks > 0).lower()
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"all_measured={all_measured}\n")
+          PY
+      - name: Upload combined evaluation bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ple-dev-eval-${{ github.run_id }}
+          path: ${{ runner.temp }}/upload_bundle
+          retention-days: 30
+          if-no-files-found: warn
+      - name: Commit merged artifacts back to origin/main when requested
+        if: ${{ inputs.commit_artifacts && needs.eval-task.result == 'success' && steps.summary.outputs.all_measured == 'true' }}
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ ! -d artifacts ]; then
+            echo "No artifacts/ directory merged to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add artifacts/
+          if git diff --cached --quiet; then
+            echo "No changes in artifacts/ to commit."
+            exit 0
+          fi
+          git commit -m "Update PLE dev artifacts (run $RUN_ID)"
+          git push origin HEAD:main
+      - name: Fail aggregate job if any task did not complete
+        if: ${{ needs.eval-task.result != 'success' || steps.summary.outputs.all_measured != 'true' }}
+        run: |
+          echo "::error::One or more evaluation tasks failed or remained unmeasured. See summary table and logs artifact."
+          exit 1
               
