@@ -51,8 +51,22 @@ def _write_mock_ifcopenshell_pkg(pkgdir: Path) -> Dict[str, str]:
         import builtins
         import json
 
+        class _Prop:
+            def __init__(self, name, value):
+                self.Name = name
+                self.NominalValue = type("_NomVal", (), {"wrappedValue": value})()
+
+        class _Pset:
+            def __init__(self, name, kv_dict):
+                self.Name = name
+                self.HasProperties = [_Prop(k, v) for k, v in kv_dict.items()]
+
+        class _RelDefines:
+            def __init__(self, pset):
+                self.RelatingPropertyDefinition = pset
+
         class _Entity:
-            def __init__(self, eid, cls, gid, name="", obj_type="", repr_=True):
+            def __init__(self, eid, cls, gid, name="", obj_type="", repr_=True, psets=None):
                 self._eid = eid
                 self._cls = cls
                 self.GlobalId = gid
@@ -61,6 +75,10 @@ def _write_mock_ifcopenshell_pkg(pkgdir: Path) -> Dict[str, str]:
                 self.Representation = repr_
                 self.IsDecomposedBy = []
                 self.ContainsElements = []
+                self.IsDefinedBy = [
+                    _RelDefines(_Pset(pname, pdict))
+                    for pname, pdict in (psets or {}).items()
+                ]
 
             def id(self):
                 return self._eid
@@ -98,6 +116,7 @@ def _write_mock_ifcopenshell_pkg(pkgdir: Path) -> Dict[str, str]:
                         e.get("name", ""),
                         e.get("obj_type", ""),
                         bool(e.get("repr", True)),
+                        psets=e.get("psets"),
                     )
                     ent._box = tuple(e["box"]) if "box" in e else None
                     self._elems[e["id"]] = ent
@@ -448,7 +467,7 @@ class TestLayer1SyntheticFailureFixtures(unittest.TestCase):
             self.assertIn("DUCT-01", bad_errs)
             self.assertIn("COL-B2", bad_errs)
             self.assertNotIn("PDU-01", bad_errs)
-            self.assertIn("tray-stack vertical headroom 170.0mm < 300mm", bad_warns)
+            self.assertIn("tray-stack vertical headroom 170.0mm < 300mm", bad_errs)
             self.assertIn("overhead clear height 2420.0mm < 2600mm", bad_warns)
             self.assertIn("overhead clear height 2350.0mm < 2600mm", bad_warns)
 
@@ -458,14 +477,14 @@ class TestLayer1SyntheticFailureFixtures(unittest.TestCase):
                     {"id": 2, "cls": "IfcElectricDistributionBoard", "gid": "PDU_1", "name": "PDU-01", "obj_type": "PDU", "box": [14.0, 15.0, 1.0, 2.0, 0.0, 2.0]},
                     {"id": 3, "cls": "IfcPipeSegment", "gid": "CHW_1", "name": "CHW-SUP-01", "box": [0.0, 2.0, 2.0, 2.2, 2.80, 2.95]},
                     {"id": 4, "cls": "IfcPipeSegment", "gid": "CHW_2", "name": "CHW-SUP-02", "box": [2.008, 4.0, 2.0, 2.2, 2.80, 2.95]},
-                    {"id": 5, "cls": "IfcFlowSegment", "gid": "COND_A", "name": "CONDUIT-A", "box": [5.0, 7.0, 2.0, 2.1, 2.80, 2.90]},
-                    {"id": 6, "cls": "IfcFlowSegment", "gid": "COND_B", "name": "CONDUIT-B", "box": [7.008, 9.0, 2.0, 2.1, 2.80, 2.90]},
+                    {"id": 5, "cls": "IfcFlowSegment", "gid": "COND_A", "name": "CONDUIT-A", "box": [5.0, 7.0, 4.0, 4.1, 2.80, 2.90]},
+                    {"id": 6, "cls": "IfcFlowSegment", "gid": "COND_B", "name": "CONDUIT-B", "box": [7.008, 9.0, 4.0, 4.1, 2.80, 2.90]},
                     {"id": 7, "cls": "IfcDuctSegment", "gid": "DUCT_1", "name": "DUCT-01", "box": [1.0, 2.0, 4.0, 4.4, 2.80, 3.00]},
                     {"id": 8, "cls": "IfcColumn", "gid": "COL_B2", "name": "COL-B2", "box": [1.0, 1.5, 4.45, 4.8, 0.0, 4.0]},
                     {"id": 9, "cls": "IfcCableCarrierSegment", "gid": "CT_LOW", "name": "CT-LOWER", "box": [8.0, 10.0, 6.0, 6.5, 2.85, 2.95]},
-                    {"id": 10, "cls": "IfcCableCarrierSegment", "gid": "CT_UP", "name": "CT-UPPER", "box": [8.0, 10.0, 6.0, 6.5, 3.30, 3.40]},
+                    {"id": 10, "cls": "IfcFlowSegment", "gid": "BW_UP", "name": "BW-UPPER", "obj_type": "Busway", "box": [8.0, 10.0, 6.0, 6.5, 3.30, 3.40]},
                     {"id": 11, "cls": "IfcFireSuppressionTerminal", "gid": "SPR_4", "name": "SPR-04", "obj_type": "Sprinkler", "box": [11.0, 11.2, 8.0, 8.2, 2.75, 2.85]},
-                    {"id": 12, "cls": "IfcPipeSegment", "gid": "CHW_LOW", "name": "CHW-LOW", "box": [12.0, 13.0, 8.0, 8.2, 2.75, 2.90]},
+                    {"id": 12, "cls": "IfcPipeSegment", "gid": "CHW_LOW", "name": "CHW-LOW", "box": [4.008, 6.0, 2.0, 2.2, 2.75, 2.90]},
                 ],
                 "connects": [[3, 4]],
             }
@@ -590,6 +609,138 @@ class TestLayer1SyntheticFailureFixtures(unittest.TestCase):
             self.assertEqual(clean["errors"], [])
             self.assertEqual(clean["warnings"], [])
 
+    def test_mep_floating_drop_proxy_connectivity_and_pset_separation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env = _write_mock_ifcopenshell_pkg(tmp_path / "pkgs")
+
+            bad_scene = {
+                "elements": [
+                    {"id": 1, "cls": "IfcSlab", "gid": "SLAB_1", "name": "FLOOR-SLAB", "box": [0.0, 20.0, 0.0, 20.0, -0.05, 0.0]},
+                    {"id": 2, "cls": "IfcCableCarrierSegment", "gid": "CT_1", "name": "CT-1-SEG-01", "box": [0.0, 2.0, 0.0, 0.4, 2.60, 2.70]},
+                    {"id": 3, "cls": "IfcCableCarrierSegment", "gid": "CT_2", "name": "CT-1-SEG-02", "box": [2.008, 4.0, 0.0, 0.4, 2.60, 2.70]},
+                    # Floating Termination proxy tagged with Pset_DCM_Drop SystemTag=CT-1, 260mm below CT-1 (>250mm tol!)
+                    {
+                        "id": 4,
+                        "cls": "IfcBuildingElementProxy",
+                        "gid": "DROP_CT_1",
+                        "name": "DROP-CT-1-ROW-A",
+                        "obj_type": "Termination",
+                        "psets": {"Pset_DCM_Drop": {"SystemTag": "CT-1"}},
+                        "box": [0.5, 0.8, 0.1, 0.3, 2.20, 2.34],
+                    },
+                    {"id": 5, "cls": "IfcFlowSegment", "gid": "BW_1", "name": "BW-1-SEG-01", "obj_type": "Busway", "box": [0.0, 2.0, 0.80, 1.10, 3.00, 3.10]},
+                    {"id": 6, "cls": "IfcFlowSegment", "gid": "BW_2", "name": "BW-1-SEG-02", "obj_type": "Busway", "box": [2.008, 4.0, 0.80, 1.10, 3.00, 3.10]},
+                    # Floating Termination proxy whose Name uses Pset SystemTag=BW-1 (no "busway" in Name): 260mm below BW-1 AND 266.5mm from CT-1
+                    {
+                        "id": 7,
+                        "cls": "IfcBuildingElementProxy",
+                        "gid": "DROP_BW_1",
+                        "name": "TERM-DROP-01",
+                        "obj_type": "Termination",
+                        "psets": {"Pset_DCM_Drop": {"SystemTag": "BW-1"}},
+                        "box": [1.0, 1.2, 0.6665, 0.75, 2.50, 2.74],
+                    },
+                    # Non-MEP neutral proxy without matching Name or Pset tag must be skipped cleanly
+                    {"id": 8, "cls": "IfcBuildingElementProxy", "gid": "MISC_1", "name": "WALL-BRACKET-1", "box": [15.0, 16.0, 15.0, 16.0, 2.0, 2.2]},
+                ]
+            }
+            bad_dir = tmp_path / "mep_drop_bad"
+            bad_dir.mkdir()
+            (bad_dir / "mep_drop_trap.ifc").write_text(
+                f"ISO-10303-21;\n/* SCENE_JSON: {json.dumps(bad_scene)} */\nEND-ISO-10303-21;",
+                encoding="utf-8",
+            )
+            bad = _run_audit(bad_dir, env=env)
+            bad_errs = "\n".join(bad["errors"])
+            self.assertIn("disconnected MEP cable_tray network", bad_errs)
+            self.assertIn("disconnected MEP busway network", bad_errs)
+            self.assertIn("tray-busway clearance 266.5mm < 300mm", bad_errs)
+            self.assertNotIn("WALL-BRACKET-1", bad_errs)
+
+            clean_scene = {
+                "elements": [
+                    {"id": 1, "cls": "IfcSlab", "gid": "SLAB_1", "name": "FLOOR-SLAB", "box": [0.0, 20.0, 0.0, 20.0, -0.05, 0.0]},
+                    {"id": 2, "cls": "IfcCableCarrierSegment", "gid": "CT_1", "name": "CT-1-SEG-01", "box": [0.0, 2.0, 0.0, 0.4, 3.00, 3.10]},
+                    {"id": 3, "cls": "IfcCableCarrierSegment", "gid": "CT_2", "name": "CT-1-SEG-02", "box": [2.008, 4.0, 0.0, 0.4, 3.00, 3.10]},
+                    # Connected inline fitting within exact 250.0mm horizontal gap (4.25 - 4.00 = 0.250m)
+                    {"id": 4, "cls": "IfcCableCarrierFitting", "gid": "DROP_OK", "name": "CT-1-DROP", "box": [4.25, 4.55, 0.0, 0.4, 3.00, 3.10]},
+                    # Neutral ServiceDropTermination proxy without CT-1/BW-1 tag does not fragment CT-1
+                    {
+                        "id": 5,
+                        "cls": "IfcBuildingElementProxy",
+                        "gid": "SD_1",
+                        "name": "SERVICE-DROP-A",
+                        "obj_type": "ServiceDropTermination",
+                        "psets": {"Pset_DCM_ServiceDrop": {"Panel": "PDU-1"}},
+                        "box": [0.5, 0.8, 0.1, 0.3, 2.20, 2.40],
+                    },
+                    {"id": 6, "cls": "IfcFlowSegment", "gid": "BW_1", "name": "BW-1-SEG-01", "obj_type": "Busway", "box": [0.0, 2.0, 0.75, 1.05, 3.00, 3.10]},
+                ]
+            }
+            clean_dir = tmp_path / "mep_drop_clean"
+            clean_dir.mkdir()
+            (clean_dir / "mep_drop_clean.ifc").write_text(
+                f"ISO-10303-21;\n/* SCENE_JSON: {json.dumps(clean_scene)} */\nEND-ISO-10303-21;",
+                encoding="utf-8",
+            )
+            clean = _run_audit(clean_dir, env=env)
+            self.assertEqual(clean["errors"], [])
+            self.assertEqual(clean["warnings"], [])
+
+    def test_tray_stack_headroom_error_and_exact_300mm_epsilon_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env = _write_mock_ifcopenshell_pkg(tmp_path / "pkgs")
+
+            bad_scene = {
+                "elements": [
+                    {"id": 1, "cls": "IfcCableCarrierSegment", "gid": "CT_BASE", "name": "CT-1-BASE", "box": [0.0, 4.0, 0.0, 0.5, 3.00, 3.10]},
+                    # 72.0mm vertical overlap headroom above CHW-1
+                    {"id": 2, "cls": "IfcPipeSegment", "gid": "CHW_72", "name": "CHW-1-72", "box": [0.5, 1.5, 0.0, 0.5, 2.80, 2.928]},
+                    # 299.0mm vertical headroom below BW-1 (must be caught in errors, not warnings)
+                    {"id": 3, "cls": "IfcFlowSegment", "gid": "BW_299", "name": "BW-1-299", "obj_type": "Busway", "box": [2.0, 3.0, 0.0, 0.5, 3.399, 3.50]},
+                ]
+            }
+            bad_dir = tmp_path / "stack_bad"
+            bad_dir.mkdir()
+            (bad_dir / "stack_bad.ifc").write_text(
+                f"ISO-10303-21;\n/* SCENE_JSON: {json.dumps(bad_scene)} */\nEND-ISO-10303-21;",
+                encoding="utf-8",
+            )
+            bad = _run_audit(bad_dir, env=env)
+            bad_errs = "\n".join(bad["errors"])
+            self.assertIn("tray-stack vertical headroom 72.0mm < 300mm", bad_errs)
+            self.assertIn("tray-stack vertical headroom 299.0mm < 300mm", bad_errs)
+            self.assertFalse(any("tray-stack vertical headroom" in w for w in bad["warnings"]))
+
+            # Exact 300.0mm (with IEEE-754 0.2999999999999998 subtraction) must pass under 1e-3mm epsilon
+            clean_scene_v = {
+                "elements": [
+                    {"id": 1, "cls": "IfcCableCarrierSegment", "gid": "CT_LOW", "name": "CT-LOWER", "box": [0.0, 2.0, 0.0, 0.5, 2.85, 2.95]},
+                    {"id": 2, "cls": "IfcFlowSegment", "gid": "BW_EXACT", "name": "BW-UPPER", "obj_type": "Busway", "box": [0.0, 2.0, 0.0, 0.5, 3.25, 3.35]},
+                ]
+            }
+            clean_scene_h = {
+                "elements": [
+                    {"id": 3, "cls": "IfcCableCarrierSegment", "gid": "CT_SIDE", "name": "CT-LOWER-SIDE", "box": [0.0, 2.0, 1.0, 1.5, 2.85, 2.95]},
+                    {"id": 4, "cls": "IfcFlowSegment", "gid": "BW_SIDE", "name": "BW-SIDE", "obj_type": "Busway", "box": [0.0, 2.0, 1.80, 2.1, 2.85, 2.95]},
+                ]
+            }
+            clean_dir = tmp_path / "stack_clean"
+            clean_dir.mkdir()
+            (clean_dir / "stack_clean_v.ifc").write_text(
+                f"ISO-10303-21;\n/* SCENE_JSON: {json.dumps(clean_scene_v)} */\nEND-ISO-10303-21;",
+                encoding="utf-8",
+            )
+            (clean_dir / "stack_clean_h.ifc").write_text(
+                f"ISO-10303-21;\n/* SCENE_JSON: {json.dumps(clean_scene_h)} */\nEND-ISO-10303-21;",
+                encoding="utf-8",
+            )
+            clean = _run_audit(clean_dir, env=env)
+            self.assertEqual(clean["errors"], [])
+            self.assertEqual(clean["warnings"], [])
+
 
 # ---------------------------------------------------------------------------
 # Layer 2: Scripted Full Agent-Loop & Resilience Simulations
@@ -629,6 +780,9 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
 
                     if sys_msg.startswith("You plan an engineering task"):
                         return _reply("Plan: inspect and verify takeoff.csv.")
+
+                    if sys_msg.startswith("You extract strict engineering constraints"):
+                        return _reply(json.dumps({"source": "llm_extractor", "deliverables": ["takeoff.csv"]}))
 
                     if sys_msg.startswith("You check an engineer's work"):
                         if not tool_msgs and len(user_texts) == 1:
@@ -756,6 +910,9 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
                     if sys_msg.startswith("You plan an engineering task"):
                         return _reply("Plan: inspect takeoff.csv.")
 
+                    if sys_msg.startswith("You extract strict engineering constraints"):
+                        return _reply(json.dumps({"source": "llm_extractor", "deliverables": ["takeoff.csv"]}))
+
                     if sys_msg.startswith("You check an engineer's work"):
                         if not tool_msgs and len(user_texts) == 1:
                             self.verify_rounds += 1
@@ -866,6 +1023,11 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
                             raise openai.APIStatusError("service unavailable", response=r503, body=None)
                         return serve._DryRunObject(
                             {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Plan ready."}}]}
+                        )
+
+                    if sys_msg.startswith("You extract strict engineering constraints"):
+                        return serve._DryRunObject(
+                            {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps({"source": "llm_extractor", "deliverables": ["takeoff.csv"]})}}]}
                         )
 
                     if sys_msg.startswith("You check an engineer's work"):
@@ -1020,6 +1182,513 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
         self.assertFalse(res["history"][3]["ok"])
         self.assertTrue(res["history"][4]["ok"])
         self.assertFalse(engine.locked)
+
+    def test_contradictory_cross_store_comment_prefilter_and_readback_gate(self):
+        # Part A: Pure regex pre-filter checks
+        self.assertTrue(
+            serve.detect_contradictory_comment_statuses("Darnwick: pre-marked carried, final call not carried")
+        )
+        self.assertTrue(
+            serve.detect_contradictory_comment_statuses("Lockmere: check pass after audit failed")
+        )
+        self.assertTrue(
+            serve.detect_contradictory_comment_statuses("Marden: approved for batch, rejected pending signature")
+        )
+        self.assertEqual(
+            serve.detect_contradictory_comment_statuses("Darnwick: NOT CARRIED — Witness test required"),
+            [],
+        )
+        self.assertEqual(
+            serve.detect_contradictory_comment_statuses("Record passed/failed and carried/not carried calls for each array."),
+            [],
+        )
+
+        # Part B: Full solve() cross-store readback & contradictory comment blocking
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            comments: List[str] = []
+
+            class _FakeMCPServer:
+                name = "apps"
+
+                async def call(self, tname: str, args: Dict[str, Any]) -> str:
+                    req = args.get("request") if isinstance(args.get("request"), dict) else args
+                    if tname == "openproject_mcp_add_comment":
+                        comments.append(str(req.get("comment") or ""))
+                        return json.dumps({"success": True, "activity_id": 61 + len(comments)})
+                    if tname == "openproject_mcp_get_work_package":
+                        return json.dumps({"id": 45, "status": "Closed"})
+                    if tname == "openproject_mcp_list_comments":
+                        return json.dumps({"comments": comments})
+                    return json.dumps({"ok": True})
+
+            fake_srv = _FakeMCPServer()
+            fake_registry = {
+                "apps__openproject_mcp_add_comment": (fake_srv, {"name": "openproject_mcp_add_comment", "inputSchema": {"type": "object"}}),
+                "apps__openproject_mcp_get_work_package": (fake_srv, {"name": "openproject_mcp_get_work_package", "inputSchema": {"type": "object"}}),
+                "apps__openproject_mcp_list_comments": (fake_srv, {"name": "openproject_mcp_list_comments", "inputSchema": {"type": "object"}}),
+            }
+            fake_defs = [
+                {"type": "function", "function": {"name": k, "description": v["name"], "parameters": v["inputSchema"]}}
+                for k, (_, v) in fake_registry.items()
+            ]
+
+            async def _fake_connect_mcp(_session: Any):
+                return fake_registry, fake_defs, "\nMCP tools exposed."
+
+            class _CrossStoreClient:
+                def __init__(self) -> None:
+                    self.verify_round = 0
+                    self.fix_prompts: List[str] = []
+                    self.fix_done = False
+                    self.chat = self
+                    self.completions = self
+
+                async def create(self, **kwargs: Any) -> serve._DryRunObject:
+                    msgs = kwargs["messages"]
+                    sys_msg = str(msgs[0].get("content") or "")
+                    user_texts = [str(m.get("content") or "") for m in msgs if m.get("role") == "user"]
+                    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+
+                    def _reply(content: Optional[str], calls: Optional[List[Dict[str, Any]]] = None):
+                        m: Dict[str, Any] = {"role": "assistant", "content": content}
+                        if calls:
+                            m["tool_calls"] = calls
+                        return serve._DryRunObject({"choices": [{"finish_reason": "stop", "message": m}]})
+
+                    if sys_msg.startswith("You plan an engineering task"):
+                        return _reply("Plan: record batch calls in OpenProject WP #45.")
+                    if sys_msg.startswith("You extract strict engineering constraints"):
+                        return _reply(json.dumps({"source": "llm_extractor", "deliverables": ["package.txt"]}))
+
+                    if sys_msg.startswith("You check an engineer's work"):
+                        if not tool_msgs:
+                            self.verify_round += 1
+                            if self.verify_round in (1, 2):
+                                # Rounds 1 & 2 skip list_comments and only call get_work_package!
+                                return _reply(
+                                    None,
+                                    [
+                                        {
+                                            "id": f"v_get_{self.verify_round}",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "apps__openproject_mcp_get_work_package",
+                                                "arguments": json.dumps({"request": {"work_package_id": 45}}),
+                                            },
+                                        }
+                                    ],
+                                )
+                            # Round 3 reads back list_comments properly
+                            return _reply(
+                                None,
+                                [
+                                    {
+                                        "id": "v_list_3",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "apps__openproject_mcp_list_comments",
+                                            "arguments": json.dumps({"request": {"work_package_id": 45}}),
+                                        },
+                                    }
+                                ],
+                            )
+                        return _reply("PASS")
+
+                    if any("A reviewer checked your files" in t for t in user_texts):
+                        last_u = str(msgs[-1].get("content") or "")
+                        if last_u.startswith("A reviewer checked your files"):
+                            self.fix_prompts.append(last_u)
+                            if not self.fix_done:
+                                self.fix_done = True
+                                return _reply(
+                                    None,
+                                    [
+                                        {
+                                            "id": "fix_clean_comment",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "apps__openproject_mcp_add_comment",
+                                                "arguments": json.dumps(
+                                                    {
+                                                        "request": {
+                                                            "work_package_id": 45,
+                                                            "comment": "Darnwick: NOT CARRIED",
+                                                        }
+                                                    }
+                                                ),
+                                            },
+                                        }
+                                    ],
+                                )
+                        return _reply("Amended OpenProject WP #45 comment cleanly.")
+
+                    if not tool_msgs:
+                        return _reply(
+                            None,
+                            [
+                                {
+                                    "id": "work_bad_comment",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "apps__openproject_mcp_add_comment",
+                                        "arguments": json.dumps(
+                                            {
+                                                "request": {
+                                                    "work_package_id": 45,
+                                                    "comment": "Darnwick: pre-marked carried, actually not carried",
+                                                }
+                                            }
+                                        ),
+                                    },
+                                },
+                                {
+                                    "id": "work_write_pkg",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "write_file",
+                                        "arguments": json.dumps({"path": "package.txt", "content": "Darnwick: NOT CARRIED\n"}),
+                                    },
+                                },
+                            ],
+                        )
+                    return _reply("Posted WP #45 comment.")
+
+            sess = _LocalReplaySession(workdir, "Record Darnwick status in package.txt and WP #45.")
+            client = _CrossStoreClient()
+            with patch.dict(
+                os.environ,
+                {
+                    "MODEL_NAME": "gemini-4-argon",
+                    "OPENAI_BASE_URL": "http://proxy.local/v1",
+                    "OPENAI_API_KEY": "k",
+                    "MAX_FIX_ROUNDS": "3",
+                },
+                clear=False,
+            ), patch.object(serve, "connect_mcp", side_effect=_fake_connect_mcp):
+                ans = asyncio.run(
+                    serve.solve(
+                        sess,  # type: ignore[arg-type]
+                        client=client,
+                        config_path=str(REPO_ROOT / "submission.yaml"),
+                    )
+                )
+
+            self.assertEqual(ans, "Amended OpenProject WP #45 comment cleanly.")
+            # Blocked R1 (contradictory comment + missing comment readback), blocked R2 (missing comment readback), passed R3
+            self.assertEqual(client.verify_round, 3)
+            self.assertIn("contradictory status (carried vs not/non-carried)", client.fix_prompts[0])
+            self.assertIn("did not call an MCP comment/journal readback tool", client.fix_prompts[0])
+            self.assertEqual(comments[-1], "Darnwick: NOT CARRIED")
+
+    def test_tool_circuit_breaker_zero_error_batch_recovery_regression(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            (workdir / "ok.txt").write_text("healthy", encoding="utf-8")
+
+            class _MixedBatchClient:
+                def __init__(self) -> None:
+                    self.turn = 0
+                    self.seen_messages: List[List[Dict[str, Any]]] = []
+                    self.chat = self
+                    self.completions = self
+
+                async def create(self, **kwargs: Any) -> serve._DryRunObject:
+                    self.turn += 1
+                    msgs = kwargs["messages"]
+                    self.seen_messages.append(copy.deepcopy(msgs))
+                    if self.turn == 1:
+                        # 3 failing calls reaching max_failures=3, followed by 1 successful call in same batch!
+                        return serve._DryRunObject(
+                            {
+                                "choices": [
+                                    {
+                                        "finish_reason": "tool_calls",
+                                        "message": {
+                                            "role": "assistant",
+                                            "content": None,
+                                            "tool_calls": [
+                                                {"id": "b1", "type": "function", "function": {"name": "read_file", "arguments": "{bad1"}},
+                                                {"id": "b2", "type": "function", "function": {"name": "read_file", "arguments": "{bad2"}},
+                                                {"id": "b3", "type": "function", "function": {"name": "read_file", "arguments": "{bad3"}},
+                                                {"id": "ok1", "type": "function", "function": {"name": "read_file", "arguments": json.dumps({"path": "ok.txt"})}},
+                                            ],
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    if self.turn == 2:
+                        # 1 failing call (<3): failure_count should be 1, must NOT trigger 0-error breaker
+                        return serve._DryRunObject(
+                            {
+                                "choices": [
+                                    {
+                                        "finish_reason": "tool_calls",
+                                        "message": {
+                                            "role": "assistant",
+                                            "content": None,
+                                            "tool_calls": [
+                                                {"id": "b4", "type": "function", "function": {"name": "read_file", "arguments": "{bad4"}},
+                                            ],
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    return serve._DryRunObject(
+                        {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Batch recovered cleanly."}}]}
+                    )
+
+            sess = _LocalReplaySession(workdir, "Test mixed batch recovery.")
+            breaker = serve.CircuitBreaker(max_failures=3)
+            rt = {"model": "gemini-4-argon", "max_output_tokens": 1024, "effort": "high", "cache_mark": False, "max_failures": 3}
+            client = _MixedBatchClient()
+            ans = asyncio.run(
+                serve.agent(
+                    sess,  # type: ignore[arg-type]
+                    serve.conversation(serve.WORKER, sess, "Test mixed batch."),  # type: ignore[arg-type]
+                    serve.TOOLS,
+                    0.0,
+                    client=client,
+                    runtime_cfg=rt,
+                    breaker=breaker,
+                    final=True,
+                )
+            )
+            self.assertEqual(ans, "Batch recovered cleanly.")
+            self.assertFalse(any("0 consecutive tool errors" in entry for entry in sess.logs))
+            self.assertFalse(any("tool circuit breaker tripped" in entry for entry in sess.logs))
+            self.assertFalse(
+                any(
+                    m.get("role") == "user" and "Consecutive tool calls failed" in str(m.get("content") or "")
+                    for m in client.seen_messages[-1]
+                )
+            )
+            self.assertEqual(breaker.failure_count, 1)
+
+            # Confirm a pure failing batch without trailing success still trips accurately at 3 consecutive errors
+            class _PureFailClient:
+                def __init__(self) -> None:
+                    self.turn = 0
+                    self.chat = self
+                    self.completions = self
+
+                async def create(self, **kwargs: Any) -> serve._DryRunObject:
+                    self.turn += 1
+                    if self.turn == 1:
+                        return serve._DryRunObject(
+                            {
+                                "choices": [
+                                    {
+                                        "finish_reason": "tool_calls",
+                                        "message": {
+                                            "role": "assistant",
+                                            "content": None,
+                                            "tool_calls": [
+                                                {"id": "p1", "type": "function", "function": {"name": "read_file", "arguments": "{bad1"}},
+                                                {"id": "p2", "type": "function", "function": {"name": "read_file", "arguments": "{bad2"}},
+                                                {"id": "p3", "type": "function", "function": {"name": "read_file", "arguments": "{bad3"}},
+                                            ],
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    return serve._DryRunObject(
+                        {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Recovered after trip."}}]}
+                    )
+
+            sess2 = _LocalReplaySession(workdir, "Test pure failing batch.")
+            ans2 = asyncio.run(
+                serve.agent(
+                    sess2,  # type: ignore[arg-type]
+                    serve.conversation(serve.WORKER, sess2, "Test pure failing batch."),  # type: ignore[arg-type]
+                    serve.TOOLS,
+                    0.0,
+                    client=_PureFailClient(),
+                    runtime_cfg=rt,
+                    breaker=serve.CircuitBreaker(max_failures=3),
+                    final=True,
+                )
+            )
+            self.assertEqual(ans2, "Recovered after trip.")
+            self.assertTrue(any("tool circuit breaker tripped after 3 consecutive tool errors" in entry for entry in sess2.logs))
+
+    def test_regex_extractor_linear_time_no_redos(self):
+        import time
+
+        t0 = time.monotonic()
+        res_hyphens = serve._regex_extract_constraints("-" * 50_000 + " /app/output/plan.csv", "")
+        res_nines = serve._regex_extract_constraints("9" * 50_000 + " >= 300 mm and 50% and 100 m2", "")
+        elapsed = time.monotonic() - t0
+
+        self.assertLess(elapsed, 0.5)
+        self.assertIn("/app/output/plan.csv", res_hyphens["file_paths"])
+        self.assertIn(">= 300 mm", res_nines["numeric_thresholds"])
+        self.assertIn("50%", res_nines["numeric_thresholds"])
+        self.assertIn("100 m2", res_nines["numeric_thresholds"])
+
+    def test_e2e_extractor_429_regex_fallback_and_worker_429_retry_to_pass(self):
+        empty_fb = serve._regex_extract_constraints("Summarize general engineering notes.", "")
+        self.assertEqual(empty_fb["source"], "regex_fallback")
+        self.assertEqual(empty_fb["entities"], [])
+        self.assertEqual(empty_fb["note"], "no_constraints_found")
+
+        def _mock_http_response(status_code: int, headers: Optional[Dict[str, str]] = None) -> SimpleNamespace:
+            return SimpleNamespace(
+                status_code=status_code,
+                headers=dict(headers or {}),
+                request=SimpleNamespace(method="POST", url="https://api.example/v1/chat/completions"),
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            sleeps: List[float] = []
+
+            async def _fast_sleep(sec: float) -> None:
+                sleeps.append(sec)
+
+            clean_csv = "device_id,register,qty\nCT-1,REG-1,10\nTOTAL,,10\n"
+
+            class _E2EStormClient:
+                def __init__(self) -> None:
+                    self.extractor_attempts = 0
+                    self.worker_attempts = 0
+                    self.worker_prompt_seen = ""
+                    self.verifier_prompt_seen = ""
+                    self.chat = self
+                    self.completions = self
+
+                async def create(self, **kwargs: Any) -> serve._DryRunObject:
+                    msgs = kwargs["messages"]
+                    sys_msg = str(msgs[0].get("content") or "")
+                    user_texts = [str(m.get("content") or "") for m in msgs if m.get("role") == "user"]
+                    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+
+                    if sys_msg.startswith("You plan an engineering task"):
+                        return serve._DryRunObject(
+                            {
+                                "choices": [
+                                    {
+                                        "finish_reason": "stop",
+                                        "message": {
+                                            "role": "assistant",
+                                            "content": "Plan: validate cable_tray and busway thresholds >= 300 mm and write /app/output/package.csv.",
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+
+                    if sys_msg.startswith("You extract strict engineering constraints"):
+                        self.extractor_attempts += 1
+                        r429 = _mock_http_response(429)
+                        raise openai.APIStatusError("extractor quota 429", response=r429, body=None)
+
+                    if sys_msg.startswith("You check an engineer's work"):
+                        self.verifier_prompt_seen = user_texts[0]
+                        if not tool_msgs:
+                            return serve._DryRunObject(
+                                {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "tool_calls",
+                                            "message": {
+                                                "role": "assistant",
+                                                "content": None,
+                                                "tool_calls": [
+                                                    {
+                                                        "id": "v_read_pkg",
+                                                        "type": "function",
+                                                        "function": {"name": "read_file", "arguments": json.dumps({"path": "package.csv"})},
+                                                    }
+                                                ],
+                                            },
+                                        }
+                                    ]
+                                }
+                            )
+                        return serve._DryRunObject(
+                            {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "PASS"}}]}
+                        )
+
+                    # WORKER receives CONSTRAINTS.json, hits 1x 429, retries cleanly, writes package.csv
+                    self.worker_attempts += 1
+                    if not self.worker_prompt_seen:
+                        self.worker_prompt_seen = user_texts[0]
+                    if self.worker_attempts == 1:
+                        r429 = _mock_http_response(429, headers={"Retry-After": "3"})
+                        raise openai.APIStatusError("worker quota 429", response=r429, body=None)
+                    if not tool_msgs:
+                        return serve._DryRunObject(
+                            {
+                                "choices": [
+                                    {
+                                        "finish_reason": "tool_calls",
+                                        "message": {
+                                            "role": "assistant",
+                                            "content": None,
+                                            "tool_calls": [
+                                                {
+                                                    "id": "w_write_pkg",
+                                                    "type": "function",
+                                                    "function": {
+                                                        "name": "write_file",
+                                                        "arguments": json.dumps({"path": "package.csv", "content": clean_csv}),
+                                                    },
+                                                }
+                                            ],
+                                        },
+                                    }
+                                ]
+                            }
+                        )
+                    return serve._DryRunObject(
+                        {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Delivered clean package.csv."}}]}
+                    )
+
+            task_prompt = (
+                "Write /app/output/package.csv for cable_tray clearances (>= 300 mm separation, "
+                "<= 250 mm joint tolerance) as of 2025-07-14. If disposition is pending signature, "
+                "the releasable array list must be empty."
+            )
+            sess = _LocalReplaySession(workdir, task_prompt)
+            client = _E2EStormClient()
+            with patch.dict(
+                os.environ,
+                {
+                    "MODEL_NAME": "google-cloud/gemini-4-argon",
+                    "FALLBACK_MODELS": "google-cloud/gemini-3.1-pro-preview",
+                    "OPENAI_BASE_URL": "http://proxy.local/v1",
+                    "OPENAI_API_KEY": "k",
+                    "MAX_EXTRACT_TURNS": "99",
+                },
+                clear=False,
+            ), patch.object(serve.asyncio, "sleep", side_effect=_fast_sleep):
+                ans = asyncio.run(
+                    serve.solve(
+                        sess,  # type: ignore[arg-type]
+                        client=client,
+                        config_path=str(REPO_ROOT / "submission.yaml"),
+                    )
+                )
+
+            self.assertEqual(ans, "Delivered clean package.csv.")
+            self.assertEqual(client.extractor_attempts, 2)
+            self.assertEqual(client.worker_attempts, 3)
+            self.assertEqual(sleeps, [2.0, 5.0])
+            self.assertTrue(any("falling back to regex constraint extraction" in entry for entry in sess.logs))
+            for injected in (client.worker_prompt_seen, client.verifier_prompt_seen):
+                self.assertIn("CONSTRAINTS.json", injected)
+                self.assertIn('"source": "regex_fallback"', injected)
+                self.assertIn("/app/output/package.csv", injected)
+                self.assertIn(">= 300 mm", injected)
+                self.assertIn("2025-07-14", injected)
+                self.assertIn("cable_tray", injected)
+                self.assertIn("busway", injected)
+                self.assertIn("empty", injected)
+            self.assertEqual(_run_audit(workdir)["errors"], [])
 
 
 if __name__ == "__main__":

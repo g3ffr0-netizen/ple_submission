@@ -1098,6 +1098,9 @@ class TestPLEAlignmentUnitContracts(unittest.TestCase):
                 if sys_msg.startswith("You plan an engineering task"):
                     return _reply("Plan: write /app/deliverable.txt")
 
+                if sys_msg.startswith("You extract strict engineering constraints"):
+                    return _reply(json.dumps({"source": "llm_extractor", "deliverables": ["/app/deliverable.txt"]}))
+
                 if sys_msg.startswith("You check an engineer's work"):
                     last_user = user_texts[-1] if user_texts else ""
                     if serve.VERIFIER_WRAP_UP["content"] in last_user:
@@ -1411,6 +1414,11 @@ class TestPLEAlignmentUnitContracts(unittest.TestCase):
                         return serve._DryRunObject(
                             {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Plan"}}]}
                         )
+                    if sys_msg.startswith("You extract strict engineering constraints"):
+                        return serve._DryRunObject(
+                            {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps({"source": "llm_extractor", "deliverables": ["devices.csv"]})}}]}
+                        )
+
                     if sys_msg.startswith("You check an engineer's work"):
                         if any("Programmatic Pre-Check" in t for t in user_texts):
                             self.seen_audit_precheck = True
@@ -1532,7 +1540,7 @@ class TestPLEAlignmentUnitContracts(unittest.TestCase):
                             1: (0.0, 12.0, 0.0, 12.0, -0.035, 0.0),
                             2: (10.0, 11.0, 1.0, 2.0, 0.0, 1.96),
                             3: (0.0, 2.0, 1.0, 1.2, 2.70, 2.86),
-                            4: (2.0 + gap, 4.0, 1.0, 1.2, 2.70, 2.86),
+                            4: (2.0 + gap, 4.994 if clean else 4.0, 1.0, 1.2, 2.70, 2.86),
                             5: (5.0, 7.0, 1.0, 1.6, tray_z0, tray_z0 + 0.127),
                             6: (7.0 + tray_ov, 8.0, 1.0, 1.6, tray_z0, tray_z0 + 0.127),
                             7: (5.0, 7.0, 1.0, 1.2, 2.70, 2.86),
@@ -1662,7 +1670,7 @@ class TestPLEAlignmentUnitContracts(unittest.TestCase):
             self.assertIn("CT-1-SEG-01", bad_errs)
             self.assertIn("CT-1-SEG-02", bad_errs)
             self.assertNotIn("PDU-01", bad_errs)
-            self.assertIn("tray-stack vertical headroom 136.0mm < 300mm", bad_warns)
+            self.assertIn("tray-stack vertical headroom 136.0mm < 300mm", bad_errs)
             self.assertIn("overhead clear height 1890.0mm < 2600mm", bad_warns)
 
             clean = _run_case("clean_case", "mep_clean.ifc")
