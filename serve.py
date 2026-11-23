@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import copy
 import json
@@ -44,6 +45,15 @@ WRAP_UP = {
     "content": "Time is up for this step. Stop and reply with your answer.",
 }
 RESULT_CHARS = 20_000
+MAX_IMAGE_BYTES = 5 << 20
+MAX_ACTIVE_IMAGES = 4
+IMAGE_MAGIC: Tuple[Tuple[bytes, str], ...] = (
+    (b"\x89PNG", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"RIFF", "image/webp"),
+)
 RETRY_WAITS = (5, 15, 30, 60, 120)
 CONTEXT_FULL = re.compile(
     r"context.?(length|window|size|limit)|maximum context|too many tokens"
@@ -69,30 +79,42 @@ PLANNER = (
     "You plan an engineering task that another engineer will carry out in a "
     "Linux container with no internet access. Inspect the task's files with "
     "your tools (bash starts in {workdir}), but do not create or change any "
-    "file. Then reply with the plan: each deliverable with its exact path "
-    "and format, what it must contain, the data and method to use, and how "
-    "to check it."
+    "file. For PNG/JPEG/GIF/WEBP engineering drawings, schedules, or diagrams, "
+    "call view_image instead of writing pixel/ASCII OCR scripts. Keep your "
+    "inspection concise so you stay well within your turn budget, then reply "
+    "with the plan: each deliverable with its exact path and format, what it "
+    "must contain, the data and method to use, and how to check it."
 )
 
 WORKER = (
     "You are an expert engineer working on a task in a Linux container with "
     "no internet access. Your tools act inside it, and bash starts in "
     "{workdir}. A plan for the task follows it; use it, and correct it where "
-    "the files show it is wrong. Compute with code, not by hand. Write each "
-    "deliverable exactly where and in the format the task asks, then open it "
-    "again to check it. When you are done, reply without calling a tool: a "
-    "short summary of each deliverable, where it is, and the key results."
+    "the files show it is wrong. For image files (drawings, schedules, plots), "
+    "use view_image rather than pixel/ASCII OCR scripts (if a sheet is dense, "
+    "crop/zoom regions to a PNG under /tmp and inspect with view_image). "
+    "Compute with code, not by hand. Watch the [Turn X/Y] pacing indicator "
+    "on tool outputs: never spend most of your budget exploring while leaving "
+    "placeholder stubs untouched—write a working version of every required "
+    "deliverable file on disk before half your turns are spent, then iterate "
+    "and verify. After any edit or fix, immediately regenerate and re-run "
+    "verification checks on the actual deliverable file before replying. When "
+    "done, reply without calling a tool: summarize each deliverable, its "
+    "exact path, and the verified results."
 )
 
 VERIFIER = (
     "You check an engineer's work on a task in a Linux container. You get the "
     "task, the plan, and the engineer's summary of what was delivered. Open "
-    "every deliverable with your tools (bash starts in {workdir}) and check it "
-    "against the task: the path, the format, every part the task asks for, "
-    "and the key numbers, recomputed. Do not create or change any file. If "
-    "everything holds, reply with the single word PASS and nothing else. "
-    "Otherwise reply with a numbered list of the gaps, each specific enough "
-    "to fix."
+    "and check every required deliverable with your tools (bash starts in "
+    "{workdir}; use view_image when inspecting images or rendered plots) "
+    "against the task: verify each deliverable file exists on disk, is NOT an "
+    "unmodified template/stub, reflects the latest script edits, matches the "
+    "exact path and format, includes every required element, and passes key "
+    "numerical and constraint checks recomputed directly from the file. Do "
+    "not create or change any file. If everything holds, reply with the "
+    "single word PASS and nothing else. Otherwise reply with a numbered list "
+    "of the gaps, each specific enough to fix."
 )
 
 
@@ -127,6 +149,16 @@ TOOLS: List[Dict[str, Any]] = [
         path={"type": "string"},
     ),
     tool(
+        "view_image",
+        (
+            "Inspect an image file (PNG, JPEG, GIF, or WEBP, up to 5 MiB) visually. "
+            "Use this for engineering drawings, schedules, diagrams, and plots "
+            "instead of pixel-by-pixel text OCR."
+        ),
+        ["path"],
+        path={"type": "string", "description": "Path to the image file in the task container."},
+    ),
+    tool(
         "write_file",
         "Create or overwrite a file in the task container; parent folders are created.",
         ["path", "content"],
@@ -144,7 +176,7 @@ TOOLS: List[Dict[str, Any]] = [
         replace_all={"type": "boolean"},
     ),
 ]
-READ_ONLY: List[Dict[str, Any]] = TOOLS[:2]
+READ_ONLY: List[Dict[str, Any]] = TOOLS[:3]
 MCP_CATALOG_TOOLS: List[Dict[str, Any]] = [
     tool(
         "mcp_find",
@@ -324,9 +356,51 @@ def marked(messages: List[Dict[str, Any]], cache_mark: bool = False) -> List[Dic
                     }
                 ],
             }
+        elif isinstance(content, list) and content:
+            parts = list(content)
+            if isinstance(parts[-1], dict):
+                parts[-1] = {**parts[-1], "cache_control": {"type": "ephemeral"}}
+            out[i] = {**m, "content": parts}
         else:
             out[i] = {**m, "cache_control": {"type": "ephemeral"}}
     return out
+
+
+def _detect_image_mime(data: bytes) -> Optional[str]:
+    """Detect supported raster image MIME type from file header bytes."""
+    for magic, mime in IMAGE_MAGIC:
+        if data.startswith(magic):
+            if magic == b"RIFF":
+                return mime if len(data) >= 12 and data[8:12] == b"WEBP" else None
+            return mime
+    return None
+
+
+def _prune_old_images(
+    messages: List[Dict[str, Any]],
+    max_images: int = MAX_ACTIVE_IMAGES,
+) -> int:
+    """Keep only the newest `max_images` `image_url` blocks in user messages."""
+    kept = 0
+    pruned = 0
+    for msg in reversed(messages):
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for idx in range(len(content) - 1, -1, -1):
+            part = content[idx]
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                if kept < max_images:
+                    kept += 1
+                else:
+                    content[idx] = {
+                        "type": "text",
+                        "text": "[Earlier image omitted to save context; call view_image again if needed]",
+                    }
+                    pruned += 1
+    return pruned
 
 
 def _unique_name(name: str, taken: Any) -> str:
@@ -521,6 +595,7 @@ async def run_tool(
     session: taskbridge.Session,
     fn: Dict[str, Any],
     mcp_registry: Optional[Dict[str, Tuple[MCPServer, Dict[str, Any]]]] = None,
+    image_sink: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Execute one model tool call inside the task container safely."""
     name = str(fn.get("name") or "").strip()
@@ -576,11 +651,47 @@ async def run_tool(
             resolved = _resolve_path(session, args["path"])
             data = await session.read_file(resolved)
             if b"\0" in data[:8192]:
+                mime = _detect_image_mime(data)
+                if mime:
+                    return (
+                        f"{args['path']} is an image file ({mime}, {len(data)} bytes); "
+                        "call view_image to inspect it visually"
+                    )
                 return (
                     f"{args['path']} is a binary file ({len(data)} bytes); "
                     "inspect it with bash"
                 )
             return clip(data.decode("utf-8", "replace") or "(empty file)")
+
+        if name == "view_image":
+            resolved = _resolve_path(session, args["path"])
+            data = await session.read_file(resolved)
+            if not data:
+                return f"error: {args['path']} is empty (0 bytes)"
+            if len(data) > MAX_IMAGE_BYTES:
+                return (
+                    f"error: {args['path']} is {len(data)} bytes (exceeds {MAX_IMAGE_BYTES} byte "
+                    "limit for view_image); crop or downscale it to PNG under /tmp first"
+                )
+            mime = _detect_image_mime(data)
+            if not mime:
+                return (
+                    f"error: {args['path']} is not a supported image (PNG, JPEG, GIF, or WEBP)"
+                )
+            b64 = base64.b64encode(data).decode("ascii")
+            if image_sink is not None:
+                image_sink.append(
+                    {
+                        "path": args["path"],
+                        "mime": mime,
+                        "b64": b64,
+                        "size": len(data),
+                    }
+                )
+            return (
+                f"loaded image {args['path']} ({mime}, {len(data)} bytes); "
+                "attached visually below"
+            )
 
         if name == "write_file":
             resolved = _resolve_path(session, args["path"])
@@ -604,7 +715,13 @@ async def run_tool(
 
 
 async def shorten(session: taskbridge.Session, messages: List[Dict[str, Any]]) -> bool:
-    """Truncate the older half of long tool results to recover from context overflow."""
+    """Truncate old images or older long tool results to recover from context overflow."""
+    pruned_images = _prune_old_images(messages, max_images=1) or _prune_old_images(
+        messages, max_images=0
+    )
+    if pruned_images:
+        await session.log(f"context full: pruned {pruned_images} old image(s)")
+        return True
     long_indices = [
         n
         for n, m in enumerate(messages)
@@ -796,6 +913,7 @@ async def agent(
 
         serialized_calls = turn.get("tool_calls") or tool_calls
         tripped = False
+        pending_images: List[Dict[str, Any]] = []
         for call in serialized_calls:
             call_id = (
                 call.get("id")
@@ -806,7 +924,12 @@ async def agent(
             await session.log(
                 f"{fn.get('name', '')} {str(fn.get('arguments', ''))[:200]}"
             )
-            content = await run_tool(session, fn, mcp_registry=mcp_registry)
+            content = await run_tool(
+                session,
+                fn,
+                mcp_registry=mcp_registry,
+                image_sink=pending_images,
+            )
             if content.startswith("error:"):
                 if tool_breaker.record_failure():
                     tripped = True
@@ -819,6 +942,68 @@ async def agent(
                     "content": content,
                 }
             )
+
+        now_left = session.time_left()
+        if messages[-1].get("role") == "tool":
+            if max_turns is not None:
+                remaining_tool_turns = max(0, (max_turns - 1) - turns)
+                time_suffix = (
+                    f", {max(0, int((now_left - until) // 60))}m left"
+                    if now_left is not None
+                    else ""
+                )
+                pacing = (
+                    f"\n[Turn {turns}/{max_turns} ({remaining_tool_turns} tool turn(s) "
+                    f"left before wrap-up){time_suffix}]"
+                )
+                if final:
+                    if max_turns >= 4 and 1 <= remaining_tool_turns <= 3:
+                        pacing += (
+                            f"\n[URGENT: only {remaining_tool_turns} tool turn(s) left "
+                            "before forced wrap-up! Finalize, regenerate, and verify "
+                            "every required deliverable file on disk right now.]"
+                        )
+                    elif (
+                        max_turns >= 6
+                        and turns >= max_turns // 2
+                        and remaining_tool_turns > 3
+                    ):
+                        pacing += (
+                            "\n[Pacing: past halfway through turn budget — write and "
+                            "test a working version of every required deliverable file "
+                            "on disk now if not already created.]"
+                        )
+                elif max_turns >= 4 and 1 <= remaining_tool_turns <= 2:
+                    pacing += (
+                        f"\n[Pacing: only {remaining_tool_turns} tool turn(s) left "
+                        "before wrap-up — conclude concisely.]"
+                    )
+                messages[-1]["content"] += pacing
+            elif now_left is not None:
+                messages[-1]["content"] += (
+                    f"\n[{max(0, int((now_left - until) // 60))} minutes left for this step]"
+                )
+
+        if pending_images:
+            parts: List[Dict[str, Any]] = []
+            for img in pending_images:
+                parts.append(
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Image from view_image({img['path']!r}) "
+                            f"({img['mime']}, {img['size']} bytes):"
+                        ),
+                    }
+                )
+                parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{img['mime']};base64,{img['b64']}"},
+                    }
+                )
+            messages.append({"role": "user", "content": parts})
+            _prune_old_images(messages, max_images=MAX_ACTIVE_IMAGES)
 
         if tripped:
             await session.log(
@@ -835,12 +1020,6 @@ async def agent(
                         "and use a corrected command or path."
                     ),
                 }
-            )
-
-        now_left = session.time_left()
-        if now_left is not None and messages[-1].get("role") == "tool":
-            messages[-1]["content"] += (
-                f"\n[{max(0, int((now_left - until) // 60))} minutes left for this step]"
             )
 
 
@@ -1111,7 +1290,11 @@ async def solve(
                     "role": "user",
                     "content": (
                         "A reviewer checked your files and found these gaps:\n"
-                        f"{verdict}\n\nFix them, then reply with your updated summary."
+                        f"{verdict}\n\n"
+                        "Fix them immediately by writing or updating and regenerating "
+                        "every required deliverable file on disk, re-run verification "
+                        "checks on the updated files before your turn budget runs out, "
+                        "then reply with your verified summary."
                     ),
                 }
             )

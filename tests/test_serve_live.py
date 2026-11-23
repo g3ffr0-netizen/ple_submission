@@ -760,6 +760,272 @@ class TestPLEAlignmentUnitContracts(unittest.TestCase):
 
         asyncio.run(_scenario())
 
+    def test_view_image_multimodal_attachment_validation_and_pruning(self):
+        png_bytes = (
+            b"\x89PNG\r\n\x1a\n"
+            b"\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x02\x00\x00\x00\x90wS\xde"
+        )
+
+        class _ImageSession:
+            workdir = "/app"
+            limits = {"exec_timeout_sec": 60}
+
+            def __init__(self) -> None:
+                self.files: Dict[str, bytes] = {
+                    "/app/sheet1.png": png_bytes,
+                    "/app/sheet2.png": png_bytes,
+                    "/app/sheet3.png": png_bytes,
+                    "/app/sheet4.png": png_bytes,
+                    "/app/sheet5.png": png_bytes,
+                    "/app/blob.bin": b"\x00not-an-image",
+                    "/app/huge.png": b"\x89PNG" + (b"x" * (serve.MAX_IMAGE_BYTES + 1)),
+                }
+                self.logs: List[str] = []
+                self.final_message = ""
+                self.cancelled = asyncio.Event()
+
+            def time_left(self) -> Optional[float]:
+                return 1800.0
+
+            async def read_file(self, path: str) -> bytes:
+                if path not in self.files:
+                    raise taskbridge.TaskError(f"missing: {path}")
+                return self.files[path]
+
+            async def log(self, text: str) -> None:
+                self.logs.append(text)
+
+            async def usage(self, *_args: Any) -> None:
+                return None
+
+        class _VisionClient:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.seen_messages: List[List[Dict[str, Any]]] = []
+                self.chat = self
+                self.completions = self
+
+            async def create(self, **kwargs: Any) -> Any:
+                self.calls += 1
+                self.seen_messages.append(copy_msgs(kwargs["messages"]))
+                if self.calls <= 5:
+                    path = f"sheet{self.calls}.png"
+                    return serve._DryRunObject(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": None,
+                                        "tool_calls": [
+                                            {
+                                                "id": f"img_{self.calls}",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": "view_image",
+                                                    "arguments": json.dumps({"path": path}),
+                                                },
+                                            }
+                                        ],
+                                    },
+                                    "finish_reason": "tool_calls",
+                                }
+                            ]
+                        }
+                    )
+                return serve._DryRunObject(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "Inspected all sheets cleanly.",
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ]
+                    }
+                )
+
+        def copy_msgs(msgs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+            return json.loads(json.dumps(msgs))
+
+        async def _scenario() -> None:
+            sess = _ImageSession()
+            # read_file on PNG points model to view_image
+            hint = await serve.run_tool(
+                sess, {"name": "read_file", "arguments": json.dumps({"path": "sheet1.png"})}  # type: ignore[arg-type]
+            )
+            self.assertIn("view_image", hint)
+
+            # view_image validation errors do not populate sink
+            sink: List[Dict[str, Any]] = []
+            bad_mime = await serve.run_tool(
+                sess,
+                {"name": "view_image", "arguments": json.dumps({"path": "blob.bin"})},  # type: ignore[arg-type]
+                image_sink=sink,
+            )
+            too_big = await serve.run_tool(
+                sess,
+                {"name": "view_image", "arguments": json.dumps({"path": "huge.png"})},  # type: ignore[arg-type]
+                image_sink=sink,
+            )
+            self.assertTrue(bad_mime.startswith("error:"))
+            self.assertTrue(too_big.startswith("error:"))
+            self.assertEqual(sink, [])
+
+            client = _VisionClient()
+            messages = serve.conversation("Use view_image in {workdir}.", sess, "Inspect 5 sheets.")  # type: ignore[arg-type]
+            runtime_cfg = {
+                "model": "gemini-3.8-flash",
+                "max_output_tokens": 1024,
+                "effort": "high",
+                "cache_mark": False,
+                "max_failures": 3,
+            }
+            answer = await serve.agent(
+                sess,  # type: ignore[arg-type]
+                messages,
+                serve.TOOLS,
+                60.0,
+                client=client,
+                runtime_cfg=runtime_cfg,
+                max_turns=8,
+            )
+            self.assertEqual(answer, "Inspected all sheets cleanly.")
+            # Every tool result remains plain text and user image messages use data:image/png;base64,...
+            tool_msgs = [m for m in client.seen_messages[-1] if m.get("role") == "tool"]
+            self.assertEqual(len(tool_msgs), 5)
+            self.assertTrue(all(isinstance(m.get("content"), str) for m in tool_msgs))
+
+            active_urls = [
+                p
+                for m in client.seen_messages[-1]
+                if m.get("role") == "user" and isinstance(m.get("content"), list)
+                for p in m["content"]
+                if isinstance(p, dict) and p.get("type") == "image_url"
+            ]
+            self.assertEqual(len(active_urls), serve.MAX_ACTIVE_IMAGES)
+            self.assertTrue(
+                active_urls[-1]["image_url"]["url"].startswith("data:image/png;base64,")
+            )
+            omitted_texts = [
+                p.get("text", "")
+                for m in client.seen_messages[-1]
+                if m.get("role") == "user" and isinstance(m.get("content"), list)
+                for p in m["content"]
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            self.assertTrue(any("Earlier image omitted" in t for t in omitted_texts))
+
+            # shorten() frees old images cleanly when recovering from context overflow
+            pruned = await serve.shorten(sess, messages)  # type: ignore[arg-type]
+            self.assertTrue(pruned)
+            self.assertTrue(any("pruned" in entry for entry in sess.logs))
+
+        asyncio.run(_scenario())
+
+    def test_agent_turn_pacing_nudges_and_urgent_warning(self):
+        class _PacingSession:
+            workdir = "/app"
+            limits = {"exec_timeout_sec": 60}
+
+            def __init__(self) -> None:
+                self.logs: List[str] = []
+                self.final_message = ""
+                self.cancelled = asyncio.Event()
+
+            def time_left(self) -> Optional[float]:
+                return 3600.0
+
+            async def exec(self, command: str, timeout_sec: int = 120) -> Dict[str, Any]:
+                return {"exit_code": 0, "output": f"ran:{command}"}
+
+            async def log(self, text: str) -> None:
+                self.logs.append(text)
+
+            async def usage(self, *_args: Any) -> None:
+                return None
+
+        class _PacingClient:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.seen_tool_outputs: List[str] = []
+                self.chat = self
+                self.completions = self
+
+            async def create(self, **kwargs: Any) -> Any:
+                self.calls += 1
+                msgs = kwargs["messages"]
+                if msgs and msgs[-1].get("role") == "tool":
+                    self.seen_tool_outputs.append(str(msgs[-1]["content"]))
+                if kwargs.get("tool_choice") == "none":
+                    return serve._DryRunObject(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "Delivered and wrapped up.",
+                                    },
+                                    "finish_reason": "stop",
+                                }
+                            ]
+                        }
+                    )
+                return serve._DryRunObject(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": None,
+                                    "tool_calls": [
+                                        {
+                                            "id": f"step_{self.calls}",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "bash",
+                                                "arguments": json.dumps({"command": "pwd"}),
+                                            },
+                                        }
+                                    ],
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ]
+                    }
+                )
+
+        async def _scenario() -> None:
+            sess = _PacingSession()
+            client = _PacingClient()
+            runtime_cfg = {
+                "model": "gemini-3.8-flash",
+                "max_output_tokens": 1024,
+                "effort": "high",
+                "cache_mark": False,
+                "max_failures": 3,
+            }
+            answer = await serve.agent(
+                sess,  # type: ignore[arg-type]
+                serve.conversation("Work in {workdir}", sess, "Build deliverable."),  # type: ignore[arg-type]
+                serve.TOOLS,
+                60.0,
+                client=client,
+                runtime_cfg=runtime_cfg,
+                final=True,
+                max_turns=10,
+            )
+            self.assertEqual(answer, "Delivered and wrapped up.")
+            self.assertEqual(client.calls, 10)
+            self.assertIn("[Turn 1/10 (8 tool turn(s) left before wrap-up)", client.seen_tool_outputs[0])
+            self.assertIn("past halfway through turn budget", client.seen_tool_outputs[4])
+            self.assertIn("[URGENT: only 3 tool turn(s) left", client.seen_tool_outputs[5])
+            self.assertIn("[URGENT: only 1 tool turn(s) left", client.seen_tool_outputs[7])
+
+        asyncio.run(_scenario())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
