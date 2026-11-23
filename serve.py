@@ -241,6 +241,32 @@ def resolve_runtime_config(config_path: str = "submission.yaml") -> Dict[str, An
         default=3,
         minimum=1,
     )
+    max_plan_turns = _safe_int(
+        os.environ.get("MAX_PLAN_TURNS") or env_cfg.get("MAX_PLAN_TURNS"),
+        default=12,
+        minimum=2,
+    )
+    max_work_turns = _safe_int(
+        os.environ.get("MAX_WORK_TURNS") or env_cfg.get("MAX_WORK_TURNS"),
+        default=40,
+        minimum=2,
+    )
+    max_verify_turns = _safe_int(
+        os.environ.get("MAX_VERIFY_TURNS") or env_cfg.get("MAX_VERIFY_TURNS"),
+        default=15,
+        minimum=2,
+    )
+    max_fix_turns = _safe_int(
+        os.environ.get("MAX_FIX_TURNS") or env_cfg.get("MAX_FIX_TURNS"),
+        default=20,
+        minimum=2,
+    )
+    model_call_timeout_sec = _safe_int(
+        os.environ.get("MODEL_CALL_TIMEOUT_SEC")
+        or env_cfg.get("MODEL_CALL_TIMEOUT_SEC"),
+        default=600,
+        minimum=30,
+    )
 
     return {
         "model": model,
@@ -251,6 +277,11 @@ def resolve_runtime_config(config_path: str = "submission.yaml") -> Dict[str, An
         "max_fix_rounds": max_fix_rounds,
         "max_retries": max_retries,
         "max_failures": max_failures,
+        "max_plan_turns": max_plan_turns,
+        "max_work_turns": max_work_turns,
+        "max_verify_turns": max_verify_turns,
+        "max_fix_turns": max_fix_turns,
+        "model_call_timeout_sec": model_call_timeout_sec,
         "cache_mark": "claude" in model.lower(),
     }
 
@@ -261,7 +292,7 @@ def build_openai_client(runtime_cfg: Dict[str, Any]) -> openai.AsyncOpenAI:
         base_url=runtime_cfg.get("base_url") or None,
         api_key=runtime_cfg.get("api_key") or "none",
         max_retries=5,
-        timeout=1800,
+        timeout=runtime_cfg.get("model_call_timeout_sec", 600),
     )
 
 
@@ -657,6 +688,7 @@ async def agent(
     mcp_registry: Optional[Dict[str, Tuple[MCPServer, Dict[str, Any]]]] = None,
     breaker: Optional[CircuitBreaker] = None,
     final: bool = False,
+    max_turns: Optional[int] = None,
 ) -> str:
     """Run tool-calling loop on `messages` until the model produces a final reply."""
     model = runtime_cfg["model"]
@@ -668,13 +700,17 @@ async def agent(
     }
     tool_breaker = breaker or CircuitBreaker(max_failures=runtime_cfg.get("max_failures", 3))
 
-    nudges, head, waits = 0, "", iter(RETRY_WAITS)
+    nudges, head, waits, turns = 0, "", iter(RETRY_WAITS), 0
     while True:
         if session.cancelled.is_set():
             return session.final_message or head
         left = session.time_left()
-        wrap_up = left is not None and left < until
+        time_cap = left is not None and left < until
+        turn_cap = max_turns is not None and turns >= max_turns - 1
+        wrap_up = time_cap or turn_cap
         if wrap_up and messages[-1:] != [WRAP_UP]:
+            if turn_cap and not time_cap:
+                await session.log(f"step reached max_turns={max_turns}; wrapping up")
             messages.append(dict(WRAP_UP))
 
         if left is None:
@@ -710,6 +746,7 @@ async def agent(
             raise
 
         waits = iter(RETRY_WAITS)
+        turns += 1
         if getattr(reply, "usage", None):
             usage = reply.usage
             details = getattr(usage, "prompt_tokens_details", None)
@@ -1025,6 +1062,7 @@ async def solve(
             runtime_cfg=runtime_cfg,
             mcp_registry=mcp_registry,
             breaker=breaker,
+            max_turns=runtime_cfg.get("max_plan_turns", 12),
         )
         await session.log(f"plan: {plan[:1000]}")
 
@@ -1044,6 +1082,7 @@ async def solve(
             mcp_registry=mcp_registry,
             breaker=breaker,
             final=True,
+            max_turns=runtime_cfg.get("max_work_turns", 40),
         )
 
         max_fix_rounds = int(runtime_cfg.get("max_fix_rounds", 2))
@@ -1062,6 +1101,7 @@ async def solve(
                 runtime_cfg=runtime_cfg,
                 mcp_registry=mcp_registry,
                 breaker=breaker,
+                max_turns=runtime_cfg.get("max_verify_turns", 15),
             )
             await session.log(f"verifier: {verdict[:1000]}")
             if not verdict.strip() or is_pass_verdict(verdict) or not _time_for(WRAP_UP_SEC):
@@ -1085,6 +1125,7 @@ async def solve(
                 mcp_registry=mcp_registry,
                 breaker=breaker,
                 final=True,
+                max_turns=runtime_cfg.get("max_fix_turns", 20),
             )
             summary = updated or summary
 

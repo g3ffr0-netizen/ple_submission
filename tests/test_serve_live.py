@@ -661,6 +661,105 @@ class TestPLEAlignmentUnitContracts(unittest.TestCase):
         self.assertEqual(custom.config, "custom.yaml")
         self.assertTrue(custom.dry_run)
 
+    def test_agent_max_turns_triggers_graceful_wrap_up(self):
+        class _TurnSession:
+            workdir = "/app"
+            limits = {"exec_timeout_sec": 60}
+
+            def __init__(self) -> None:
+                self.logs: List[str] = []
+                self.final_message = ""
+                self.cancelled = asyncio.Event()
+
+            def time_left(self) -> Optional[float]:
+                return 3600.0
+
+            async def exec(self, command: str, timeout_sec: int = 120) -> Dict[str, Any]:
+                return {"exit_code": 0, "output": f"ran:{command}"}
+
+            async def log(self, text: str) -> None:
+                self.logs.append(text)
+
+            async def usage(self, *_args: Any) -> None:
+                return None
+
+        class _EndlessToolClient:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.tool_choices: List[Any] = []
+                self.chat = self
+                self.completions = self
+
+            async def create(self, **kwargs: Any) -> Any:
+                self.calls += 1
+                choice_mode = kwargs.get("tool_choice")
+                self.tool_choices.append(choice_mode)
+                if choice_mode == "none":
+                    return serve._DryRunObject(
+                        {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "Wrapped up cleanly after hitting max_turns.",
+                                    },
+                                    "finish_reason": "stop",
+                                }
+                            ]
+                        }
+                    )
+                return serve._DryRunObject(
+                    {
+                        "choices": [
+                            {
+                                "message": {
+                                    "role": "assistant",
+                                    "content": None,
+                                    "tool_calls": [
+                                        {
+                                            "id": f"loop_{self.calls}",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "bash",
+                                                "arguments": json.dumps({"command": "echo loop"}),
+                                            },
+                                        }
+                                    ],
+                                },
+                                "finish_reason": "tool_calls",
+                            }
+                        ]
+                    }
+                )
+
+        async def _scenario() -> None:
+            fake_session = _TurnSession()
+            loop_client = _EndlessToolClient()
+            runtime_cfg = {
+                "model": "gemini-3.8-flash",
+                "max_output_tokens": 1024,
+                "effort": "high",
+                "cache_mark": False,
+                "max_failures": 3,
+            }
+            answer = await serve.agent(
+                fake_session,  # type: ignore[arg-type]
+                serve.conversation("Work in {workdir}", fake_session, "Run loop."),  # type: ignore[arg-type]
+                serve.TOOLS,
+                60.0,
+                client=loop_client,
+                runtime_cfg=runtime_cfg,
+                final=True,
+                max_turns=3,
+            )
+            self.assertEqual(answer, "Wrapped up cleanly after hitting max_turns.")
+            self.assertEqual(fake_session.final_message, answer)
+            self.assertEqual(loop_client.calls, 3)
+            self.assertEqual(loop_client.tool_choices, ["auto", "auto", "none"])
+            self.assertTrue(any("max_turns=3" in entry for entry in fake_session.logs))
+
+        asyncio.run(_scenario())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
