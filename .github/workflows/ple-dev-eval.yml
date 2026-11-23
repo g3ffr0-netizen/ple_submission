@@ -1,195 +1,775 @@
---- a/.github/workflows/ple-dev-eval.yml
-+++ b/.github/workflows/ple-dev-eval.yml
-@@ -26,6 +26,7 @@ on:
- 
- permissions:
-   contents: write
-+  packages: write
- 
- jobs:
-   plan-and-check:
-@@ -110,6 +111,14 @@ jobs:
-         with:
-           python-version: "3.12"
- 
-+      - name: Cache uv downloads
-+        uses: actions/cache@v4
-+        with:
-+          path: ~/.cache/uv
-+          key: ple-uv-${{ runner.os }}-py312
-+          restore-keys: |
-+            ple-uv-${{ runner.os }}-
-+
-       - name: Install uv
-         run: python -m pip install --upgrade pip uv
- 
-@@ -120,6 +129,28 @@ jobs:
-           cd "$RUNNER_TEMP/ple_kit"
-           uv sync
- 
-+      - name: Log in to GitHub Container Registry (GHCR)
-+        uses: docker/login-action@v3
-+        with:
-+          registry: ghcr.io
-+          username: ${{ github.actor }}
-+          password: ${{ secrets.GITHUB_TOKEN }}
-+
-+      - name: Restore cached plebench-builder image from GHCR
-+        id: builder_cache
-+        run: |
-+          BUILDER_TAG=$(python3 - <<'PY'
-+          import hashlib, os
-+          from pathlib import Path
-+          df = Path(os.environ["RUNNER_TEMP"]) / "ple_kit" / "kit" / "builder" / "Dockerfile"
-+          print("plebench-builder:" + hashlib.sha256(df.read_bytes() + b"linux/amd64").hexdigest()[:16])
-+          PY
-+          )
-+          REPO_LC="${GITHUB_REPOSITORY,,}"
-+          echo "builder_tag=$BUILDER_TAG" >> "$GITHUB_OUTPUT"
-+          echo "builder_ref=ghcr.io/${REPO_LC}/${BUILDER_TAG}" >> "$GITHUB_OUTPUT"
-+          docker pull "ghcr.io/${REPO_LC}/${BUILDER_TAG}" && docker tag "ghcr.io/${REPO_LC}/${BUILDER_TAG}" "${BUILDER_TAG}" || true
-+
-       - name: Start local Vertex AI model proxy
-         env:
-           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-@@ -178,6 +209,15 @@ jobs:
-           cd "$RUNNER_TEMP/ple_kit"
-           uv run python -m kit check "$GITHUB_WORKSPACE" --cancel-test --env-file "$RUNNER_TEMP/local.env"
- 
-+      - name: Push plebench-builder image to GHCR on cache miss
-+        run: |
-+          BUILDER_TAG="${{ steps.builder_cache.outputs.builder_tag }}"
-+          BUILDER_REF="${{ steps.builder_cache.outputs.builder_ref }}"
-+          if docker image inspect "$BUILDER_TAG" >/dev/null 2>&1 && ! docker manifest inspect "$BUILDER_REF" >/dev/null 2>&1; then
-+            docker tag "$BUILDER_TAG" "$BUILDER_REF"
-+            docker push "$BUILDER_REF" || echo "::warning::Failed to push ${BUILDER_REF}; continuing"
-+          fi
-+
-       - name: Plan dev task matrix
-         id: plan
-         env:
-@@ -267,6 +307,16 @@ jobs:
-         with:
-           python-version: "3.12"
- 
-+      - name: Cache uv and Harbor tool
-+        uses: actions/cache@v4
-+        with:
-+          path: |
-+            ~/.cache/uv
-+            ~/.local/share/uv/tools
-+          key: ple-uv-harbor-0.20.0-${{ runner.os }}-py312
-+          restore-keys: |
-+            ple-uv-harbor-0.20.0-${{ runner.os }}-
-+
-       - name: Install uv and Harbor
-         run: |
-           python -m pip install --upgrade pip uv
-@@ -280,6 +330,104 @@ jobs:
-           cd "$RUNNER_TEMP/ple_kit"
-           uv sync
- 
-+      - name: Resolve dev task dataset metadata
-+        id: task_meta
-+        env:
-+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-+          TASK_ID: ${{ matrix.task_id }}
-+        run: |
-+          cd "$RUNNER_TEMP/ple_kit"
-+          uv run python - <<'PY'
-+          import hashlib, os, sys
-+          from pathlib import Path
-+          import yaml
-+          sys.path.insert(0, os.getcwd())
-+          from eval import run as eval_run
-+          dev_set = yaml.safe_load(Path("eval/dev_set.yaml").read_text(encoding="utf-8"))
-+          tasks_by_id = {t["id"]: t for t in dev_set["tasks"]}
-+          task_id = os.environ["TASK_ID"]
-+          grading = tasks_by_id[task_id].get("grading", "unknown")
-+          repo = eval_run.dataset_repo()
-+          try:
-+              rev = eval_run.latest_revision(repo, os.environ.get("HF_TOKEN"))
-+          except Exception:
-+              rev = str(dev_set.get("tasks_revision") or "latest")
-+          df = Path("kit/builder/Dockerfile")
-+          btag = "plebench-builder:" + hashlib.sha256(df.read_bytes() + b"linux/amd64").hexdigest()[:16]
-+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
-+              fh.write(f"hf_rev={rev}\n")
-+              fh.write(f"grading={grading}\n")
-+              fh.write(f"builder_tag={btag}\n")
-+          print(f"Resolved task={task_id} grading={grading} hf_rev={rev[:12]} builder_tag={btag}")
-+          PY
-+
-+      - name: Cache Hugging Face task files (~45-150 MB per task)
-+        uses: actions/cache@v4
-+        with:
-+          path: ~/.cache/plebench/tasks
-+          key: ple-hf-${{ steps.task_meta.outputs.hf_rev }}-${{ matrix.task_id }}
-+
-+      - name: Log in to GitHub Container Registry (GHCR)
-+        uses: docker/login-action@v3
-+        with:
-+          registry: ghcr.io
-+          username: ${{ github.actor }}
-+          password: ${{ secrets.GITHUB_TOKEN }}
-+
-+      - name: Pre-warm builder and task Docker layers from GHCR
-+        env:
-+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-+          TASK_ID: ${{ matrix.task_id }}
-+          TASK_GRADING: ${{ steps.task_meta.outputs.grading }}
-+          BUILDER_TAG: ${{ steps.task_meta.outputs.builder_tag }}
-+        run: |
-+          REPO_LC="${GITHUB_REPOSITORY,,}"
-+
-+          # 1. Pull cached plebench-builder image (skips ~60s rebuild per matrix job)
-+          if docker pull "ghcr.io/${REPO_LC}/${BUILDER_TAG}"; then
-+            docker tag "ghcr.io/${REPO_LC}/${BUILDER_TAG}" "${BUILDER_TAG}"
-+          fi
-+
-+          # 2. Ensure HF task directory is present and compute exact eval/run.py task_image tag
-+          cd "$RUNNER_TEMP/ple_kit"
-+          eval "$(uv run python - <<'PY'
-+          import os, shlex, sys
-+          sys.path.insert(0, os.getcwd())
-+          from eval import run as eval_run
-+          tid = os.environ["TASK_ID"]
-+          found = eval_run.resolve_tasks([tid], None, {"HF_TOKEN": os.environ.get("HF_TOKEN", "")})
-+          env_dir = found[tid] / "environment"
-+          tag = f"plebench-task-{tid}:{eval_run.tree_sha256(env_dir)[:20]}"
-+          has_df = "true" if (env_dir / "Dockerfile").is_file() else "false"
-+          print(f"ENV_DIR={shlex.quote(str(env_dir))}")
-+          print(f"TASK_TAG={shlex.quote(tag)}")
-+          print(f"HAS_DOCKERFILE={has_df}")
-+          PY
-+          )"
-+
-+          # 3. Build/load into host daemon BuildKit (default builder) using GHCR registry cache
-+          if [ "$HAS_DOCKERFILE" = "true" ]; then
-+            CACHE_REF="ghcr.io/${REPO_LC}/plebench-cache:${TASK_ID}"
-+            SHARED_REF="ghcr.io/${REPO_LC}/plebench-cache:shared-${TASK_GRADING}"
-+            CACHE_TO_ARGS=()
-+            if docker info --format '{{.DriverStatus}}' 2>/dev/null | grep -q 'io.containerd.snapshotter'; then
-+              CACHE_TO_ARGS+=(--cache-to "type=registry,ref=${CACHE_REF},mode=max,oci-mediatypes=true,image-manifest=true")
-+              if [ "$TASK_GRADING" = "rubric" ] && ! docker buildx imagetools inspect "$SHARED_REF" >/dev/null 2>&1; then
-+                CACHE_TO_ARGS+=(--cache-to "type=registry,ref=${SHARED_REF},mode=max,oci-mediatypes=true,image-manifest=true")
-+              fi
-+            else
-+              CACHE_TO_ARGS+=(--cache-to "type=inline")
-+            fi
-+
-+            echo "Pre-warming ${TASK_TAG} from ${CACHE_REF} (shared: ${SHARED_REF}) ..."
-+            DOCKER_BUILDKIT=1 docker buildx build \
-+              --builder default \
-+              --platform linux/amd64 \
-+              --load \
-+              --cache-from "type=registry,ref=${CACHE_REF}" \
-+              --cache-from "type=registry,ref=${SHARED_REF}" \
-+              "${CACHE_TO_ARGS[@]}" \
-+              -t "${TASK_TAG}" \
-+              "${ENV_DIR}" || echo "::warning::GHCR-cached pre-warm failed; eval/run.py will build locally"
-+          fi
-+
-       - name: Start local Vertex AI model proxy
-         env:
-           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+name: PLE Dev Eval
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_limit:
+        description: "Number of public dev tasks to run (1-29; default 3 for smoke test, 29 for full dev set)"
+        required: false
+        default: "3"
+        type: string
+      max_parallel:
+        description: "Maximum parallel task runners (1-6; default 3)"
+        required: false
+        default: "3"
+        type: string
+      commit_artifacts:
+        description: "Commit merged artifacts/ back to origin/main when all selected tasks succeed"
+        required: false
+        default: false
+        type: boolean
+      tasks:
+        description: "Optional comma-separated dev task IDs overriding task_limit (e.g. frame-extension-method,data-hall-device-takeoff)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  plan-and-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      tasks_json: ${{ steps.plan.outputs.tasks_json }}
+      max_parallel: ${{ steps.plan.outputs.max_parallel }}
+
+    steps:
+      - name: Validate required secrets and inputs
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          VERTEXAI_PROJECT: ${{ secrets.VERTEXAI_PROJECT }}
+          TASK_LIMIT: ${{ inputs.task_limit }}
+          MAX_PARALLEL: ${{ inputs.max_parallel }}
+          COMMIT_ARTIFACTS: ${{ inputs.commit_artifacts }}
+          TASKS_INPUT: ${{ inputs.tasks }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          missing = [
+              name
+              for name in ("HF_TOKEN", "GCP_SA_KEY", "VERTEXAI_PROJECT")
+              if not os.environ.get(name, "").strip()
+          ]
+          if missing:
+              print(
+                  f"::error::Missing required GitHub Repository Secrets: {', '.join(missing)}",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          try:
+              sa = json.loads(os.environ["GCP_SA_KEY"])
+              assert isinstance(sa, dict) and sa.get("client_email") and sa.get("private_key")
+          except Exception:
+              print(
+                  "::error::GCP_SA_KEY must be valid Google Cloud service account JSON.",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          raw_limit = os.environ.get("TASK_LIMIT", "3").strip() or "3"
+          try:
+              limit = int(raw_limit)
+          except ValueError:
+              print(f"::error::task_limit must be an integer 1..29 (got {raw_limit!r})", file=sys.stderr)
+              sys.exit(1)
+          if not 1 <= limit <= 29:
+              print(f"::error::task_limit must be between 1 and 29 (got {limit})", file=sys.stderr)
+              sys.exit(1)
+
+          raw_parallel = os.environ.get("MAX_PARALLEL", "3").strip() or "3"
+          try:
+              max_p = int(raw_parallel)
+          except ValueError:
+              print(f"::error::max_parallel must be an integer 1..6 (got {raw_parallel!r})", file=sys.stderr)
+              sys.exit(1)
+          if not 1 <= max_p <= 6:
+              print(f"::error::max_parallel must be between 1 and 6 (got {max_p})", file=sys.stderr)
+              sys.exit(1)
+
+          print(
+              f"Validated inputs: task_limit={limit}, max_parallel={max_p}, "
+              f"commit_artifacts={os.environ.get('COMMIT_ARTIFACTS')}, "
+              f"tasks={os.environ.get('TASKS_INPUT', '').strip()!r}"
+          )
+          PY
+
+      - name: Check out submission repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: python -m pip install --upgrade pip uv
+
+      - name: Clone official PLE starter kit and install dependencies
+        run: |
+          rm -rf "$RUNNER_TEMP/ple_kit"
+          git clone --depth 1 https://github.com/google-research/ple.git "$RUNNER_TEMP/ple_kit"
+          cd "$RUNNER_TEMP/ple_kit"
+          uv sync
+
+      - name: Start local Vertex AI model proxy
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          VERTEXAI_PROJECT: ${{ secrets.VERTEXAI_PROJECT }}
+        run: |
+          umask 077
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          key_path = Path(os.environ["RUNNER_TEMP"]) / "gcp-sa-key.json"
+          key_path.write_text(os.environ["GCP_SA_KEY"], encoding="utf-8")
+          os.chmod(key_path, 0o600)
+          PY
+
+          PROXY_KEY=$(openssl rand -hex 24)
+          echo "::add-mask::$PROXY_KEY"
+          echo "MODEL_PROXY_KEY=$PROXY_KEY" >> "$GITHUB_ENV"
+          echo "MODEL_PROXY_URL=http://localhost:4000" >> "$GITHUB_ENV"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-sa-key.json" >> "$GITHUB_ENV"
+
+          {
+            printf 'MODEL_PROXY_URL=http://localhost:4000\n'
+            printf 'MODEL_PROXY_KEY=%s\n' "$PROXY_KEY"
+            printf 'HF_TOKEN=%s\n' "$HF_TOKEN"
+          } > "$RUNNER_TEMP/local.env"
+          chmod 600 "$RUNNER_TEMP/local.env"
+
+          export MODEL_PROXY_KEY="$PROXY_KEY"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/gcp-sa-key.json"
+          bash "$RUNNER_TEMP/ple_kit/kit/model_proxy/start.sh" >"$RUNNER_TEMP/model_proxy.log" 2>&1 &
+          PROXY_PID=$!
+          echo "PROXY_PID=$PROXY_PID" >> "$GITHUB_ENV"
+
+          for _ in $(seq 1 180); do
+            if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+              echo "::error::kit/model_proxy/start.sh exited prematurely"
+              tail -n 60 "$RUNNER_TEMP/model_proxy.log" || true
+              exit 1
+            fi
+            if curl -fsS -H "Authorization: Bearer $PROXY_KEY" http://127.0.0.1:4000/v1/models >/dev/null 2>&1; then
+              echo "Local Vertex AI model proxy is ready on http://0.0.0.0:4000"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "::error::Model proxy did not become ready within 180s"
+          tail -n 60 "$RUNNER_TEMP/model_proxy.log" || true
+          exit 1
+
+      - name: Run official kit check --cancel-test
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          cd "$RUNNER_TEMP/ple_kit"
+          uv run python -m kit check "$GITHUB_WORKSPACE" --cancel-test --env-file "$RUNNER_TEMP/local.env"
+
+      - name: Plan dev task matrix
+        id: plan
+        env:
+          TASK_LIMIT: ${{ inputs.task_limit }}
+          MAX_PARALLEL: ${{ inputs.max_parallel }}
+          TASKS_INPUT: ${{ inputs.tasks }}
+        run: |
+          cd "$RUNNER_TEMP/ple_kit"
+          uv run python - <<'PY'
+          import json
+          import os
+          import sys
+          import yaml
+          from pathlib import Path
+
+          raw_tasks = os.environ.get("TASKS_INPUT", "").strip()
+          dev_set = yaml.safe_load((Path(os.environ["RUNNER_TEMP"]) / "ple_kit" / "eval" / "dev_set.yaml").read_text(encoding="utf-8"))
+          tasks = dev_set["tasks"]
+          known_ids = {t["id"] for t in tasks}
+
+          if raw_tasks:
+              requested = []
+              for part in raw_tasks.split(","):
+                  tid = part.strip()
+                  if tid and tid not in requested:
+                      requested.append(tid)
+              if not requested:
+                  print(f"::error::tasks input must contain at least one task id (got {raw_tasks!r})", file=sys.stderr)
+                  sys.exit(1)
+              unknown = [tid for tid in requested if tid not in known_ids]
+              if unknown:
+                  print(f"::error::Unknown task id(s): {', '.join(unknown)}", file=sys.stderr)
+                  sys.exit(1)
+              selected = requested
+              max_p = min(len(selected), int(os.environ.get("MAX_PARALLEL", "3") or "3"))
+          else:
+              limit = int(os.environ.get("TASK_LIMIT", "3") or "3")
+              max_p = min(limit, int(os.environ.get("MAX_PARALLEL", "3") or "3"))
+              if limit >= len(tasks):
+                  selected = [t["id"] for t in tasks]
+              else:
+                  ordered = sorted(
+                      tasks,
+                      key=lambda t: (0 if t.get("grading") == "checks" else (1 if t.get("grading") == "checks-judge" else 2)),
+                  )
+                  selected = [t["id"] for t in ordered[:limit]]
+
+          print(f"Selected {len(selected)} task(s) with max_parallel={max_p}: {selected}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"tasks_json={json.dumps(selected)}\n")
+              fh.write(f"max_parallel={max_p}\n")
+          PY
+
+      - name: Stop model proxy and clean secret files
+        if: always()
+        run: |
+          if [ -n "${PROXY_PID:-}" ]; then
+            kill "$PROXY_PID" 2>/dev/null || true
+          fi
+          rm -f "$RUNNER_TEMP/gcp-sa-key.json" "$RUNNER_TEMP/local.env"
+
+  eval-task:
+    needs: plan-and-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      max-parallel: ${{ fromJson(needs.plan-and-check.outputs.max_parallel) }}
+      matrix:
+        task_id: ${{ fromJson(needs.plan-and-check.outputs.tasks_json) }}
+
+    steps:
+      - name: Check out submission repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reclaim runner disk space for container images
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/boost /usr/local/share/chromium /usr/local/lib/node_modules || true
+          sudo docker system prune -af --volumes || true
+          sudo apt-get clean || true
+          df -h
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv and Harbor
+        run: |
+          python -m pip install --upgrade pip uv
+          uv tool install harbor==0.20.0 --with websockets
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Clone official PLE starter kit and install dependencies
+        run: |
+          rm -rf "$RUNNER_TEMP/ple_kit"
+          git clone --depth 1 https://github.com/google-research/ple.git "$RUNNER_TEMP/ple_kit"
+          cd "$RUNNER_TEMP/ple_kit"
+          uv sync
+
+      - name: Start local Vertex AI model proxy
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          VERTEXAI_PROJECT: ${{ secrets.VERTEXAI_PROJECT }}
+        run: |
+          umask 077
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          key_path = Path(os.environ["RUNNER_TEMP"]) / "gcp-sa-key.json"
+          key_path.write_text(os.environ["GCP_SA_KEY"], encoding="utf-8")
+          os.chmod(key_path, 0o600)
+          PY
+
+          PROXY_KEY=$(openssl rand -hex 24)
+          echo "::add-mask::$PROXY_KEY"
+          echo "MODEL_PROXY_KEY=$PROXY_KEY" >> "$GITHUB_ENV"
+          echo "MODEL_PROXY_URL=http://localhost:4000" >> "$GITHUB_ENV"
+          echo "GOOGLE_APPLICATION_CREDENTIALS=$RUNNER_TEMP/gcp-sa-key.json" >> "$GITHUB_ENV"
+
+          {
+            printf 'MODEL_PROXY_URL=http://localhost:4000\n'
+            printf 'MODEL_PROXY_KEY=%s\n' "$PROXY_KEY"
+            printf 'HF_TOKEN=%s\n' "$HF_TOKEN"
+          } > "$RUNNER_TEMP/local.env"
+          chmod 600 "$RUNNER_TEMP/local.env"
+
+          export MODEL_PROXY_KEY="$PROXY_KEY"
+          export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/gcp-sa-key.json"
+          bash "$RUNNER_TEMP/ple_kit/kit/model_proxy/start.sh" >"$RUNNER_TEMP/model_proxy.log" 2>&1 &
+          PROXY_PID=$!
+          echo "PROXY_PID=$PROXY_PID" >> "$GITHUB_ENV"
+
+          for _ in $(seq 1 180); do
+            if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+              echo "::error::kit/model_proxy/start.sh exited prematurely"
+              tail -n 60 "$RUNNER_TEMP/model_proxy.log" || true
+              exit 1
+            fi
+            if curl -fsS -H "Authorization: Bearer $PROXY_KEY" http://127.0.0.1:4000/v1/models >/dev/null 2>&1; then
+              echo "Local Vertex AI model proxy is ready on http://0.0.0.0:4000"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "::error::Model proxy did not become ready within 180s"
+          tail -n 60 "$RUNNER_TEMP/model_proxy.log" || true
+          exit 1
+
+      - name: Run task evaluation with 60s live progress stream
+        id: run_task
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TASK_ID: ${{ matrix.task_id }}
+        run: |
+          cd "$RUNNER_TEMP/ple_kit"
+          rm -rf "$RUNNER_TEMP/eval_run"
+
+          uv run python eval/run.py "$GITHUB_WORKSPACE" \
+            --tasks "$TASK_ID" \
+            --env-file "$RUNNER_TEMP/local.env" \
+            --out "$RUNNER_TEMP/eval_run" \
+            --no-export &
+          EVAL_PID=$!
+
+          START_TS=$(date +%s)
+          (
+            while kill -0 "$EVAL_PID" 2>/dev/null; do
+              sleep 60
+              if ! kill -0 "$EVAL_PID" 2>/dev/null; then
+                break
+              fi
+              ELAPSED=$(( $(date +%s) - START_TS ))
+              echo "=== [${ELAPSED}s] Live progress for $TASK_ID ==="
+              docker ps --format 'table {{.Names}}\t{{.Status}}' || true
+              if [ -f "$RUNNER_TEMP/eval_run/results.json" ]; then
+                echo "--- checkpoint results.json ---"
+                cat "$RUNNER_TEMP/eval_run/results.json" || true
+              fi
+              LATEST_HARBOR=$(ls -1t "$RUNNER_TEMP"/eval_run/attempt*/harbor.log 2>/dev/null | head -n 1 || true)
+              if [ -n "$LATEST_HARBOR" ]; then
+                echo "--- harbor.log tail ---"
+                tail -n 10 "$LATEST_HARBOR" || true
+              fi
+              LATEST_SERVE=$(ls -1t "$RUNNER_TEMP"/eval_run/attempt*/jobs/dev/*/agent/serve.log 2>/dev/null | head -n 1 || true)
+              if [ -n "$LATEST_SERVE" ]; then
+                echo "--- serve.log tail ---"
+                tail -n 10 "$LATEST_SERVE" || true
+              fi
+              LATEST_TRACE=$(ls -1t "$RUNNER_TEMP"/eval_run/attempt*/jobs/dev/*/agent/*.txt 2>/dev/null | head -n 1 || true)
+              if [ -n "$LATEST_TRACE" ]; then
+                echo "--- agent protocol trace tail ---"
+                tail -n 10 "$LATEST_TRACE" || true
+              fi
+            done
+          ) &
+          MON_PID=$!
+
+          set +e
+          wait "$EVAL_PID"
+          RC=$?
+          set -e
+
+          kill "$MON_PID" 2>/dev/null || true
+          wait "$MON_PID" 2>/dev/null || true
+
+          echo "eval_exit=$RC" >> "$GITHUB_OUTPUT"
+          echo "Task $TASK_ID finished with eval/run.py exit code $RC"
+
+      - name: Stage per-task results, artifacts, and logs
+        if: always()
+        env:
+          TASK_ID: ${{ matrix.task_id }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import shutil
+          from pathlib import Path
+
+          rt = Path(os.environ["RUNNER_TEMP"])
+          eval_dir = rt / "eval_run"
+          bundle = rt / "task_bundle"
+          if bundle.exists():
+              shutil.rmtree(bundle)
+          bundle.mkdir(parents=True, exist_ok=True)
+
+          if (eval_dir / "results.json").is_file():
+              shutil.copy2(eval_dir / "results.json", bundle / "results.json")
+          if (eval_dir / "artifacts").is_dir():
+              shutil.copytree(eval_dir / "artifacts", bundle / "artifacts", dirs_exist_ok=True)
+
+          logs_dir = bundle / "logs"
+          logs_dir.mkdir(parents=True, exist_ok=True)
+          seen = set()
+
+          def _unique_out_path(rel_name: str) -> Path:
+              out_path = logs_dir / rel_name
+              if out_path.exists():
+                  stem, suffix = out_path.stem, out_path.suffix
+                  idx = 2
+                  while (logs_dir / f"{stem}_{idx}{suffix}").exists():
+                      idx += 1
+                  out_path = logs_dir / f"{stem}_{idx}{suffix}"
+              return out_path
+
+          def _stage_log_file(
+              src: Path,
+              rel_name: str,
+              max_lines: int,
+              *,
+              keep_head: bool = False,
+              max_raw_bytes: int = 2 * 1024 * 1024,
+              max_out_bytes: int = 2 * 1024 * 1024,
+          ) -> None:
+              if not src.is_file() or src.stat().st_size > max_raw_bytes:
+                  return
+              resolved = src.resolve()
+              if resolved in seen:
+                  return
+              seen.add(resolved)
+              out_path = _unique_out_path(rel_name)
+              lines = src.read_text(encoding="utf-8", errors="replace").splitlines()
+              if len(lines) > max_lines:
+                  if keep_head:
+                      head_n = max_lines // 2
+                      tail_n = max_lines - head_n
+                      omitted = len(lines) - max_lines
+                      lines = lines[:head_n] + [f"... [omitted {omitted} line(s)] ..."] + lines[-tail_n:]
+                  else:
+                      lines = lines[-max_lines:]
+              text_out = "\n".join(lines) + "\n"
+              raw_bytes = text_out.encode("utf-8", errors="replace")
+              if len(raw_bytes) > max_out_bytes:
+                  half_b = max(1024, (max_out_bytes - 256) // 2)
+                  marker = b"\n... [truncated middle due to byte limit] ...\n"
+                  raw_bytes = raw_bytes[:half_b] + marker + raw_bytes[-half_b:]
+                  text_out = raw_bytes.decode("utf-8", errors="replace")
+              out_path.write_text(text_out, encoding="utf-8")
+
+          for pattern, limit, keep_head in (
+              ("attempt*/harbor.log", 200, False),
+              ("attempt*/jobs/dev/*/agent/serve.log", 400, False),
+              ("attempt*/jobs/dev/*/agent/*.txt", 200, False),
+              ("attempt*/jobs/dev/*/result.json", 1200, True),
+          ):
+              for match in sorted(eval_dir.glob(pattern)):
+                  if match.is_file():
+                      rel = "_".join(match.relative_to(eval_dir).parts[-4:])
+                      _stage_log_file(
+                          match,
+                          rel,
+                          limit,
+                          keep_head=keep_head,
+                          max_raw_bytes=(20 * 1024 * 1024 if keep_head else 2 * 1024 * 1024),
+                      )
+
+          for ver_dir in sorted(eval_dir.glob("attempt*/jobs/dev/*/verifier")):
+              if not ver_dir.is_dir():
+                  continue
+              prefix = "_".join(ver_dir.relative_to(eval_dir).parts[-3:])
+              for vf in sorted(ver_dir.rglob("*")):
+                  if vf.is_file():
+                      sub_rel = "_".join(vf.relative_to(ver_dir).parts)
+                      _stage_log_file(
+                          vf,
+                          f"{prefix}_{sub_rel}",
+                          1200,
+                          keep_head=True,
+                          max_raw_bytes=20 * 1024 * 1024,
+                      )
+          PY
+
+      - name: Upload per-task artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ple-task-${{ matrix.task_id }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/task_bundle
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Stop model proxy, clean secrets, and check task exit code
+        if: always()
+        env:
+          EVAL_EXIT: ${{ steps.run_task.outputs.eval_exit }}
+        run: |
+          if [ -n "${PROXY_PID:-}" ]; then
+            kill "$PROXY_PID" 2>/dev/null || true
+          fi
+          rm -f "$RUNNER_TEMP/gcp-sa-key.json" "$RUNNER_TEMP/local.env"
+          if [ -n "${EVAL_EXIT:-}" ] && [ "$EVAL_EXIT" != "0" ]; then
+            echo "::error::eval/run.py exited with status $EVAL_EXIT"
+            exit 1
+          fi
+
+  aggregate:
+    needs: [plan-and-check, eval-task]
+    if: always() && needs.plan-and-check.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out submission repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: python -m pip install --upgrade pip uv
+
+      - name: Clone official PLE starter kit
+        run: |
+          rm -rf "$RUNNER_TEMP/ple_kit"
+          git clone --depth 1 https://github.com/google-research/ple.git "$RUNNER_TEMP/ple_kit"
+          cd "$RUNNER_TEMP/ple_kit"
+          uv sync
+
+      - name: Download all per-task artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ple-task-*-${{ github.run_id }}
+          path: ${{ runner.temp }}/task_artifacts
+
+      - name: Merge artifacts and compute combined evaluation summary
+        id: summary
+        env:
+          TASKS_JSON: ${{ needs.plan-and-check.outputs.tasks_json }}
+        run: |
+          cd "$RUNNER_TEMP/ple_kit"
+          uv run python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import shutil
+          import sys
+          from pathlib import Path
+
+          sys.path.insert(0, os.getcwd())
+          from kit import export, artifacts
+
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          task_art_root = Path(os.environ["RUNNER_TEMP"]) / "task_artifacts"
+          bundle = Path(os.environ["RUNNER_TEMP"]) / "upload_bundle"
+          if bundle.exists():
+              shutil.rmtree(bundle)
+          bundle.mkdir(parents=True, exist_ok=True)
+
+          selected_ids = json.loads(os.environ["TASKS_JSON"])
+          results_by_task = {}
+          submission_name = "ple-submission"
+          model_api = "google-cloud/gemini-3.8-flash"
+          judge_model = "claude-opus-5-5"
+
+          for sub_dir in sorted(task_art_root.glob("ple-task-*")):
+              res_file = sub_dir / "results.json"
+              if res_file.is_file():
+                  data = json.loads(res_file.read_text(encoding="utf-8"))
+                  submission_name = str(data.get("submission") or submission_name)
+                  model_api = str(data.get("model") or model_api)
+                  judge_model = str(data.get("judge_model") or judge_model)
+                  for row in data.get("tasks") or []:
+                      if isinstance(row, dict) and row.get("id"):
+                          results_by_task[row["id"]] = row
+
+              art_src = sub_dir / "artifacts"
+              if (art_src / "manifest.json").is_file():
+                  try:
+                      msgs = export.import_run(workspace, art_src)
+                      print(f"Imported {sub_dir.name}: {'; '.join(msgs)}")
+                  except export.ExportError as exc:
+                      print(f"::warning::Could not import artifacts from {sub_dir.name}: {exc}")
+
+              log_src = sub_dir / "logs"
+              if log_src.is_dir():
+                  shutil.copytree(log_src, bundle / "logs" / sub_dir.name, dirs_exist_ok=True)
+
+          if (workspace / "artifacts").is_dir():
+              shutil.copytree(workspace / "artifacts", bundle / "artifacts", dirs_exist_ok=True)
+              try:
+                  rv = artifacts.review_directory(workspace, artifacts.load_dev_set(artifacts.DEV_SET_FILE))
+                  print("--- Official artifacts review ---")
+                  print("\n".join(rv.lines()))
+              except Exception as exc:
+                  print(f"::warning::Artifact review note: {exc}")
+
+          RATES = {
+              "gemini-3.8-flash": {"input": 0.15, "cache": 0.04, "output": 0.60},
+              "gemini-4-argon": {"input": 1.25, "cache": 0.31, "output": 10.00},
+              "gemini-3.1-pro-preview": {"input": 1.25, "cache": 0.31, "output": 10.00},
+              "claude-opus-5-5": {"input": 15.00, "cache": 1.50, "output": 75.00},
+          }
+          DEFAULT_RATE = {"input": 0.50, "cache": 0.12, "output": 2.00}
+          rate = RATES.get(model_api.split("/")[-1], DEFAULT_RATE)
+
+          total_in = 0
+          total_cache = 0
+          total_out = 0
+          total_score = 0.0
+          passed = 0
+          measured_count = 0
+          rows_md = []
+          task_summaries = []
+
+          for tid in selected_ids:
+              t = results_by_task.get(tid) or {"id": tid, "score": 0.0, "measured": False, "status": "missing"}
+              score = float(t.get("score") or 0.0)
+              measured = bool(t.get("measured"))
+              status = str(t.get("status") or "")
+              seconds = t.get("seconds")
+              tokens = t.get("tokens") or {}
+              in_tok = int(tokens.get("input") or 0)
+              cache_tok = int(tokens.get("cache") or 0)
+              out_tok = int(tokens.get("output") or 0)
+
+              total_in += in_tok
+              total_cache += cache_tok
+              total_out += out_tok
+              total_score += score
+
+              uncached_in = max(0, in_tok - cache_tok)
+              est_cost = (
+                  (uncached_in / 1_000_000.0) * rate["input"]
+                  + (cache_tok / 1_000_000.0) * rate["cache"]
+                  + (out_tok / 1_000_000.0) * rate["output"]
+              )
+
+              if not measured:
+                  verdict = "UNMEASURED"
+              elif score >= 0.5:
+                  verdict = "PASS"
+                  passed += 1
+              else:
+                  verdict = "FAIL"
+              if measured:
+                  measured_count += 1
+
+              sec_str = f"{float(seconds):.0f}s" if isinstance(seconds, (int, float)) else "-"
+              rows_md.append(
+                  f"| `{tid}` | **{verdict}** | {score:.3f} | {status} | {sec_str} | "
+                  f"{in_tok:,} / {cache_tok:,} / {out_tok:,} | ~${est_cost:.4f} |"
+              )
+              task_summaries.append(
+                  {
+                      "id": tid,
+                      "verdict": verdict,
+                      "score": score,
+                      "measured": measured,
+                      "status": status,
+                      "seconds": seconds,
+                      "tokens": {"input": in_tok, "cache": cache_tok, "output": out_tok},
+                      "estimated_cost_usd": round(est_cost, 6),
+                  }
+              )
+
+          total_tasks = len(selected_ids)
+          overall_score = (total_score / total_tasks) if total_tasks else 0.0
+          total_uncached = max(0, total_in - total_cache)
+          total_est_cost = (
+              (total_uncached / 1_000_000.0) * rate["input"]
+              + (total_cache / 1_000_000.0) * rate["cache"]
+              + (total_out / 1_000_000.0) * rate["output"]
+          )
+
+          summary_lines = [
+              "## PLE Dev Eval Summary",
+              "",
+              f"- **Submission:** `{submission_name}`",
+              f"- **Model:** `{model_api}` (judge: `{judge_model}`)",
+              f"- **Overall Mean Score:** `{overall_score:.4f}` (`{passed}/{total_tasks}` passed score >= 0.5; `{measured_count}/{total_tasks}` measured)",
+              f"- **Total Tokens (in / cache / out):** `{total_in:,} / {total_cache:,} / {total_out:,}`",
+              f"- **Estimated Harness Cost (approx. list rates):** `~${total_est_cost:.4f}` *(excludes separate LLM judge calls)*",
+              "",
+              "| Task | Result | Score | Status | Time | Tokens (in / cache / out) | Est. Cost |",
+              "| :--- | :--- | ---: | :--- | ---: | ---: | ---: |",
+              *rows_md,
+              "",
+          ]
+          report_text = "\n".join(summary_lines)
+          (bundle / "summary.md").write_text(report_text, encoding="utf-8")
+          (bundle / "summary.json").write_text(
+              json.dumps(
+                  {
+                      "submission": submission_name,
+                      "model": model_api,
+                      "judge_model": judge_model,
+                      "overall_score": round(overall_score, 6),
+                      "passed_tasks": passed,
+                      "measured_tasks": measured_count,
+                      "total_tasks": total_tasks,
+                      "tokens": {
+                          "input": total_in,
+                          "cache": total_cache,
+                          "output": total_out,
+                      },
+                      "estimated_cost_usd": round(total_est_cost, 6),
+                      "tasks": task_summaries,
+                  },
+                  indent=2,
+              ),
+              encoding="utf-8",
+          )
+
+          print(report_text)
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary:
+              with open(step_summary, "a", encoding="utf-8") as fh:
+                  fh.write(report_text)
+
+          all_measured = str(measured_count == total_tasks and total_tasks > 0).lower()
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"all_measured={all_measured}\n")
+          PY
+
+      - name: Upload combined evaluation bundle
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ple-dev-eval-${{ github.run_id }}
+          path: ${{ runner.temp }}/upload_bundle
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Commit merged artifacts back to origin/main when requested
+        if: ${{ inputs.commit_artifacts && needs.eval-task.result == 'success' && steps.summary.outputs.all_measured == 'true' }}
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          if [ ! -d artifacts ]; then
+            echo "No artifacts/ directory merged to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add artifacts/
+          if git diff --cached --quiet; then
+            echo "No changes in artifacts/ to commit."
+            exit 0
+          fi
+          git commit -m "Update PLE dev artifacts (run $RUN_ID)"
+          git push origin HEAD:main
+
+      - name: Fail aggregate job if any task did not complete
+        if: ${{ needs.eval-task.result != 'success' || steps.summary.outputs.all_measured != 'true' }}
+        run: |
+          echo "::error::One or more evaluation tasks failed or remained unmeasured. See summary table and logs artifact."
+          exit 1
