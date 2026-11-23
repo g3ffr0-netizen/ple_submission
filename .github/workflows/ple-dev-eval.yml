@@ -26,6 +26,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   plan-and-check:
@@ -110,6 +111,14 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Cache uv downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/uv
+          key: ple-uv-${{ runner.os }}-py312
+          restore-keys: |
+            ple-uv-${{ runner.os }}-
+
       - name: Install uv
         run: python -m pip install --upgrade pip uv
 
@@ -119,6 +128,28 @@ jobs:
           git clone --depth 1 https://github.com/google-research/ple.git "$RUNNER_TEMP/ple_kit"
           cd "$RUNNER_TEMP/ple_kit"
           uv sync
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Restore cached plebench-builder image from GHCR
+        id: builder_cache
+        run: |
+          BUILDER_TAG=$(python3 - <<'PY'
+          import hashlib, os
+          from pathlib import Path
+          df = Path(os.environ["RUNNER_TEMP"]) / "ple_kit" / "kit" / "builder" / "Dockerfile"
+          print("plebench-builder:" + hashlib.sha256(df.read_bytes() + b"linux/amd64").hexdigest()[:16])
+          PY
+          )
+          REPO_LC="${GITHUB_REPOSITORY,,}"
+          echo "builder_tag=$BUILDER_TAG" >> "$GITHUB_OUTPUT"
+          echo "builder_ref=ghcr.io/${REPO_LC}/${BUILDER_TAG}" >> "$GITHUB_OUTPUT"
+          docker pull "ghcr.io/${REPO_LC}/${BUILDER_TAG}" && docker tag "ghcr.io/${REPO_LC}/${BUILDER_TAG}" "${BUILDER_TAG}" || true
 
       - name: Start local Vertex AI model proxy
         env:
@@ -177,6 +208,15 @@ jobs:
         run: |
           cd "$RUNNER_TEMP/ple_kit"
           uv run python -m kit check "$GITHUB_WORKSPACE" --cancel-test --env-file "$RUNNER_TEMP/local.env"
+
+      - name: Push plebench-builder image to GHCR on cache miss
+        run: |
+          BUILDER_TAG="${{ steps.builder_cache.outputs.builder_tag }}"
+          BUILDER_REF="${{ steps.builder_cache.outputs.builder_ref }}"
+          if docker image inspect "$BUILDER_TAG" >/dev/null 2>&1 && ! docker manifest inspect "$BUILDER_REF" >/dev/null 2>&1; then
+            docker tag "$BUILDER_TAG" "$BUILDER_REF"
+            docker push "$BUILDER_REF" || echo "::warning::Failed to push ${BUILDER_REF}; continuing"
+          fi
 
       - name: Plan dev task matrix
         id: plan
@@ -267,6 +307,16 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Cache uv and Harbor tool
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.local/share/uv/tools
+          key: ple-uv-harbor-0.20.0-${{ runner.os }}-py312
+          restore-keys: |
+            ple-uv-harbor-0.20.0-${{ runner.os }}-
+
       - name: Install uv and Harbor
         run: |
           python -m pip install --upgrade pip uv
@@ -279,6 +329,109 @@ jobs:
           git clone --depth 1 https://github.com/google-research/ple.git "$RUNNER_TEMP/ple_kit"
           cd "$RUNNER_TEMP/ple_kit"
           uv sync
+
+      - name: Resolve dev task dataset metadata
+        id: task_meta
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TASK_ID: ${{ matrix.task_id }}
+        run: |
+          cd "$RUNNER_TEMP/ple_kit"
+          uv run python - <<'PY'
+          import hashlib, os, sys
+          from pathlib import Path
+          import yaml
+          sys.path.insert(0, os.getcwd())
+          from eval import run as eval_run
+          dev_set = yaml.safe_load(Path("eval/dev_set.yaml").read_text(encoding="utf-8"))
+          tasks_by_id = {t["id"]: t for t in dev_set["tasks"]}
+          task_id = os.environ["TASK_ID"]
+          grading = tasks_by_id[task_id].get("grading", "unknown")
+          repo = eval_run.dataset_repo()
+          try:
+              rev = eval_run.latest_revision(repo, os.environ.get("HF_TOKEN"))
+          except Exception:
+              rev = str(dev_set.get("tasks_revision") or "latest")
+          df = Path("kit/builder/Dockerfile")
+          btag = "plebench-builder:" + hashlib.sha256(df.read_bytes() + b"linux/amd64").hexdigest()[:16]
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"hf_rev={rev}\n")
+              fh.write(f"grading={grading}\n")
+              fh.write(f"builder_tag={btag}\n")
+          print(f"Resolved task={task_id} grading={grading} hf_rev={rev[:12]} builder_tag={btag}")
+          PY
+
+      - name: Cache Hugging Face task files (~45-150 MB per task)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/plebench/tasks
+          key: ple-hf-${{ steps.task_meta.outputs.hf_rev }}-${{ matrix.task_id }}
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pre-warm builder and task Docker layers from GHCR
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TASK_ID: ${{ matrix.task_id }}
+          TASK_GRADING: ${{ steps.task_meta.outputs.grading }}
+          BUILDER_TAG: ${{ steps.task_meta.outputs.builder_tag }}
+        run: |
+          REPO_LC="${GITHUB_REPOSITORY,,}"
+
+          if docker pull "ghcr.io/${REPO_LC}/${BUILDER_TAG}"; then
+            docker tag "ghcr.io/${REPO_LC}/${BUILDER_TAG}" "${BUILDER_TAG}"
+          fi
+
+          cd "$RUNNER_TEMP/ple_kit"
+          uv run python - <<'PY'
+          import os, shlex, sys
+          from pathlib import Path
+          sys.path.insert(0, os.getcwd())
+          from eval import run as eval_run
+          tid = os.environ["TASK_ID"]
+          found = eval_run.resolve_tasks([tid], None, {"HF_TOKEN": os.environ.get("HF_TOKEN", "")})
+          env_dir = found[tid] / "environment"
+          tag = f"plebench-task-{tid}:{eval_run.tree_sha256(env_dir)[:20]}"
+          has_df = "true" if (env_dir / "Dockerfile").is_file() else "false"
+          out_sh = Path(os.environ["RUNNER_TEMP"]) / "task_env.sh"
+          out_sh.write_text(
+              f"ENV_DIR={shlex.quote(str(env_dir))}\n"
+              f"TASK_TAG={shlex.quote(tag)}\n"
+              f"HAS_DOCKERFILE={has_df}\n",
+              encoding="utf-8",
+          )
+          PY
+          source "$RUNNER_TEMP/task_env.sh"
+
+          if [ "$HAS_DOCKERFILE" = "true" ]; then
+            CACHE_REF="ghcr.io/${REPO_LC}/plebench-cache:${TASK_ID}"
+            SHARED_REF="ghcr.io/${REPO_LC}/plebench-cache:shared-${TASK_GRADING}"
+            CACHE_TO_ARGS=()
+            if docker info --format '{{.DriverStatus}}' 2>/dev/null | grep -q 'io.containerd.snapshotter'; then
+              CACHE_TO_ARGS+=(--cache-to "type=registry,ref=${CACHE_REF},mode=max,oci-mediatypes=true,image-manifest=true")
+              if [ "$TASK_GRADING" = "rubric" ] && ! docker buildx imagetools inspect "$SHARED_REF" >/dev/null 2>&1; then
+                CACHE_TO_ARGS+=(--cache-to "type=registry,ref=${SHARED_REF},mode=max,oci-mediatypes=true,image-manifest=true")
+              fi
+            else
+              CACHE_TO_ARGS+=(--cache-to "type=inline")
+            fi
+
+            echo "Pre-warming ${TASK_TAG} from ${CACHE_REF} (shared: ${SHARED_REF}) ..."
+            DOCKER_BUILDKIT=1 docker buildx build \
+              --builder default \
+              --platform linux/amd64 \
+              --load \
+              --cache-from "type=registry,ref=${CACHE_REF}" \
+              --cache-from "type=registry,ref=${SHARED_REF}" \
+              "${CACHE_TO_ARGS[@]}" \
+              -t "${TASK_TAG}" \
+              "${ENV_DIR}" || echo "::warning::GHCR-cached pre-warm failed; eval/run.py will build locally"
+          fi
 
       - name: Start local Vertex AI model proxy
         env:
