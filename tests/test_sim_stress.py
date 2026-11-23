@@ -1515,6 +1515,20 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
             self.assertEqual(ans2, "Recovered after trip.")
             self.assertTrue(any("tool circuit breaker tripped after 3 consecutive tool errors" in entry for entry in sess2.logs))
 
+    def test_regex_extractor_linear_time_no_redos(self):
+        import time
+
+        t0 = time.monotonic()
+        res_hyphens = serve._regex_extract_constraints("-" * 50_000 + " /app/output/plan.csv", "")
+        res_nines = serve._regex_extract_constraints("9" * 50_000 + " >= 300 mm and 50% and 100 m2", "")
+        elapsed = time.monotonic() - t0
+
+        self.assertLess(elapsed, 0.5)
+        self.assertIn("/app/output/plan.csv", res_hyphens["file_paths"])
+        self.assertIn(">= 300 mm", res_nines["numeric_thresholds"])
+        self.assertIn("50%", res_nines["numeric_thresholds"])
+        self.assertIn("100 m2", res_nines["numeric_thresholds"])
+
     def test_e2e_extractor_429_regex_fallback_and_worker_429_retry_to_pass(self):
         empty_fb = serve._regex_extract_constraints("Summarize general engineering notes.", "")
         self.assertEqual(empty_fb["source"], "regex_fallback")

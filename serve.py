@@ -932,11 +932,11 @@ _MCP_COMMENT_READ_RE = re.compile(
 _META_STATUS_LINE_RE = re.compile(
     r"\b(?:whether|one way or the other|yes/no|pass/fail|pass or fail|"
     r"approved/rejected|eligible/ineligible)\b"
-    r"|\b([a-z]{3,20})\s*(?:/|or)\s*(?:not\s+|non-)\1\b",
+    r"|\b([a-z]{3,20})\s{0,3}(?:/|or)\s{0,3}(?:not\s{1,3}|non-)\1\b",
     re.I,
 )
 _NEG_STATUS_RE = re.compile(
-    r"\b(?:not\s+|non[-_\s]+)([a-z][a-z0-9_-]{2,24})\b",
+    r"\b(?:not\s{1,3}|non[-_\s]{1,3})([a-z][a-z0-9_-]{2,24})\b",
     re.I,
 )
 _POS_WORD_RE = re.compile(r"\b([a-z][a-z0-9_-]{2,24})\b", re.I)
@@ -959,13 +959,16 @@ _ANTONYM_STATUS_PAIRS: Tuple[Tuple[re.Pattern[str], re.Pattern[str], str], ...] 
     (re.compile(r"\baccepted\b", re.I), re.compile(r"\brejected\b", re.I), "accepted vs rejected"),
     (re.compile(r"\bactive\b", re.I), re.compile(r"\bwithdrawn\b", re.I), "active vs withdrawn"),
 )
-_CONSTRAINT_PATH_RE = re.compile(
-    r"(?:(?:/[A-Za-z0-9._-]+){2,}|[A-Za-z0-9._-]+\.(?:docx|pdf|xlsx|xlsm|csv|tsv|ifc|json|yaml|yml|md|txt|py|png|jpg|jpeg))\b",
-    re.I,
+_CONSTRAINT_PATH_TOKEN_RE = re.compile(r"[A-Za-z0-9._/-]+")
+_CONSTRAINT_PATH_EXTS = (
+    ".docx", ".pdf", ".xlsx", ".xlsm", ".csv", ".tsv", ".ifc",
+    ".json", ".yaml", ".yml", ".md", ".txt", ".py", ".png", ".jpg", ".jpeg",
 )
 _CONSTRAINT_THRESHOLD_RE = re.compile(
-    r"(?:(?:>=|<=|!=|==|>|<|±)\s*)?\d+(?:[.,]\d+)?(?:\s*-\s*\d+(?:[.,]\d+)?)?\s*"
-    r"(?:mm|cm|m|m\^2|m2|ft|in|kw|kva|mw|kv|hz|ms|deg|°c|°f|psi|bar|pa|db|rpm|s|%|aff)\b",
+    r"(?:(?:>=|<=|!=|==|[<>±])\s{0,2}|(?<![A-Za-z0-9.]))"
+    r"\d{1,10}(?:[.,]\d{1,6})?"
+    r"(?:\s{0,2}-\s{0,2}\d{1,10}(?:[.,]\d{1,6})?)?\s{0,2}"
+    r"(?:mm|cm|m\^2|m2|m|ft|in|kw|kva|mw|kv|hz|ms|deg|°c|°f|psi|bar|pa|db|rpm|s|%|aff)(?![A-Za-z0-9])",
     re.I,
 )
 _CONSTRAINT_DATE_RE = re.compile(
@@ -980,9 +983,31 @@ _CONSTRAINT_ENTITY_RE = re.compile(
 _EMPTY_TRIGGER_LINE_RE = re.compile(
     r"\b(empty|no entry|zero|none|as of|as the record stands|not yours to make|"
     r"stays with|do not release|pending signature|withdrawn|out of scope|must not|"
-    r"never|prohibit|mandatory|releasable)\b|\[h\s*=\s*1\]",
+    r"never|prohibit|mandatory|releasable)\b|\[h\s{0,3}=\s{0,3}1\]",
     re.I,
 )
+
+
+def _extract_path_candidates(text: str) -> List[str]:
+    """Extract file paths deterministically in linear time (no regex backtracking)."""
+    out: List[str] = []
+    for raw_tok in _CONSTRAINT_PATH_TOKEN_RE.findall(text):
+        tok = raw_tok.rstrip(".")
+        if not tok:
+            continue
+        low = tok.lower()
+        if any(
+            low.endswith(ext)
+            and len(low) > len(ext)
+            and low[-len(ext) - 1] not in "/."
+            for ext in _CONSTRAINT_PATH_EXTS
+        ):
+            out.append(tok)
+            continue
+        if tok.startswith("/") and not tok.startswith("//"):
+            if len([seg for seg in tok.split("/") if seg]) >= 2:
+                out.append(tok)
+    return out
 
 
 def _dedupe_strs(items: Iterable[str], limit: int = 30) -> List[str]:
@@ -1001,7 +1026,7 @@ def _dedupe_strs(items: Iterable[str], limit: int = 30) -> List[str]:
 def _regex_extract_constraints(task: str, plan: str = "") -> Dict[str, Any]:
     """Zero-latency deterministic fallback extractor for CONSTRAINTS.json."""
     text = f"{task or ''}\n{plan or ''}".strip()
-    file_paths = _dedupe_strs(_CONSTRAINT_PATH_RE.findall(text))
+    file_paths = _dedupe_strs(_extract_path_candidates(text))
     numeric_thresholds = _dedupe_strs(_CONSTRAINT_THRESHOLD_RE.findall(text))
     iso_dates = _dedupe_strs(_CONSTRAINT_DATE_RE.findall(text))
     raw_entities = _CONSTRAINT_ENTITY_RE.findall(text)
