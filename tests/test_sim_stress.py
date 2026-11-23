@@ -14,11 +14,11 @@ import textwrap
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import patch
 from xml.sax.saxutils import escape as xml_escape
 
-import httpx
 import openai
 
 import harness
@@ -372,7 +372,7 @@ class _LocalReplaySession:
     async def exec(self, command: str, timeout_sec: int = 120) -> Dict[str, Any]:
         is_audit = "__PLE_AUDIT__" in command
         res = subprocess.run(
-            [sys.executable, "-"] if is_audit else ["cmd", "/c", "echo ok"],
+            [sys.executable, "-"] if is_audit else [sys.executable, "-c", "print('ok')"],
             input=serve._build_programmatic_audit_script() if is_audit else None,
             cwd=self._root,
             capture_output=True,
@@ -821,7 +821,13 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
             self.assertEqual(_run_audit(workdir)["errors"], [])
 
     def test_429_503_api_storms_fallback_rotation_and_malformed_tool_calls(self):
-        req = httpx.Request("POST", "https://api.example/v1/chat/completions")
+        def _mock_http_response(status_code: int, headers: Optional[Dict[str, str]] = None) -> SimpleNamespace:
+            return SimpleNamespace(
+                status_code=status_code,
+                headers=dict(headers or {}),
+                request=SimpleNamespace(method="POST", url="https://api.example/v1/chat/completions"),
+            )
+
         clean_csv = "device_id,register,qty\nD1,REG-1,10\nD2,REG-2,20\nTOTAL,,30\n"
 
         # Part A: Full serve.solve() replay with 429 Retry-After, 503 storms, fallback rotation,
@@ -853,10 +859,10 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
                         self.planner_calls += 1
                         self.planner_models.append(model_used)
                         if self.planner_calls == 1:
-                            r429 = httpx.Response(429, request=req, headers={"Retry-After": "9"})
+                            r429 = _mock_http_response(429, headers={"Retry-After": "9"})
                             raise openai.APIStatusError("rate limited", response=r429, body=None)
                         if self.planner_calls == 2:
-                            r503 = httpx.Response(503, request=req)
+                            r503 = _mock_http_response(503)
                             raise openai.APIStatusError("service unavailable", response=r503, body=None)
                         return serve._DryRunObject(
                             {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Plan ready."}}]}
@@ -866,7 +872,7 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
                         self.verifier_calls += 1
                         self.verifier_models.append(model_used)
                         if self.verifier_calls == 1:
-                            r503 = httpx.Response(503, request=req)
+                            r503 = _mock_http_response(503)
                             raise openai.APIStatusError("verifier overloaded", response=r503, body=None)
                         return serve._DryRunObject(
                             {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "PASS"}}]}
@@ -982,7 +988,7 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
 
         class _Srv503(Exception):
             status_code = 503
-            response = httpx.Response(503, request=req)
+            response = _mock_http_response(503)
 
         class _Srv500(Exception):
             status_code = 500

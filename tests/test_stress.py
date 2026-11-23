@@ -24,6 +24,7 @@ import time
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import patch
 
@@ -31,7 +32,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-import httpx
 import openai
 import websockets
 
@@ -880,7 +880,7 @@ class TestAdversarialHarnessStress(unittest.TestCase):
                 async def exec(self, command: str, timeout_sec: int = 120) -> Dict[str, Any]:
                     is_audit = "__PLE_AUDIT__" in command
                     res = subprocess.run(
-                        [sys.executable, "-"] if is_audit else ["cmd", "/c", "echo ok"],
+                        [sys.executable, "-"] if is_audit else [sys.executable, "-c", "print('ok')"],
                         input=serve._build_programmatic_audit_script() if is_audit else None,
                         cwd=workdir,
                         capture_output=True,
@@ -1012,6 +1012,13 @@ class TestAdversarialHarnessStress(unittest.TestCase):
 
     def test_429_5xx_backoff_fallback_rotation_and_malformed_tool_calls_resilience(self):
         # Part A: HarnessExecutionEngine 429 + Retry-After + 5xx exponential backoff & rotation
+        def _mock_http_response(status_code: int, headers: Optional[Dict[str, str]] = None) -> SimpleNamespace:
+            return SimpleNamespace(
+                status_code=status_code,
+                headers=dict(headers or {}),
+                request=SimpleNamespace(method="POST", url="https://api.example/v1/chat/completions"),
+            )
+
         sleep_calls: List[float] = []
         engine = HarnessExecutionEngine(
             config_path=str(REPO_ROOT / "submission.yaml"),
@@ -1019,7 +1026,6 @@ class TestAdversarialHarnessStress(unittest.TestCase):
             retry_backoff_sec=0.5,
             sleep_fn=sleep_calls.append,
         )
-        req = httpx.Request("POST", "https://api.example/v1/chat/completions")
 
         class _RateLimitErr(Exception):
             status_code = 429
@@ -1027,7 +1033,7 @@ class TestAdversarialHarnessStress(unittest.TestCase):
 
         class _Overloaded503Err(Exception):
             status_code = 503
-            response = httpx.Response(503, request=req, headers={"Retry-After": "1"})
+            response = _mock_http_response(503, headers={"Retry-After": "1"})
 
         class _Internal500Err(Exception):
             status_code = 500
@@ -1096,10 +1102,10 @@ class TestAdversarialHarnessStress(unittest.TestCase):
                 self.calls += 1
                 self.seen_messages.append(json.loads(json.dumps(kwargs["messages"], default=str)))
                 if self.calls == 1:
-                    r429 = httpx.Response(429, request=req, headers={"Retry-After": "8"})
+                    r429 = _mock_http_response(429, headers={"Retry-After": "8"})
                     raise openai.APIStatusError("rate limited", response=r429, body=None)
                 if self.calls == 2:
-                    r503 = httpx.Response(503, request=req)
+                    r503 = _mock_http_response(503)
                     raise openai.APIStatusError("unavailable", response=r503, body=None)
                 if self.calls == 3:
                     return serve._DryRunObject({"choices": []})
