@@ -240,10 +240,12 @@ jobs:
           rm -f "$RUNNER_TEMP/gcp-sa-key.json" "$RUNNER_TEMP/local.env"
 
   eval-task:
-    needs: plan-and-check
-    runs-on: ubuntu-latest
-    timeout-minutes: 120
-    strategy:
+   eval-task:
+  needs: plan-and-check
+  runs-on: ubuntu-latest
+  timeout-minutes: 120
+  timeout-minutes: 120
+  strategy:
       fail-fast: false
       max-parallel: ${{ fromJson(needs.plan-and-check.outputs.max_parallel) }}
       matrix:
