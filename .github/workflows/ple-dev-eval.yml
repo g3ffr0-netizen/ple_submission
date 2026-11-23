@@ -385,18 +385,46 @@ jobs:
 
           logs_dir = bundle / "logs"
           logs_dir.mkdir(parents=True, exist_ok=True)
-          for pattern in (
-              "attempt*/harbor.log",
-              "attempt*/jobs/dev/*/agent/serve.log",
-              "attempt*/jobs/dev/*/agent/*.txt",
-              "attempt*/jobs/dev/*/verifier/test-stdout.txt",
-              "attempt*/jobs/dev/*/verifier/grade.log",
+          seen = set()
+
+          def _stage_tail(src: Path, rel_name: str, max_lines: int) -> None:
+              if not src.is_file() or src.stat().st_size > 2 * 1024 * 1024:
+                  return
+              resolved = src.resolve()
+              if resolved in seen:
+                  return
+              seen.add(resolved)
+              out_path = logs_dir / rel_name
+              if out_path.exists():
+                  stem, suffix = out_path.stem, out_path.suffix
+                  idx = 2
+                  while (logs_dir / f"{stem}_{idx}{suffix}").exists():
+                      idx += 1
+                  out_path = logs_dir / f"{stem}_{idx}{suffix}"
+              lines = src.read_text(encoding="utf-8", errors="replace").splitlines()
+              if len(lines) > max_lines:
+                  lines = lines[-max_lines:]
+              out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+          for pattern, limit in (
+              ("attempt*/harbor.log", 200),
+              ("attempt*/jobs/dev/*/agent/serve.log", 200),
+              ("attempt*/jobs/dev/*/agent/*.txt", 200),
+              ("attempt*/jobs/dev/*/result.json", 400),
           ):
-              for match in eval_dir.glob(pattern):
+              for match in sorted(eval_dir.glob(pattern)):
                   if match.is_file():
                       rel = "_".join(match.relative_to(eval_dir).parts[-4:])
-                      tail_lines = match.read_text(encoding="utf-8", errors="replace").splitlines()[-200:]
-                      (logs_dir / rel).write_text("\n".join(tail_lines) + "\n", encoding="utf-8")
+                      _stage_tail(match, rel, limit)
+
+          for ver_dir in sorted(eval_dir.glob("attempt*/jobs/dev/*/verifier")):
+              if not ver_dir.is_dir():
+                  continue
+              prefix = "_".join(ver_dir.relative_to(eval_dir).parts[-3:])
+              for vf in sorted(ver_dir.rglob("*")):
+                  if vf.is_file():
+                      sub_rel = "_".join(vf.relative_to(ver_dir).parts)
+                      _stage_tail(vf, f"{prefix}_{sub_rel}", 400)
           PY
 
       - name: Upload per-task artifact
