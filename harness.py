@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -30,6 +31,81 @@ def _safe_int(value: Any, default: int, minimum: int = 1) -> int:
     except (TypeError, ValueError):
         return default
     return max(minimum, parsed)
+
+
+def _safe_nonneg_float(value: Any, default: float = 0.0) -> float:
+    """Safely parse non-negative finite floats while rejecting booleans."""
+    if isinstance(value, bool) or value is None:
+        return default
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    return max(0.0, parsed)
+
+
+def _extract_retry_after(exc: Exception) -> Optional[float]:
+    """Extract numeric Retry-After seconds from an exception or its response headers."""
+    candidates: List[Any] = [getattr(exc, "retry_after", None)]
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if isinstance(headers, dict):
+        for k, v in headers.items():
+            if str(k).lower() == "retry-after":
+                candidates.append(v)
+    elif hasattr(headers, "get"):
+        candidates.append(headers.get("retry-after") or headers.get("Retry-After"))
+    for raw in candidates:
+        if isinstance(raw, bool) or raw is None:
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(val) and val > 0.0:
+            return val
+    return None
+
+
+def classify_transient_error(exc: Exception) -> Tuple[str, Optional[float]]:
+    """Classify an API/model exception for backoff handling and extract Retry-After."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    try:
+        status_int = int(status) if status is not None and not isinstance(status, bool) else None
+    except (TypeError, ValueError):
+        status_int = None
+
+    err_l = str(exc).lower()
+    retry_after = _extract_retry_after(exc)
+    if status_int == 429 or any(
+        tok in err_l
+        for tok in ("429", "rate limit", "rate_limit", "quota", "resource_exhausted", "too many requests")
+    ):
+        return "rate_limit", retry_after
+    if (status_int is not None and status_int >= 500) or any(
+        tok in err_l
+        for tok in (
+            "500",
+            "502",
+            "503",
+            "504",
+            "overloaded",
+            "service unavailable",
+            "internal server error",
+            "bad gateway",
+            "gateway timeout",
+        )
+    ):
+        return "server_error", retry_after
+    if status_int in (408, 409) or any(
+        tok in err_l
+        for tok in ("timeout", "timed out", "deadline exceeded", "connection", "temporarily")
+    ):
+        return "transient", retry_after
+    return "error", retry_after
 
 
 def extract_json_payload(text: Any) -> str:
@@ -215,6 +291,8 @@ class HarnessExecutionEngine:
         max_failures: Optional[int] = None,
         max_output_tokens: Optional[int] = None,
         fallback_models: Optional[List[str]] = None,
+        retry_backoff_sec: Optional[float] = None,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         cfg = load_submission_config(config_path)
         harness_cfg = cfg.get("harness") if isinstance(cfg.get("harness"), dict) else {}
@@ -278,6 +356,17 @@ class HarnessExecutionEngine:
         self.max_output_tokens = _safe_int(
             raw_output_tokens, default=4096, minimum=64
         )
+        raw_backoff = (
+            retry_backoff_sec
+            if retry_backoff_sec is not None
+            else (
+                harness_cfg.get("retry_backoff_sec")
+                if "retry_backoff_sec" in harness_cfg
+                else env_cfg.get("RETRY_BACKOFF_SEC")
+            )
+        )
+        self.retry_backoff_sec = _safe_nonneg_float(raw_backoff, default=0.0)
+        self._sleep_fn = sleep_fn
 
     @property
     def max_failures(self) -> int:
@@ -359,6 +448,7 @@ class HarnessExecutionEngine:
         last_output = ""
         last_reason = ""
         active_prompt = clean_prompt
+        transient_streak = 0
 
         for idx in range(self.max_retries):
             attempt_num = idx + 1
@@ -388,6 +478,7 @@ class HarnessExecutionEngine:
                         "elapsed_ms": _elapsed_ms(),
                         "history": history,
                     }
+                transient_streak = 0
                 last_reason = reason
                 logger.warning(
                     "Attempt %d/%d failed verification on model=%s: %s",
@@ -403,10 +494,24 @@ class HarnessExecutionEngine:
                 )
             except Exception as exc:
                 last_reason = str(exc) or exc.__class__.__name__
+                err_kind, retry_after = classify_transient_error(exc)
+                if err_kind != "error":
+                    delay = min(
+                        30.0,
+                        max(
+                            retry_after or 0.0,
+                            self.retry_backoff_sec * (2**transient_streak),
+                        ),
+                    )
+                    transient_streak += 1
+                else:
+                    delay = 0.0
+                    transient_streak = 0
                 logger.warning(
-                    "Attempt %d/%d raised error on model=%s: %s",
+                    "Attempt %d/%d raised %s on model=%s: %s",
                     attempt_num,
                     self.max_retries,
+                    err_kind,
                     model_name,
                     last_reason,
                 )
@@ -416,8 +521,12 @@ class HarnessExecutionEngine:
                         "model": model_name,
                         "ok": False,
                         "reason": last_reason,
+                        "error_kind": err_kind,
+                        "backoff_sec": round(delay, 3),
                     }
                 )
+                if delay > 0.0 and attempt_num < self.max_retries:
+                    self._sleep_fn(delay)
                 active_prompt = (
                     f"{clean_prompt}\n\n"
                     f"Previous attempt ({attempt_num}) raised an error: {last_reason}. "
