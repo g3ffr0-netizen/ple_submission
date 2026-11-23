@@ -281,4 +281,143 @@ jobs:
           for _ in $(seq 1 180); do
             if ! kill -0 "$PROXY_PID" 2>/dev/null; then
               echo "::error::kit/model_proxy/start.sh exited prematurely"
-              tail -n 6
+          tail -n 60 "$RUNNER_TEMP/model_proxy.log" || true
+              exit 1
+            fi
+            if curl -fsS -H "Authorization: Bearer $PROXY_KEY" http://127.0.0.1:4000/v1/models >/dev/null 2>&1; then
+              echo "Local Vertex AI model proxy is ready on http://0.0.0.0:4000"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Model proxy did not become ready within 180s"
+          tail -n 60 "$RUNNER_TEMP/model_proxy.log" || true
+          exit 1
+      - name: Run task evaluation with 60s live progress stream
+        id: run_task
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TASK_ID: ${{ matrix.task_id }}
+        run: |
+          cd "$RUNNER_TEMP/ple_kit"
+          rm -rf "$RUNNER_TEMP/eval_run"
+          uv run python eval/run.py "$GITHUB_WORKSPACE" \
+            --tasks "$TASK_ID" \
+            --env-file "$RUNNER_TEMP/local.env" \
+            --out "$RUNNER_TEMP/eval_run" \
+            --no-export &
+          EVAL_PID=$!
+          START_TS=$(date +%s)
+          (
+            while kill -0 "$EVAL_PID" 2>/dev/null; do
+              sleep 60
+              if ! kill -0 "$EVAL_PID" 2>/dev/null; then
+                break
+              fi
+              ELAPSED=$(($(date +%s) - START_TS ))
+              echo "=== [${ELAPSED}s] Live progress for$TASK_ID ==="
+              docker ps --format 'table {{.Names}}\t{{.Status}}' || true
+              if [ -f "$RUNNER_TEMP/eval_run/results.json" ]; then
+                echo "--- checkpoint results.json ---"
+                cat "$RUNNER_TEMP/eval_run/results.json" || true
+              fi
+              LATEST_HARBOR=$(ls -1t "$RUNNER_TEMP"/eval_run/attempt*/harbor.log 2>/dev/null | head -n 1 || true)
+              if [ -n "$LATEST_HARBOR" ]; then
+                echo "--- harbor.log tail ---"
+                tail -n 10 "$LATEST_HARBOR" || true
+              fi
+              LATEST_SERVE=$(ls -1t "$RUNNER_TEMP"/eval_run/attempt*/jobs/dev/*/agent/serve.log 2>/dev/null | head -n 1 || true)
+              if [ -n "$LATEST_SERVE" ]; then
+                echo "--- serve.log tail ---"
+                tail -n 10 "$LATEST_SERVE" || true
+              fi
+              LATEST_TRACE=$(ls -1t "$RUNNER_TEMP"/eval_run/attempt*/jobs/dev/*/agent/*.txt 2>/dev/null | head -n 1 || true)
+              if [ -n "$LATEST_TRACE" ]; then
+                echo "--- agent protocol trace tail ---"
+                tail -n 10 "$LATEST_TRACE" || true
+              fi
+            done
+          ) &
+          MON_PID=$!
+          set +e
+          wait "$EVAL_PID"
+          RC=$?
+          set -e
+          kill "$MON_PID" 2>/dev/null || true
+          wait "$MON_PID" 2>/dev/null || true
+          echo "eval_exit=$RC" >> "$GITHUB_OUTPUT"
+          echo "Task $TASK_ID finished with eval/run.py exit code$RC"
+      - name: Stage per-task results, artifacts, and logs
+        if: always()
+        env:
+          TASK_ID: ${{ matrix.task_id }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import shutil
+          from pathlib import Path
+          rt = Path(os.environ["RUNNER_TEMP"])
+          eval_dir = rt / "eval_run"
+          bundle = rt / "task_bundle"
+          if bundle.exists():
+              shutil.rmtree(bundle)
+          bundle.mkdir(parents=True, exist_ok=True)
+          if (eval_dir / "results.json").is_file():
+              shutil.copy2(eval_dir / "results.json", bundle / "results.json")
+          if (eval_dir / "artifacts").is_dir():
+              shutil.copytree(eval_dir / "artifacts", bundle / "artifacts", dirs_exist_ok=True)
+          logs_dir = bundle / "logs"
+          logs_dir.mkdir(parents=True, exist_ok=True)
+          seen = set()
+          def _unique_out_path(rel_name: str) -> Path:
+              out_path = logs_dir / rel_name
+              if out_path.exists():
+                  stem, suffix = out_path.stem, out_path.suffix
+                  idx = 2
+                  while (logs_dir / f"{stem}_{idx}{suffix}").exists():
+                      idx += 1
+                  out_path = logs_dir / f"{stem}_{idx}{suffix}"
+              return out_path
+          def _stage_log_file(
+              src: Path,
+              rel_name: str,
+              max_lines: int,
+              *,
+              keep_head: bool = False,
+              max_raw_bytes: int = 2 * 1024 * 1024,
+              max_out_bytes: int = 2 * 1024 * 1024,
+          ) -> None:
+              if not src.is_file() or src.stat().st_size > max_raw_bytes:
+                  return
+              resolved = src.resolve()
+              if resolved in seen:
+                  return
+              seen.add(resolved)
+              out_path = _unique_out_path(rel_name)
+              lines = src.read_text(encoding="utf-8", errors="replace").splitlines()
+              if len(lines) > max_lines:
+                  if keep_head:
+                      head_n = max_lines // 2
+                      tail_n = max_lines - head_n
+                      omitted = len(lines) - max_lines
+                      lines = lines[:head_n] + [f"... [omitted {omitted} line(s)] ..."] + lines[-tail_n:]
+                  else:
+                      lines = lines[-max_lines:]
+              text_out = "\n".join(lines) + "\n"
+              raw_bytes = text_out.encode("utf-8", errors="replace")
+              if len(raw_bytes) > max_out_bytes:
+                  half_b = max(1024, (max_out_bytes - 256) // 2)
+                  marker = b"\n... [truncated middle due to byte limit] ...\n"
+                  raw_bytes = raw_bytes[:half_b] + marker + raw_bytes[-half_b:]
+                  text_out = raw_bytes.decode("utf-8", errors="replace")
+              out_path.write_text(text_out, encoding="utf-8")
+          for pattern, limit, keep_head in (
+              ("attempt*/harbor.log", 200, False),
+              ("attempt*/jobs/dev/*/agent/serve.log", 400, False),
+              ("attempt*/jobs/dev/*/agent/*.txt", 200, False),
+              ("attempt*/jobs/dev/*/result.json", 1200, True),
+          ):
+              for match in sorted(eval_dir.glob(pattern)):
+                  if match.is_file():
+                      rel = "_".join(match.relative_
+              
