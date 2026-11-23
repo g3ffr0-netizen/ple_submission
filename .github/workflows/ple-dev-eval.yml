@@ -181,6 +181,56 @@ jobs:
 
           export MODEL_PROXY_KEY="$PROXY_KEY"
           export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/gcp-sa-key.json"
+          pushd "$RUNNER_TEMP/ple_kit" >/dev/null
+          uv run python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import yaml
+
+          cfg_path = Path(os.environ["RUNNER_TEMP"]) / "ple_kit" / "kit" / "model_proxy" / "config.yaml"
+          cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+
+          litellm_settings = dict(cfg.get("litellm_settings") or {})
+          litellm_settings["num_retries"] = 6
+          litellm_settings["request_timeout"] = max(int(litellm_settings.get("request_timeout") or 0), 600)
+          cfg["litellm_settings"] = litellm_settings
+
+          router_settings = dict(cfg.get("router_settings") or {})
+          router_settings.update(
+              {
+                  "num_retries": 6,
+                  "timeout": 600,
+                  "retry_after": 10,
+                  "disable_cooldowns": True,
+                  "retry_policy": {
+                      "RateLimitErrorRetries": 6,
+                      "InternalServerErrorRetries": 4,
+                      "TimeoutErrorRetries": 3,
+                      "BadRequestErrorRetries": 0,
+                      "AuthenticationErrorRetries": 0,
+                      "ContentPolicyViolationErrorRetries": 0,
+                  },
+              }
+          )
+          cfg["router_settings"] = router_settings
+
+          cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+          print(
+              "Configured LiteLLM proxy retry policy:",
+              json.dumps(
+                  {
+                      "litellm_settings": {
+                          "num_retries": litellm_settings["num_retries"],
+                          "request_timeout": litellm_settings["request_timeout"],
+                      },
+                      "router_settings": router_settings,
+                  },
+                  sort_keys=True,
+              ),
+          )
+          PY
+          popd >/dev/null
           bash "$RUNNER_TEMP/ple_kit/kit/model_proxy/start.sh" >"$RUNNER_TEMP/model_proxy.log" 2>&1 &
           PROXY_PID=$!
           echo "PROXY_PID=$PROXY_PID" >> "$GITHUB_ENV"
@@ -463,6 +513,56 @@ jobs:
 
           export MODEL_PROXY_KEY="$PROXY_KEY"
           export GOOGLE_APPLICATION_CREDENTIALS="$RUNNER_TEMP/gcp-sa-key.json"
+          pushd "$RUNNER_TEMP/ple_kit" >/dev/null
+          uv run python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import yaml
+
+          cfg_path = Path(os.environ["RUNNER_TEMP"]) / "ple_kit" / "kit" / "model_proxy" / "config.yaml"
+          cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+
+          litellm_settings = dict(cfg.get("litellm_settings") or {})
+          litellm_settings["num_retries"] = 6
+          litellm_settings["request_timeout"] = max(int(litellm_settings.get("request_timeout") or 0), 600)
+          cfg["litellm_settings"] = litellm_settings
+
+          router_settings = dict(cfg.get("router_settings") or {})
+          router_settings.update(
+              {
+                  "num_retries": 6,
+                  "timeout": 600,
+                  "retry_after": 10,
+                  "disable_cooldowns": True,
+                  "retry_policy": {
+                      "RateLimitErrorRetries": 6,
+                      "InternalServerErrorRetries": 4,
+                      "TimeoutErrorRetries": 3,
+                      "BadRequestErrorRetries": 0,
+                      "AuthenticationErrorRetries": 0,
+                      "ContentPolicyViolationErrorRetries": 0,
+                  },
+              }
+          )
+          cfg["router_settings"] = router_settings
+
+          cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+          print(
+              "Configured LiteLLM proxy retry policy:",
+              json.dumps(
+                  {
+                      "litellm_settings": {
+                          "num_retries": litellm_settings["num_retries"],
+                          "request_timeout": litellm_settings["request_timeout"],
+                      },
+                      "router_settings": router_settings,
+                  },
+                  sort_keys=True,
+              ),
+          )
+          PY
+          popd >/dev/null
           bash "$RUNNER_TEMP/ple_kit/kit/model_proxy/start.sh" >"$RUNNER_TEMP/model_proxy.log" 2>&1 &
           PROXY_PID=$!
           echo "PROXY_PID=$PROXY_PID" >> "$GITHUB_ENV"
