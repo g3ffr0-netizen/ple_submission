@@ -152,7 +152,7 @@ class ServeProtocolV1ContractTests(unittest.TestCase):
         cfg_path = Path(__file__).resolve().parent / "submission.yaml"
         data = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
         self.assertEqual(data["name"], "ple-submission")
-        self.assertEqual(data["model_api"], "google-cloud/gemini-3.8-flash")
+        self.assertEqual(data["model_api"], "google-cloud/gemini-4-argon")
         self.assertTrue(
             set(data.keys()).issubset({"name", "model_api", "model_base_url", "install", "serve", "env"})
         )

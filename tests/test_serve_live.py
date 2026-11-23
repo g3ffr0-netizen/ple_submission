@@ -9,7 +9,10 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -474,7 +477,7 @@ class TestPLEAlignmentUnitContracts(unittest.TestCase):
             clear=False,
         ):
             rt3 = serve.resolve_runtime_config(cfg_path)
-            self.assertEqual(rt3["model"], "gemini-3.8-flash")
+            self.assertEqual(rt3["model"], "gemini-4-argon")
             self.assertEqual(
                 rt3["base_url"],
                 "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -1025,6 +1028,456 @@ class TestPLEAlignmentUnitContracts(unittest.TestCase):
             self.assertIn("[URGENT: only 1 tool turn(s) left", client.seen_tool_outputs[7])
 
         asyncio.run(_scenario())
+
+    def test_truncated_verifier_never_passes_and_forces_fix_round(self):
+        class _ScriptedSession:
+            instruction = "Produce /app/deliverable.txt"
+            workdir = "/app"
+            mcp_servers: List[Dict[str, Any]] = []
+            limits = {"exec_timeout_sec": 60}
+
+            def __init__(self) -> None:
+                self.files: Dict[str, bytes] = {}
+                self.logs: List[str] = []
+                self.usages: List[tuple] = []
+                self.final_message = ""
+                self.cancelled = asyncio.Event()
+
+            def time_left(self) -> float:
+                return 3600.0
+
+            async def exec(self, command: str, timeout_sec: int = 120) -> Dict[str, Any]:
+                return {"exit_code": 0, "output": "", "truncated": False}
+
+            async def read_file(self, path: str) -> bytes:
+                if path not in self.files:
+                    raise taskbridge.TaskError(f"missing {path}")
+                return self.files[path]
+
+            async def write_file(self, path: str, data: Any, append: bool = False) -> int:
+                raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+                self.files[path] = (self.files.get(path, b"") + raw) if append else raw
+                return len(raw)
+
+            async def log(self, text: str) -> None:
+                self.logs.append(text)
+
+            async def usage(self, model: str, inp: int, out: int, cached: int = 0) -> None:
+                self.usages.append((model, inp, out, cached))
+
+        class _TruncatingVerifierClient:
+            def __init__(self) -> None:
+                self.verify_round = 0
+                self.verify_turns = 0
+                self.saw_verifier_wrap_up = False
+                self.fix_rounds = 0
+                self.chat = self
+                self.completions = self
+
+            async def create(self, **kwargs: Any) -> serve._DryRunObject:
+                msgs = kwargs["messages"]
+                sys_msg = str(msgs[0].get("content") or "")
+                user_texts = [
+                    str(m.get("content") or "")
+                    for m in msgs
+                    if m.get("role") == "user" and isinstance(m.get("content"), str)
+                ]
+                tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+
+                def _reply(content: Optional[str], calls: Optional[List[Dict[str, Any]]] = None) -> serve._DryRunObject:
+                    msg: Dict[str, Any] = {"role": "assistant", "content": content}
+                    if calls:
+                        msg["tool_calls"] = calls
+                    return serve._DryRunObject(
+                        {
+                            "choices": [{"finish_reason": "stop", "message": msg}],
+                            "usage": {"prompt_tokens": 5, "completion_tokens": 5},
+                        }
+                    )
+
+                if sys_msg.startswith("You plan an engineering task"):
+                    return _reply("Plan: write /app/deliverable.txt")
+
+                if sys_msg.startswith("You check an engineer's work"):
+                    last_user = user_texts[-1] if user_texts else ""
+                    if serve.VERIFIER_WRAP_UP["content"] in last_user:
+                        self.saw_verifier_wrap_up = True
+                        # Reproduce premature max_turns PASS bug: solve() MUST reject this!
+                        return _reply("PASS")
+                    if not tool_msgs:
+                        self.verify_round += 1
+                        self.verify_turns = 0
+                    self.verify_turns += 1
+                    if self.verify_round == 1:
+                        return _reply(
+                            None,
+                            [
+                                {
+                                    "id": f"v_r1_{self.verify_turns}",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps({"path": "/app/deliverable.txt"}),
+                                    },
+                                }
+                            ],
+                        )
+                    if self.verify_turns == 1:
+                        return _reply(
+                            None,
+                            [
+                                {
+                                    "id": "v_r2_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "read_file",
+                                        "arguments": json.dumps({"path": "/app/deliverable.txt"}),
+                                    },
+                                }
+                            ],
+                        )
+                    return _reply("PASS")
+
+                # Worker or Fix round
+                in_fix = any("A reviewer checked your files" in t for t in user_texts)
+                if in_fix:
+                    last_gap = next(
+                        (t for t in reversed(user_texts) if "A reviewer checked your files" in t),
+                        "",
+                    )
+                    if not any(
+                        m.get("role") == "assistant"
+                        and any(
+                            c.get("id") == "fix_write_1"
+                            for c in (m.get("tool_calls") or [])
+                            if isinstance(c, dict)
+                        )
+                        for m in msgs
+                    ):
+                        self.fix_rounds += 1
+                        assert "out of turns/time" in last_gap
+                        return _reply(
+                            None,
+                            [
+                                {
+                                    "id": "fix_write_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "write_file",
+                                        "arguments": json.dumps(
+                                            {"path": "/app/deliverable.txt", "content": "FIXED"}
+                                        ),
+                                    },
+                                }
+                            ],
+                        )
+                    return _reply("Updated /app/deliverable.txt cleanly.")
+
+                if not tool_msgs:
+                    return _reply(
+                        None,
+                        [
+                            {
+                                "id": "work_write_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": json.dumps(
+                                        {"path": "/app/deliverable.txt", "content": "INITIAL"}
+                                    ),
+                                },
+                            }
+                        ],
+                    )
+                return _reply("Wrote /app/deliverable.txt")
+
+        async def _scenario() -> None:
+            sess = _ScriptedSession()
+            client = _TruncatingVerifierClient()
+            with patch.dict(
+                os.environ,
+                {
+                    "MODEL_NAME": "gemini-4-argon",
+                    "OPENAI_BASE_URL": "http://proxy.local/v1",
+                    "OPENAI_API_KEY": "test-key",
+                    "MAX_FIX_ROUNDS": "2",
+                    "MAX_PLAN_TURNS": "3",
+                    "MAX_WORK_TURNS": "5",
+                    "MAX_VERIFY_TURNS": "3",
+                    "MAX_FIX_TURNS": "5",
+                },
+                clear=False,
+            ):
+                answer = await serve.solve(
+                    sess,  # type: ignore[arg-type]
+                    client=client,
+                    config_path=str(REPO_ROOT / "submission.yaml"),
+                )
+            self.assertEqual(answer, "Updated /app/deliverable.txt cleanly.")
+            self.assertEqual(sess.files.get("/app/deliverable.txt"), b"FIXED")
+            self.assertEqual(client.verify_round, 2)
+            self.assertEqual(client.fix_rounds, 1)
+            self.assertTrue(client.saw_verifier_wrap_up)
+            self.assertTrue(any("verifier: truncated=True" in entry for entry in sess.logs))
+
+        asyncio.run(_scenario())
+
+    def test_programmatic_audit_detects_csv_shift_and_road_building_crossing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            workdir = tmp_path / "work"
+            pkgdir = tmp_path / "fake_pkgs"
+            workdir.mkdir()
+            (pkgdir / "ifcopenshell").mkdir(parents=True)
+
+            # 1. CSV with shifted row, missing register ID, and #REF! error token + invalid JSON
+            (workdir / "devices.csv").write_text(
+                "device_id,register,value\n"
+                "DEV1,40001,10,EXTRA_SHIFT\n"
+                "DEV2,,20\n"
+                "DEV3,40003,#REF!\n",
+                encoding="utf-8",
+            )
+            (workdir / "bad.json").write_text('{"x": NaN}', encoding="utf-8")
+            (workdir / "site.ifc").write_text("ISO-10303-21;END-ISO-10303-21;", encoding="utf-8")
+
+            # Minimal fake ifcopenshell package (with ifcopenshell.geom submodule)
+            fake_ifc = textwrap.dedent(
+                """
+                class _Entity:
+                    def __init__(self, eid, cls, gid=None, name="", obj_type="", repr_=True):
+                        self._eid = eid
+                        self._cls = cls
+                        self.GlobalId = gid or f"G_{eid}"
+                        self.Name = name
+                        self.ObjectType = obj_type
+                        self.Representation = repr_
+                        self.IsDecomposedBy = []
+                        self.ContainsElements = []
+                    def id(self):
+                        return self._eid
+                    def is_a(self, target=None):
+                        return self._cls == target if target else self._cls
+                    def __str__(self):
+                        return f"#{self._eid}={self._cls}"
+
+                class _LineIdx:
+                    def __init__(self, idxs):
+                        self._idxs = idxs
+                    def is_a(self, target=None):
+                        return target == "IfcLineIndex"
+                    def __getitem__(self, item):
+                        return self._idxs
+
+                class _PolyCurve(_Entity):
+                    def __init__(self):
+                        super().__init__(99, "IfcIndexedPolyCurve", repr_=False)
+                        self.Points = type("_Pts", (), {"CoordList": [(0, 0), (10, 0), (10, 10)]})()
+                        self.Segments = [_LineIdx((1, 2, 3, 1, 1))]
+
+                class _Model:
+                    def __init__(self):
+                        self.bldg = _Entity(1, "IfcBuilding", gid="BLDG_BRM", name="BRM", repr_=False)
+                        self.bldg_slab = _Entity(2, "IfcSlab", gid="SLAB_BRM", name="BRM_SLAB")
+                        self.bldg.ContainsElements = [type("_Rel", (), {"RelatedElements": [self.bldg_slab]})()]
+                        self.road = _Entity(3, "IfcCivilElement", gid="ROAD_1", name="ROAD_P1_1")
+                        self.curve = _PolyCurve()
+
+                    def by_type(self, name):
+                        if name == "IfcIndexedPolyCurve":
+                            return [self.curve]
+                        if name == "IfcBuilding":
+                            return [self.bldg]
+                        if name == "IfcProduct":
+                            return [self.bldg, self.bldg_slab, self.road]
+                        return []
+
+                def open(_path):
+                    return _Model()
+                """
+            ).lstrip()
+            fake_geom = textwrap.dedent(
+                """
+                class settings:
+                    USE_WORLD_COORDS = "use-world-coords"
+                    def set(self, k, v):
+                        pass
+
+                def create_shape(_settings, elem):
+                    def _box(x0, x1, y0, y1, z0, z1):
+                        verts = [
+                            x0, y0, z0, x1, y0, z0, x1, y1, z0, x0, y1, z0,
+                            x0, y0, z1, x1, y0, z1, x1, y1, z1, x0, y1, z1,
+                        ]
+                        faces = [
+                            0, 1, 2, 0, 2, 3,
+                            4, 5, 6, 4, 6, 7,
+                            0, 1, 5, 0, 5, 4,
+                            1, 2, 6, 1, 6, 5,
+                            2, 3, 7, 2, 7, 6,
+                            3, 0, 4, 3, 4, 7,
+                        ]
+                        return type("_Shape", (), {"geometry": type("_Geo", (), {"verts": verts, "faces": faces})()})()
+                    if elem.GlobalId == "SLAB_BRM":
+                        return _box(10.0, 20.0, 10.0, 20.0, 0.0, 5.0)
+                    if elem.GlobalId == "ROAD_1":
+                        return _box(0.0, 30.0, 12.0, 16.0, 0.0, 0.2)
+                    return None
+                """
+            ).lstrip()
+            (pkgdir / "ifcopenshell" / "__init__.py").write_text(fake_ifc, encoding="utf-8")
+            (pkgdir / "ifcopenshell" / "geom.py").write_text(fake_geom, encoding="utf-8")
+
+            env = dict(os.environ)
+            env["PYTHONPATH"] = str(pkgdir) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+            proc = subprocess.run(
+                [sys.executable, "-"],
+                input=serve._build_programmatic_audit_script(),
+                cwd=workdir,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            audit_line = next(
+                line for line in proc.stdout.splitlines() if line.startswith(serve.AUDIT_MARKER)
+            )
+            parsed = json.loads(audit_line[len(serve.AUDIT_MARKER):])
+            joined = "\n".join(parsed["errors"])
+            self.assertIn("shifted/malformed CSV columns", joined)
+            self.assertIn("missing/placeholder IDs", joined)
+            self.assertIn("invalid numeric/formula token '#REF!'", joined)
+            self.assertIn("invalid JSON or non-finite numeric literal", joined)
+            self.assertIn("consecutive duplicate IfcLineIndex index 1", joined)
+            self.assertIn("road 'ROAD_P1_1' intersects building 'BRM (site.ifc)'", joined)
+
+            # 2. Verify solve() refuses non-truncated VERIFIER PASS while audit errors exist, then passes after fix
+            (workdir / "bad.json").write_text('{"ok": true}', encoding="utf-8")
+            (workdir / "site.ifc").unlink()
+            clean_csv = "device_id,register,value\nDEV1,40001,10\nDEV2,40002,20\nTOTAL,,30\n"
+
+            class _AuditSession:
+                instruction = "Fix devices.csv"
+                mcp_servers: List[Dict[str, Any]] = []
+                limits = {"exec_timeout_sec": 60}
+
+                def __init__(self) -> None:
+                    self.workdir = str(workdir)
+                    self.logs: List[str] = []
+                    self.final_message = ""
+                    self.cancelled = asyncio.Event()
+
+                def time_left(self) -> float:
+                    return 3600.0
+
+                async def exec(self, command: str, timeout_sec: int = 120) -> Dict[str, Any]:
+                    is_audit = "__PLE_AUDIT__" in command
+                    res = subprocess.run(
+                        [sys.executable, "-"] if is_audit else ["cmd", "/c", command],
+                        input=serve._build_programmatic_audit_script() if is_audit else None,
+                        cwd=workdir,
+                        capture_output=True,
+                        text=True,
+                    )
+                    return {"exit_code": res.returncode, "output": res.stdout + res.stderr, "truncated": False}
+
+                async def write_file(self, path: str, data: Any, append: bool = False) -> int:
+                    target = workdir / Path(path.replace("\\", "/")).name
+                    raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+                    target.write_bytes((target.read_bytes() + raw) if append and target.exists() else raw)
+                    return len(raw)
+
+                async def read_file(self, path: str) -> bytes:
+                    return (workdir / Path(path.replace("\\", "/")).name).read_bytes()
+
+                async def log(self, text: str) -> None:
+                    self.logs.append(text)
+
+                async def usage(self, model: str, inp: int, out: int, cached: int = 0) -> None:
+                    pass
+
+            class _AuditClient:
+                def __init__(self) -> None:
+                    self.seen_audit_precheck = False
+                    self.fix_ran = False
+                    self.chat = self
+                    self.completions = self
+
+                async def create(self, **kwargs: Any) -> serve._DryRunObject:
+                    msgs = kwargs["messages"]
+                    sys_msg = str(msgs[0].get("content") or "")
+                    user_texts = [str(m.get("content") or "") for m in msgs if m.get("role") == "user"]
+                    if sys_msg.startswith("You plan an engineering task"):
+                        return serve._DryRunObject(
+                            {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Plan"}}]}
+                        )
+                    if sys_msg.startswith("You check an engineer's work"):
+                        if any("Programmatic Pre-Check" in t for t in user_texts):
+                            self.seen_audit_precheck = True
+                        # Always try to say PASS: audit error must block PASS on round 1!
+                        return serve._DryRunObject(
+                            {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "PASS"}}]}
+                        )
+                    if any("Programmatic Pre-Check ERRORS" in t for t in user_texts):
+                        if not self.fix_ran:
+                            self.fix_ran = True
+                            return serve._DryRunObject(
+                                {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "stop",
+                                            "message": {
+                                                "role": "assistant",
+                                                "content": None,
+                                                "tool_calls": [
+                                                    {
+                                                        "id": "fix_csv",
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": "write_file",
+                                                            "arguments": json.dumps(
+                                                                {
+                                                                    "path": "devices.csv",
+                                                                    "content": clean_csv,
+                                                                }
+                                                            ),
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        }
+                                    ]
+                                }
+                            )
+                        return serve._DryRunObject(
+                            {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Fixed CSV."}}]}
+                        )
+                    return serve._DryRunObject(
+                        {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Initial."}}]}
+                    )
+
+            async def _run_with_ref(client_obj: _AuditClient) -> str:
+                with patch.dict(
+                    os.environ,
+                    {
+                        "MODEL_NAME": "gemini-4-argon",
+                        "OPENAI_BASE_URL": "http://proxy.local/v1",
+                        "OPENAI_API_KEY": "test-key",
+                        "MAX_FIX_ROUNDS": "2",
+                    },
+                    clear=False,
+                ):
+                    return await serve.solve(
+                        _AuditSession(),  # type: ignore[arg-type]
+                        client=client_obj,
+                        config_path=str(REPO_ROOT / "submission.yaml"),
+                    )
+
+            audit_client = _AuditClient()
+            ans = asyncio.run(_run_with_ref(audit_client))
+            self.assertEqual(ans, "Fixed CSV.")
+            self.assertTrue(audit_client.seen_audit_precheck)
+            self.assertTrue(audit_client.fix_ran)
 
 
 if __name__ == "__main__":

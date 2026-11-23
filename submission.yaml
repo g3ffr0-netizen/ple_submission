@@ -1,5 +1,5 @@
 name: ple-submission
-model_api: google-cloud/gemini-3.8-flash
+model_api: google-cloud/gemini-4-argon
 install: >-
   uv venv --python 3.12 /opt/harness/venv
   && uv pip install --python /opt/harness/venv/bin/python -r {src}/requirements-serve.txt
@@ -10,7 +10,7 @@ env:
   MAX_FIX_ROUNDS: "2"
   MAX_FAILURES: "3"
   MAX_RETRIES: "3"
-  MAX_PLAN_TURNS: "12"
-  MAX_WORK_TURNS: "40"
-  MAX_VERIFY_TURNS: "15"
-  MAX_FIX_TURNS: "20"
+  MAX_PLAN_TURNS: "18"
+  MAX_WORK_TURNS: "55"
+  MAX_VERIFY_TURNS: "25"
+  MAX_FIX_TURNS: "30"

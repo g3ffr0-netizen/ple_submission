@@ -15,6 +15,7 @@ DEFAULT_MODEL = "gemini-3.8-flash"
 DEFAULT_FALLBACK_MODELS = [
     "gemini-4-argon",
     "gemini-3.1-pro-preview",
+    "gemini-3.8-flash",
 ]
 
 _CLOSED_FENCE_RE = re.compile(r"```([A-Za-z0-9_+-]*)[ \t]*\r?\n(.*?)```", re.DOTALL)

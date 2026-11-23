@@ -44,6 +44,15 @@ WRAP_UP = {
     "role": "user",
     "content": "Time is up for this step. Stop and reply with your answer.",
 }
+VERIFIER_WRAP_UP = {
+    "role": "user",
+    "content": (
+        "Time or turn budget is up for this verification step. Stop tool calls and "
+        "reply now: ONLY output PASS if you have ALREADY inspected every required "
+        "deliverable file on disk and verified every calculation/constraint; "
+        "otherwise list every unchecked item and every detected gap as a numbered list."
+    ),
+}
 RESULT_CHARS = 20_000
 MAX_IMAGE_BYTES = 5 << 20
 MAX_ACTIVE_IMAGES = 4
@@ -82,8 +91,11 @@ PLANNER = (
     "file. For PNG/JPEG/GIF/WEBP engineering drawings, schedules, or diagrams, "
     "call view_image instead of writing pixel/ASCII OCR scripts. Keep your "
     "inspection concise so you stay well within your turn budget, then reply "
-    "with the plan: each deliverable with its exact path and format, what it "
-    "must contain, the data and method to use, and how to check it."
+    "with the plan: each deliverable with its exact path and format, every hard "
+    "constraint / threshold / register or tag ID format, the data and method "
+    "to use, and concrete self-verification checks (for spreadsheets/CSVs: schema, "
+    "header/row alignment, non-null IDs, totals; for IFC/BIM models: schema "
+    "validation, coordinate clearances, and 3D solid clash/boundary checks)."
 )
 
 WORKER = (
@@ -97,24 +109,37 @@ WORKER = (
     "on tool outputs: never spend most of your budget exploring while leaving "
     "placeholder stubs untouched—write a working version of every required "
     "deliverable file on disk before half your turns are spent, then iterate "
-    "and verify. After any edit or fix, immediately regenerate and re-run "
-    "verification checks on the actual deliverable file before replying. When "
-    "done, reply without calling a tool: summarize each deliverable, its "
-    "exact path, and the verified results."
+    "and verify. Before replying: (1) programmatically verify every numerical "
+    "hard constraint, threshold, summation, and cross-table ID / register / tag "
+    "consistency (zero missing/shifted columns, zero NaN/N/A/TBD values or "
+    "formula errors); (2) if creating or modifying .ifc BIM deliverables, run "
+    "a Python validation script using ifcopenshell.validate plus 3D geometry / "
+    "clearance / solid-clash checks against existing elements and site "
+    "buildings/roads, and reroute or adjust elevations until zero unintentional "
+    "clashes or invalid boundary crossings remain. After any edit or fix, "
+    "immediately regenerate and re-run verification checks on the actual "
+    "deliverable file before replying. When done, reply without calling a tool: "
+    "summarize each deliverable, its exact path, and the verified results."
 )
 
 VERIFIER = (
     "You check an engineer's work on a task in a Linux container. You get the "
-    "task, the plan, and the engineer's summary of what was delivered. Open "
-    "and check every required deliverable with your tools (bash starts in "
-    "{workdir}; use view_image when inspecting images or rendered plots) "
-    "against the task: verify each deliverable file exists on disk, is NOT an "
-    "unmodified template/stub, reflects the latest script edits, matches the "
-    "exact path and format, includes every required element, and passes key "
-    "numerical and constraint checks recomputed directly from the file. Do "
-    "not create or change any file. If everything holds, reply with the "
-    "single word PASS and nothing else. Otherwise reply with a numbered list "
-    "of the gaps, each specific enough to fix."
+    "task, the plan, the engineer's summary of what was delivered, and an "
+    "automated Programmatic Pre-Check summary. Open and check every required "
+    "deliverable with your tools (bash starts in {workdir}; use view_image "
+    "when inspecting images or rendered plots) against the task: verify each "
+    "deliverable file exists on disk, is NOT an unmodified template/stub, "
+    "reflects the latest script edits, matches the exact path, headers, and "
+    "format, has no shifted CSV columns, formula errors, duplicate rows, or "
+    "missing/unpopulated register/device IDs, and satisfies every hard "
+    "constraint and tolerance recomputed directly from the file. For .ifc "
+    "deliverables, run Python geometry/schema/clash checks with ifcopenshell "
+    "(including 3D solid intersection, tray-to-busway clearance, and road vs. "
+    "building footprint non-intersection) rather than trusting the summary. "
+    "Do not create or change any file. If every requirement and pre-check passes "
+    "with zero errors, reply with the single word PASS and nothing else. "
+    "Otherwise reply with a numbered list of every gap, each specific enough "
+    "to fix."
 )
 
 
@@ -275,22 +300,22 @@ def resolve_runtime_config(config_path: str = "submission.yaml") -> Dict[str, An
     )
     max_plan_turns = _safe_int(
         os.environ.get("MAX_PLAN_TURNS") or env_cfg.get("MAX_PLAN_TURNS"),
-        default=12,
+        default=18,
         minimum=2,
     )
     max_work_turns = _safe_int(
         os.environ.get("MAX_WORK_TURNS") or env_cfg.get("MAX_WORK_TURNS"),
-        default=40,
+        default=55,
         minimum=2,
     )
     max_verify_turns = _safe_int(
         os.environ.get("MAX_VERIFY_TURNS") or env_cfg.get("MAX_VERIFY_TURNS"),
-        default=15,
+        default=25,
         minimum=2,
     )
     max_fix_turns = _safe_int(
         os.environ.get("MAX_FIX_TURNS") or env_cfg.get("MAX_FIX_TURNS"),
-        default=20,
+        default=30,
         minimum=2,
     )
     model_call_timeout_sec = _safe_int(
@@ -806,6 +831,8 @@ async def agent(
     breaker: Optional[CircuitBreaker] = None,
     final: bool = False,
     max_turns: Optional[int] = None,
+    wrap_up_message: Optional[Dict[str, Any]] = None,
+    run_state: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Run tool-calling loop on `messages` until the model produces a final reply."""
     model = runtime_cfg["model"]
@@ -816,6 +843,18 @@ async def agent(
         "effort": runtime_cfg.get("effort"),
     }
     tool_breaker = breaker or CircuitBreaker(max_failures=runtime_cfg.get("max_failures", 3))
+    active_wrap = dict(wrap_up_message or WRAP_UP)
+    wrap_up_injected = False
+    if run_state is not None:
+        run_state.clear()
+        run_state.update(
+            {
+                "turns": 0,
+                "turn_cap": False,
+                "time_cap": False,
+                "truncated": False,
+            }
+        )
 
     nudges, head, waits, turns = 0, "", iter(RETRY_WAITS), 0
     while True:
@@ -825,10 +864,15 @@ async def agent(
         time_cap = left is not None and left < until
         turn_cap = max_turns is not None and turns >= max_turns - 1
         wrap_up = time_cap or turn_cap
-        if wrap_up and messages[-1:] != [WRAP_UP]:
+        if wrap_up and not wrap_up_injected:
+            wrap_up_injected = True
+            if run_state is not None:
+                run_state["turn_cap"] = bool(turn_cap)
+                run_state["time_cap"] = bool(time_cap)
+                run_state["truncated"] = True
             if turn_cap and not time_cap:
                 await session.log(f"step reached max_turns={max_turns}; wrapping up")
-            messages.append(dict(WRAP_UP))
+            messages.append(dict(active_wrap))
 
         if left is None:
             timeout: Optional[float] = None
@@ -864,6 +908,8 @@ async def agent(
 
         waits = iter(RETRY_WAITS)
         turns += 1
+        if run_state is not None:
+            run_state["turns"] = turns
         if getattr(reply, "usage", None):
             usage = reply.usage
             details = getattr(usage, "prompt_tokens_details", None)
@@ -1202,6 +1248,984 @@ class _DryRunCompletionsNamespace:
         return await self._parent.create_completion(**kwargs)
 
 
+AUDIT_MARKER = "__PLE_AUDIT_JSON__:"
+
+_PROGRAMMATIC_AUDIT_SCRIPT = r'''
+import csv
+import json
+import math
+import os
+import re
+import time
+from pathlib import Path
+
+START_T = time.monotonic()
+SKIP_DIRS = {
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "node_modules",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    "dist",
+    "build",
+    "site-packages",
+}
+SKIP_JSON_NAMES = {"package.json", "package-lock.json", "tsconfig.json"}
+FORMULA_ERRORS = {
+    "#REF!",
+    "#NAME?",
+    "#VALUE!",
+    "#DIV/0!",
+    "#N/A",
+    "#NUM!",
+    "#NULL!",
+    "#SPILL!",
+    "#CALC!",
+}
+NAN_TOKENS = {"nan", "+nan", "-nan", "inf", "+inf", "-inf"}
+PLACEHOLDER_TOKENS = {"tbd", "todo", "placeholder", "fixme", "not_implemented", "fill_in", "<insert>"}
+MISSING_ID_TOKENS = {"", "none", "null", "na", "n/a", "nan", "tbd", "todo", "placeholder"}
+PRIMARY_ID_COLS = {
+    "id",
+    "row_id",
+    "device_id",
+    "register",
+    "register_id",
+    "modbus_register",
+    "bacnet_object",
+    "tag",
+    "tag_id",
+    "element_id",
+    "circuit_id",
+    "panel_id",
+    "breaker_id",
+    "equipment_id",
+    "point_id",
+    "asset_id",
+    "sensor_id",
+    "meter_id",
+}
+STRICT_ID_COLS = {"id", "device_id", "register", "register_id", "tag_id", "element_id"}
+ZERO_BYTE_EXTS = {".csv", ".tsv", ".xlsx", ".xlsm", ".json", ".ifc", ".pdf", ".docx"}
+NON_SOLID_CLASSES = {
+    "IfcSpace",
+    "IfcOpeningElement",
+    "IfcSite",
+    "IfcAnnotation",
+    "IfcGrid",
+    "IfcVirtualElement",
+}
+MEP_CLASSES = {
+    "IfcDistributionElement",
+    "IfcDistributionFlowElement",
+    "IfcFlowSegment",
+    "IfcFlowFitting",
+    "IfcFlowController",
+    "IfcFlowTerminal",
+    "IfcFlowMovingDevice",
+    "IfcFlowStorageDevice",
+    "IfcFlowTreatmentDevice",
+    "IfcEnergyConversionDevice",
+    "IfcCableCarrierSegment",
+    "IfcCableCarrierFitting",
+    "IfcCableSegment",
+    "IfcCableFitting",
+    "IfcPipeSegment",
+    "IfcPipeFitting",
+    "IfcDuctSegment",
+    "IfcDuctFitting",
+    "IfcDistributionControlElement",
+}
+ROAD_NAME_RE = re.compile(r"(?:^|[^a-z0-9])(road|roadway|driveway|access_road|street|pavement)", re.I)
+TRAY_RE = re.compile(r"tray", re.I)
+BUSWAY_RE = re.compile(r"(?:^|[^a-z0-9])(busway|bus_?duct|bus-duct|bus)(?:[^a-z0-9]|$)", re.I)
+MEP_NAME_RE = re.compile(r"(tray|busway|bus_?duct|conduit|pipe|duct|chilled|cable)", re.I)
+SUMMARY_ROW_RE = re.compile(
+    r"^(total|subtotal|grand\s+total|summary|sum|average|avg|mean|min|max|note|notes)\b",
+    re.I,
+)
+
+errors = []
+warnings = []
+root = Path.cwd()
+files = []
+for cur, dirs, names in os.walk(root):
+    dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
+    for name in sorted(names):
+        if name.startswith("."):
+            continue
+        p = Path(cur) / name
+        if p.is_file():
+            files.append(p)
+        if len(files) >= 600:
+            break
+    if len(files) >= 600:
+        break
+
+def _rel(p: Path) -> str:
+    try:
+        return p.relative_to(root).as_posix()
+    except Exception:
+        return str(p)
+
+def _norm_col(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(name or "").strip().lower()).strip("_")
+
+def _reject_const(token: str):
+    raise ValueError(f"non-finite JSON constant {token}")
+
+ifc_files = []
+for p in files:
+    rel = _rel(p)
+    ext = p.suffix.lower()
+    try:
+        size = p.stat().st_size
+    except OSError:
+        continue
+    if ext in ZERO_BYTE_EXTS and size == 0:
+        errors.append(f"{rel}: deliverable file is empty (0 bytes)")
+        continue
+    if ext == ".ifc":
+        ifc_files.append(p)
+        continue
+    if size > 25 * 1024 * 1024:
+        continue
+
+    if ext == ".csv":
+        try:
+            text = p.read_text(encoding="utf-8-sig", errors="replace")
+            if text.lstrip().startswith("```"):
+                errors.append(f"{rel}: CSV starts with markdown code fence")
+                continue
+            rows = list(csv.reader(text.splitlines()))
+        except Exception as exc:
+            errors.append(f"{rel}: CSV parse error: {exc}")
+            continue
+        if not rows:
+            errors.append(f"{rel}: empty CSV file")
+            continue
+        header = rows[0]
+        if not header or all(not str(c).strip() for c in header):
+            errors.append(f"{rel}: blank CSV header row")
+            continue
+        data_rows = [r for r in rows[1:] if any(str(c).strip() for c in r)]
+        bad_cols = [idx + 2 for idx, r in enumerate(rows[1:]) if r and len(r) != len(header)]
+        if bad_cols:
+            errors.append(
+                f"{rel}: shifted/malformed CSV columns on {len(bad_cols)} row(s) "
+                f"(first at row {bad_cols[0]}: expected {len(header)} cols)"
+            )
+        if not data_rows:
+            warnings.append(f"{rel}: CSV has header only (0 data rows)")
+            continue
+        valid_rows = [r for r in data_rows if len(r) == len(header)]
+        norm_headers = [_norm_col(h) for h in header]
+        seen_rows = set()
+        dup_row_count = 0
+        for r_idx, r in enumerate(valid_rows, start=2):
+            row_key = tuple(c.strip() for c in r)
+            if row_key in seen_rows:
+                dup_row_count += 1
+            else:
+                seen_rows.add(row_key)
+            for c_idx, cell in enumerate(r):
+                tok = cell.strip()
+                if tok.upper() in FORMULA_ERRORS or tok.lower() in NAN_TOKENS:
+                    errors.append(
+                        f"{rel}: invalid numeric/formula token {tok!r} at row {r_idx}, col {header[c_idx]!r}"
+                    )
+                    break
+        if dup_row_count:
+            warnings.append(f"{rel}: {dup_row_count} exact duplicate data row(s)")
+        id_rows = []
+        for r in valid_rows:
+            first_nonempty = next((c.strip() for c in r if c.strip()), "")
+            if first_nonempty and SUMMARY_ROW_RE.match(first_nonempty):
+                continue
+            id_rows.append(r)
+        if id_rows:
+            for c_idx, nh in enumerate(norm_headers):
+                if nh not in PRIMARY_ID_COLS:
+                    continue
+                vals = [r[c_idx].strip() for r in id_rows]
+                missing = [i + 2 for i, v in enumerate(vals) if v.lower() in MISSING_ID_TOKENS]
+                has_placeholder = any(vals[i - 2].lower() in PLACEHOLDER_TOKENS for i in missing)
+                if missing and (len(missing) < len(vals) or has_placeholder or nh in STRICT_ID_COLS):
+                    errors.append(
+                        f"{rel}: column {header[c_idx]!r} has missing/placeholder IDs on {len(missing)}/{len(vals)} non-summary row(s) "
+                        f"(first at row {missing[0]})"
+                    )
+
+    elif ext in {".xlsx", ".xlsm"}:
+        try:
+            import openpyxl
+        except ImportError:
+            openpyxl = None
+        if openpyxl is not None:
+            for data_only in (False, True):
+                wb = None
+                try:
+                    wb = openpyxl.load_workbook(p, read_only=True, data_only=data_only)
+                    for sname in wb.sheetnames:
+                        ws = wb[sname]
+                        for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+                            if r_idx > 20000:
+                                break
+                            for c_idx, val in enumerate(row, start=1):
+                                if val is None:
+                                    continue
+                                if isinstance(val, float) and not math.isfinite(val):
+                                    errors.append(f"{rel}[{sname}] R{r_idx}C{c_idx}: non-finite float {val}")
+                                elif isinstance(val, str):
+                                    s = val.strip()
+                                    if s.upper() in FORMULA_ERRORS or s.lower() in NAN_TOKENS:
+                                        errors.append(f"{rel}[{sname}] R{r_idx}C{c_idx}: Excel error/NaN token {s!r}")
+                except Exception as exc:
+                    errors.append(f"{rel}: failed reading workbook (data_only={data_only}): {exc}")
+                finally:
+                    if wb is not None:
+                        try:
+                            wb.close()
+                        except Exception:
+                            pass
+
+    elif ext == ".json" and p.name.lower() not in SKIP_JSON_NAMES:
+        try:
+            parsed = json.loads(p.read_text(encoding="utf-8", errors="strict"), parse_constant=_reject_const)
+            stack = [parsed]
+            seen_nodes = 0
+            while stack and seen_nodes < 10000:
+                cur_val = stack.pop()
+                seen_nodes += 1
+                if isinstance(cur_val, dict):
+                    stack.extend(cur_val.values())
+                elif isinstance(cur_val, list):
+                    stack.extend(cur_val)
+                elif isinstance(cur_val, float) and not math.isfinite(cur_val):
+                    errors.append(f"{rel}: non-finite float in JSON")
+                    break
+                elif isinstance(cur_val, str) and cur_val.strip().upper() in FORMULA_ERRORS:
+                    errors.append(f"{rel}: spreadsheet error string {cur_val!r} in JSON")
+                    break
+        except Exception as exc:
+            errors.append(f"{rel}: invalid JSON or non-finite numeric literal: {exc}")
+
+# 2. Pure-Python 2D/3D geometry helpers for IFC site and MEP clash checks
+def _aabb_of(verts):
+    xs = [v[0] for v in verts]
+    ys = [v[1] for v in verts]
+    zs = [v[2] for v in verts]
+    return (min(xs), min(ys), min(zs), max(xs), max(ys), max(zs))
+
+def _aabb_overlap(a, b, tol=0.0):
+    return (
+        min(a[3], b[3]) - max(a[0], b[0]) > tol
+        and min(a[4], b[4]) - max(a[1], b[1]) > tol
+        and min(a[5], b[5]) - max(a[2], b[2]) > tol
+    )
+
+def _aabb_dist(a, b):
+    dx = max(0.0, a[0] - b[3], b[0] - a[3])
+    dy = max(0.0, a[1] - b[4], b[1] - a[4])
+    dz = max(0.0, a[2] - b[5], b[2] - a[5])
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+def _poly_area2d(poly):
+    if len(poly) < 3:
+        return 0.0
+    s = 0.0
+    for i in range(len(poly)):
+        x1, y1 = poly[i]
+        x2, y2 = poly[(i + 1) % len(poly)]
+        s += x1 * y2 - x2 * y1
+    return abs(s) * 0.5
+
+def _clip_poly2d(subject, clip):
+    def _ensure_ccw(pts):
+        s = 0.0
+        for i in range(len(pts)):
+            x1, y1 = pts[i]
+            x2, y2 = pts[(i + 1) % len(pts)]
+            s += (x2 - x1) * (y2 + y1)
+        return list(reversed(pts)) if s > 0 else list(pts)
+
+    def _inside(p, cx1, cy1, cx2, cy2):
+        return (cx2 - cx1) * (p[1] - cy1) - (cy2 - cy1) * (p[0] - cx1) >= -1e-12
+
+    def _inter(p1, p2, cx1, cy1, cx2, cy2):
+        dcx, dcy = cx2 - cx1, cy2 - cy1
+        dpx, dpy = p2[0] - p1[0], p2[1] - p1[1]
+        den = dcx * dpy - dcy * dpx
+        if abs(den) < 1e-15:
+            return p2
+        n1 = dcx * (p1[1] - cy1) - dcy * (p1[0] - cx1)
+        t = -n1 / den
+        return (p1[0] + t * dpx, p1[1] + t * dpy)
+
+    clip_ccw = _ensure_ccw(clip)
+    out = list(subject)
+    for i in range(len(clip_ccw)):
+        cx1, cy1 = clip_ccw[i]
+        cx2, cy2 = clip_ccw[(i + 1) % len(clip_ccw)]
+        if not out:
+            break
+        inp = out
+        out = []
+        s = inp[-1]
+        for e in inp:
+            if _inside(e, cx1, cy1, cx2, cy2):
+                if not _inside(s, cx1, cy1, cx2, cy2):
+                    out.append(_inter(s, e, cx1, cy1, cx2, cy2))
+                out.append(e)
+            elif _inside(s, cx1, cy1, cx2, cy2):
+                out.append(_inter(s, e, cx1, cy1, cx2, cy2))
+            s = e
+    return out
+
+def _footprint_overlap_area(tris_a, tris_b, shap):
+    if shap is not None:
+        Poly, u_union = shap
+        pa = []
+        for t in tris_a:
+            p = Poly([(t[0][0], t[0][1]), (t[1][0], t[1][1]), (t[2][0], t[2][1])])
+            if p.area > 1e-7:
+                pa.append(p.buffer(0))
+        pb = []
+        for t in tris_b:
+            p = Poly([(t[0][0], t[0][1]), (t[1][0], t[1][1]), (t[2][0], t[2][1])])
+            if p.area > 1e-7:
+                pb.append(p.buffer(0))
+        if not pa or not pb:
+            return 0.0
+        return float(u_union(pa).intersection(u_union(pb)).area)
+    total = 0.0
+    for ta in tris_a:
+        ta2 = [(p[0], p[1]) for p in ta]
+        if _poly_area2d(ta2) <= 1e-7:
+            continue
+        ax0, ax1 = min(p[0] for p in ta2), max(p[0] for p in ta2)
+        ay0, ay1 = min(p[1] for p in ta2), max(p[1] for p in ta2)
+        for tb in tris_b:
+            tb2 = [(p[0], p[1]) for p in tb]
+            if _poly_area2d(tb2) <= 1e-7:
+                continue
+            if ax1 < min(p[0] for p in tb2) or max(p[0] for p in tb2) < ax0:
+                continue
+            if ay1 < min(p[1] for p in tb2) or max(p[1] for p in tb2) < ay0:
+                continue
+            clipped = _clip_poly2d(ta2, tb2)
+            total += _poly_area2d(clipped)
+    return total
+
+def _sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+def _add(a, b):
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+def _scale(a, s):
+    return (a[0] * s, a[1] * s, a[2] * s)
+
+def _dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+def _cross(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+def _pt_tri_dist_sq(p, tri):
+    a, b, c = tri
+    ab = _sub(b, a)
+    ac = _sub(c, a)
+    ap = _sub(p, a)
+    d1, d2 = _dot(ab, ap), _dot(ac, ap)
+    if d1 <= 0.0 and d2 <= 0.0:
+        return _dot(ap, ap)
+    bp = _sub(p, b)
+    d3, d4 = _dot(ab, bp), _dot(ac, bp)
+    if d3 >= 0.0 and d4 <= d3:
+        return _dot(bp, bp)
+    vc = d1 * d4 - d3 * d2
+    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+        v = d1 / (d1 - d3)
+        q = _add(a, _scale(ab, v))
+        d = _sub(p, q)
+        return _dot(d, d)
+    cp = _sub(p, c)
+    d5, d6 = _dot(ab, cp), _dot(ac, cp)
+    if d6 >= 0.0 and d5 <= d6:
+        return _dot(cp, cp)
+    vb = d5 * d2 - d1 * d6
+    if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+        w = d2 / (d2 - d6)
+        q = _add(a, _scale(ac, w))
+        d = _sub(p, q)
+        return _dot(d, d)
+    va = d3 * d6 - d5 * d4
+    if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+        w = (d4 - d3) / ((d4 - d3) + (d5 - d6))
+        q = _add(b, _scale(_sub(c, b), w))
+        d = _sub(p, q)
+        return _dot(d, d)
+    denom = 1.0 / (va + vb + vc) if (va + vb + vc) > 1e-18 else 0.0
+    v, w = vb * denom, vc * denom
+    q = _add(a, _add(_scale(ab, v), _scale(ac, w)))
+    d = _sub(p, q)
+    return _dot(d, d)
+
+def _seg_seg_dist(p1, q1, p2, q2):
+    d1 = _sub(q1, p1)
+    d2 = _sub(q2, p2)
+    r = _sub(p1, p2)
+    a = _dot(d1, d1)
+    e = _dot(d2, d2)
+    f = _dot(d2, r)
+    if a <= 1e-18 and e <= 1e-18:
+        return math.sqrt(_dot(r, r))
+    if a <= 1e-18:
+        s = 0.0
+        t = min(1.0, max(0.0, f / e))
+    else:
+        c = _dot(d1, r)
+        if e <= 1e-18:
+            t = 0.0
+            s = min(1.0, max(0.0, -c / a))
+        else:
+            b = _dot(d1, d2)
+            denom = a * e - b * b
+            s = min(1.0, max(0.0, (b * f - c * e) / denom)) if abs(denom) > 1e-18 else 0.0
+            t = (b * s + f) / e
+            if t < 0.0:
+                t = 0.0
+                s = min(1.0, max(0.0, -c / a))
+            elif t > 1.0:
+                t = 1.0
+                s = min(1.0, max(0.0, (b - c) / a))
+    c1 = _add(p1, _scale(d1, s))
+    c2 = _add(p2, _scale(d2, t))
+    diff = _sub(c1, c2)
+    return math.sqrt(_dot(diff, diff))
+
+def _ray_hits_tri(orig, direction, tri):
+    a, b, c = tri
+    e1 = _sub(b, a)
+    e2 = _sub(c, a)
+    h = _cross(direction, e2)
+    det = _dot(e1, h)
+    if abs(det) < 1e-12:
+        return None
+    inv = 1.0 / det
+    s = _sub(orig, a)
+    u = inv * _dot(s, h)
+    if u < -1e-7 or u > 1.0 + 1e-7:
+        return None
+    q = _cross(s, e1)
+    v = inv * _dot(direction, q)
+    if v < -1e-7 or u + v > 1.0 + 1e-7:
+        return None
+    t = inv * _dot(e2, q)
+    return t if t > 1e-7 else None
+
+def _pt_strictly_inside_mesh(p, tris, tol=0.002):
+    for tri in tris:
+        if _pt_tri_dist_sq(p, tri) <= tol * tol:
+            return False
+    hits = 0
+    d_vec = (1.0, 1.37e-5, 2.71e-5)
+    for tri in tris:
+        t = _ray_hits_tri(p, d_vec, tri)
+        if t is not None:
+            hits += 1
+    return (hits % 2) == 1
+
+def _seg_tri_param(p0, p1, tri):
+    direction = _sub(p1, p0)
+    a, b, c = tri
+    e1 = _sub(b, a)
+    e2 = _sub(c, a)
+    h = _cross(direction, e2)
+    det = _dot(e1, h)
+    if abs(det) < 1e-12:
+        return None
+    inv = 1.0 / det
+    s = _sub(p0, a)
+    u = inv * _dot(s, h)
+    if u < -1e-6 or u > 1.0 + 1e-6:
+        return None
+    q = _cross(s, e1)
+    v = inv * _dot(direction, q)
+    if v < -1e-6 or u + v > 1.0 + 1e-6:
+        return None
+    t = inv * _dot(e2, q)
+    return t if 0.0 <= t <= 1.0 else None
+
+def _meshes_clash_gt_2mm(elem_a, elem_b, tol=0.002):
+    ia = _aabb_overlap(elem_a["aabb"], elem_b["aabb"], tol=tol)
+    if not ia:
+        return False
+    ix0 = max(elem_a["aabb"][0], elem_b["aabb"][0]) - 0.01
+    iy0 = max(elem_a["aabb"][1], elem_b["aabb"][1]) - 0.01
+    iz0 = max(elem_a["aabb"][2], elem_b["aabb"][2]) - 0.01
+    ix1 = min(elem_a["aabb"][3], elem_b["aabb"][3]) + 0.01
+    iy1 = min(elem_a["aabb"][4], elem_b["aabb"][4]) + 0.01
+    iz1 = min(elem_a["aabb"][5], elem_b["aabb"][5]) + 0.01
+    def _filter_tris(tris):
+        kept = []
+        for t in tris:
+            if (
+                max(t[0][0], t[1][0], t[2][0]) >= ix0 and min(t[0][0], t[1][0], t[2][0]) <= ix1
+                and max(t[0][1], t[1][1], t[2][1]) >= iy0 and min(t[0][1], t[1][1], t[2][1]) <= iy1
+                and max(t[0][2], t[1][2], t[2][2]) >= iz0 and min(t[0][2], t[1][2], t[2][2]) <= iz1
+            ):
+                kept.append(t)
+        return kept
+    ta = _filter_tris(elem_a["tris"])
+    tb = _filter_tris(elem_b["tris"])
+    if not ta or not tb:
+        return False
+    for p in elem_a["verts"]:
+        if ix0 <= p[0] <= ix1 and iy0 <= p[1] <= iy1 and iz0 <= p[2] <= iz1:
+            if _pt_strictly_inside_mesh(p, elem_b["tris"], tol=tol):
+                return True
+    for p in elem_b["verts"]:
+        if ix0 <= p[0] <= ix1 and iy0 <= p[1] <= iy1 and iz0 <= p[2] <= iz1:
+            if _pt_strictly_inside_mesh(p, elem_a["tris"], tol=tol):
+                return True
+    for src_edges, dst_tris, dst_all in (
+        (elem_a["edges"], tb, elem_b["tris"]),
+        (elem_b["edges"], ta, elem_a["tris"]),
+    ):
+        for p0, p1 in src_edges:
+            if max(p0[0], p1[0]) < ix0 or min(p0[0], p1[0]) > ix1:
+                continue
+            if max(p0[1], p1[1]) < iy0 or min(p0[1], p1[1]) > iy1:
+                continue
+            if max(p0[2], p1[2]) < iz0 or min(p0[2], p1[2]) > iz1:
+                continue
+            ts = sorted(t for tri in dst_tris for t in [_seg_tri_param(p0, p1, tri)] if t is not None)
+            pts = [0.0] + ts + [1.0]
+            for k in range(len(pts) - 1):
+                if pts[k + 1] - pts[k] <= 1e-6:
+                    continue
+                tm = 0.5 * (pts[k] + pts[k + 1])
+                pm = (
+                    p0[0] + tm * (p1[0] - p0[0]),
+                    p0[1] + tm * (p1[1] - p0[1]),
+                    p0[2] + tm * (p1[2] - p0[2]),
+                )
+                if _pt_strictly_inside_mesh(pm, dst_all, tol=tol):
+                    return True
+    return False
+
+def _mesh_clearance(elem_a, elem_b):
+    best = _aabb_dist(elem_a["aabb"], elem_b["aabb"])
+    if best >= 0.35:
+        return best
+    pad = 0.35
+    ba = elem_a["aabb"]
+    bb = elem_b["aabb"]
+
+    def _pt_near(p, box):
+        return (
+            box[0] - pad <= p[0] <= box[3] + pad
+            and box[1] - pad <= p[1] <= box[4] + pad
+            and box[2] - pad <= p[2] <= box[5] + pad
+        )
+
+    def _seg_near(p, q, box):
+        return (
+            max(p[0], q[0]) >= box[0] - pad and min(p[0], q[0]) <= box[3] + pad
+            and max(p[1], q[1]) >= box[1] - pad and min(p[1], q[1]) <= box[4] + pad
+            and max(p[2], q[2]) >= box[2] - pad and min(p[2], q[2]) <= box[5] + pad
+        )
+
+    def _tri_near(t, box):
+        return (
+            max(t[0][0], t[1][0], t[2][0]) >= box[0] - pad and min(t[0][0], t[1][0], t[2][0]) <= box[3] + pad
+            and max(t[0][1], t[1][1], t[2][1]) >= box[1] - pad and min(t[0][1], t[1][1], t[2][1]) <= box[4] + pad
+            and max(t[0][2], t[1][2], t[2][2]) >= box[2] - pad and min(t[0][2], t[1][2], t[2][2]) <= box[5] + pad
+        )
+
+    va = [p for p in elem_a["verts"] if _pt_near(p, bb)]
+    vb = [p for p in elem_b["verts"] if _pt_near(p, ba)]
+    ta = [t for t in elem_a["tris"] if _tri_near(t, bb)]
+    tb = [t for t in elem_b["tris"] if _tri_near(t, ba)]
+    ea = [(p, q) for p, q in elem_a["edges"] if _seg_near(p, q, bb)]
+    eb = [(p, q) for p, q in elem_b["edges"] if _seg_near(p, q, ba)]
+
+    min_d = pad
+    for p in va:
+        for tri in tb:
+            d2 = _pt_tri_dist_sq(p, tri)
+            if d2 < min_d * min_d:
+                min_d = math.sqrt(d2)
+                if min_d < 0.299:
+                    return min_d
+    for p in vb:
+        for tri in ta:
+            d2 = _pt_tri_dist_sq(p, tri)
+            if d2 < min_d * min_d:
+                min_d = math.sqrt(d2)
+                if min_d < 0.299:
+                    return min_d
+    for p1, q1 in ea:
+        for p2, q2 in eb:
+            d = _seg_seg_dist(p1, q1, p2, q2)
+            if d < min_d:
+                min_d = d
+                if min_d < 0.299:
+                    return min_d
+    return min_d
+
+if ifc_files:
+    try:
+        import ifcopenshell
+        import ifcopenshell.geom
+    except ImportError:
+        ifcopenshell = None
+    try:
+        from shapely.geometry import Polygon as _ShapPoly
+        from shapely.ops import unary_union as _shap_union
+        _SHAP = (_ShapPoly, _shap_union)
+    except Exception:
+        _SHAP = None
+
+    if ifcopenshell is not None:
+        settings = ifcopenshell.geom.settings()
+        try:
+            settings.set("use-world-coords", True)
+        except Exception:
+            try:
+                settings.set(settings.USE_WORLD_COORDS, True)
+            except Exception:
+                pass
+
+        all_elems = []
+        building_groups = {}
+        connected_pairs = set()
+
+        for ifc_path in ifc_files:
+            rel = _rel(ifc_path)
+            try:
+                model = ifcopenshell.open(str(ifc_path))
+            except Exception as exc:
+                errors.append(f"{rel}: failed to open IFC: {exc}")
+                continue
+
+            # Optional schema validation reported cleanly as warning
+            try:
+                import ifcopenshell.validate as _ifc_val
+                _jlog = _ifc_val.json_logger()
+                _ifc_val.validate(model, _jlog)
+                _stmts = getattr(_jlog, "statements", None) or []
+                if _stmts:
+                    warnings.append(f"{rel}: ifcopenshell.validate reported {len(_stmts)} issue(s): {_stmts[0]}")
+            except Exception:
+                pass
+
+            # Polyline & IfcIndexedPolyCurve duplicate consecutive vertex/index check
+            try:
+                for pc in model.by_type("IfcIndexedPolyCurve"):
+                    pt_list = getattr(pc, "Points", None)
+                    n_pts = len(getattr(pt_list, "CoordList", []) or []) if pt_list else 0
+                    for seg in (getattr(pc, "Segments", None) or []):
+                        if seg.is_a("IfcLineIndex"):
+                            idxs = list(seg[0] or [])
+                            if len(idxs) < 2:
+                                errors.append(f"{rel}: {pc} has IfcLineIndex with < 2 indices")
+                                break
+                            for k in range(len(idxs)):
+                                if n_pts and (idxs[k] < 1 or idxs[k] > n_pts):
+                                    errors.append(f"{rel}: {pc} IfcLineIndex index {idxs[k]} out of bounds 1..{n_pts}")
+                                    break
+                                if k + 1 < len(idxs) and idxs[k] == idxs[k + 1]:
+                                    errors.append(f"{rel}: {pc} has consecutive duplicate IfcLineIndex index {idxs[k]}")
+                                    break
+                for pl in model.by_type("IfcPolyline"):
+                    pts = list(getattr(pl, "Points", None) or [])
+                    for k in range(len(pts) - 1):
+                        c1 = getattr(pts[k], "Coordinates", None)
+                        c2 = getattr(pts[k + 1], "Coordinates", None)
+                        if c1 and c2 and len(c1) == len(c2):
+                            if math.sqrt(sum((float(a) - float(b)) ** 2 for a, b in zip(c1, c2))) <= 1e-9:
+                                errors.append(f"{rel}: {pl} has zero-length consecutive duplicate point")
+                                break
+            except Exception as exc:
+                warnings.append(f"{rel}: polyline check skipped: {exc}")
+
+            # Connected pairs via IfcRelConnects* / IfcRelNests / IfcRelAggregates
+            def _port_owner(port):
+                for rn in getattr(port, "ContainedIn", []) or []:
+                    return getattr(rn, "RelatingObject", None)
+                for rn in getattr(port, "Nests", []) or []:
+                    return getattr(rn, "RelatingObject", None)
+                return None
+
+            try:
+                for rel_name in ("IfcRelConnectsElements", "IfcRelConnectsWithRealizingElements"):
+                    for r in model.by_type(rel_name):
+                        e1 = getattr(r, "RelatingElement", None)
+                        e2 = getattr(r, "RelatedElement", None)
+                        if e1 and e2 and getattr(e1, "GlobalId", None) and getattr(e2, "GlobalId", None):
+                            connected_pairs.add((rel, min(e1.GlobalId, e2.GlobalId), max(e1.GlobalId, e2.GlobalId)))
+                for r in model.by_type("IfcRelConnectsPorts"):
+                    p1 = getattr(r, "RelatingPort", None)
+                    p2 = getattr(r, "RelatedPort", None)
+                    o1 = _port_owner(p1) if p1 else None
+                    o2 = _port_owner(p2) if p2 else None
+                    if o1 and o2 and getattr(o1, "GlobalId", None) and getattr(o2, "GlobalId", None):
+                        connected_pairs.add((rel, min(o1.GlobalId, o2.GlobalId), max(o1.GlobalId, o2.GlobalId)))
+            except Exception:
+                pass
+
+            # Map element id -> building id
+            elem_to_bldg = {}
+            bldg_labels = {}
+            try:
+                for b in model.by_type("IfcBuilding"):
+                    bid = f"{rel}::{b.GlobalId}"
+                    bldg_labels[bid] = f"{b.Name or b.GlobalId} ({rel})"
+                    queue = [b]
+                    visited = set()
+                    while queue:
+                        node = queue.pop()
+                        if node.id() in visited:
+                            continue
+                        visited.add(node.id())
+                        elem_to_bldg[node.id()] = bid
+                        for agg in getattr(node, "IsDecomposedBy", []) or []:
+                            for child in getattr(agg, "RelatedObjects", []) or []:
+                                queue.append(child)
+                        for relc in getattr(node, "ContainsElements", []) or []:
+                            for child in getattr(relc, "RelatedElements", []) or []:
+                                queue.append(child)
+            except Exception:
+                pass
+
+            for prod in model.by_type("IfcProduct"):
+                if time.monotonic() - START_T > 25.0:
+                    warnings.append("IFC geometry check stopped early at 25s time budget")
+                    break
+                cls = prod.is_a()
+                if cls in NON_SOLID_CLASSES or cls in {"IfcBuildingStorey", "IfcSpatialZone"}:
+                    continue
+                if not getattr(prod, "Representation", None):
+                    continue
+                try:
+                    shape = ifcopenshell.geom.create_shape(settings, prod)
+                    raw_v = shape.geometry.verts
+                    raw_f = shape.geometry.faces
+                except Exception:
+                    continue
+                if not raw_v or not raw_f:
+                    continue
+                verts = [(float(raw_v[i]), float(raw_v[i + 1]), float(raw_v[i + 2])) for i in range(0, len(raw_v), 3)]
+                tris = [
+                    (verts[raw_f[i]], verts[raw_f[i + 1]], verts[raw_f[i + 2]])
+                    for i in range(0, len(raw_f), 3)
+                ]
+                edge_set = set()
+                for i in range(0, len(raw_f), 3):
+                    a, b, c = raw_f[i], raw_f[i + 1], raw_f[i + 2]
+                    for u, v in ((a, b), (b, c), (c, a)):
+                        edge_set.add((min(u, v), max(u, v)))
+                edges = [(verts[u], verts[v]) for u, v in edge_set]
+                name = str(getattr(prod, "Name", "") or "")
+                obj_t = str(getattr(prod, "ObjectType", "") or "")
+                gid = str(getattr(prod, "GlobalId", None) or prod.id())
+                bid = elem_to_bldg.get(prod.id())
+                rec = {
+                    "file": rel,
+                    "cls": cls,
+                    "gid": gid,
+                    "name": name or gid,
+                    "label": f"{cls} {name or gid}",
+                    "text": f"{cls} {name} {obj_t}",
+                    "bldg": bid,
+                    "bldg_label": bldg_labels.get(bid, bid) if bid else None,
+                    "verts": verts,
+                    "tris": tris,
+                    "edges": edges,
+                    "aabb": _aabb_of(verts),
+                }
+                all_elems.append(rec)
+                if bid and cls != "IfcBuilding":
+                    building_groups.setdefault(bid, []).append(rec)
+                elif cls == "IfcBuilding":
+                    building_groups.setdefault(bid or f"{rel}::{gid}", []).append(rec)
+
+        # Site checks: Road vs Building intersection & Building vs Building overlap
+        roads = [
+            e for e in all_elems
+            if e["cls"] in {"IfcRoad", "IfcRoadPart"}
+            or (e["bldg"] is None and ROAD_NAME_RE.search(e["text"]))
+        ]
+        bldg_aabbs = {}
+        for bid, elems in building_groups.items():
+            bldg_aabbs[bid] = (
+                min(e["aabb"][0] for e in elems),
+                min(e["aabb"][1] for e in elems),
+                min(e["aabb"][2] for e in elems),
+                max(e["aabb"][3] for e in elems),
+                max(e["aabb"][4] for e in elems),
+                max(e["aabb"][5] for e in elems),
+            )
+
+        for r in roads:
+            for bid, b_elems in building_groups.items():
+                ba = bldg_aabbs[bid]
+                ra = r["aabb"]
+                if min(ra[3], ba[3]) - max(ra[0], ba[0]) <= 0.05:
+                    continue
+                if min(ra[4], ba[4]) - max(ra[1], ba[1]) <= 0.05:
+                    continue
+                if ra[5] < ba[2] - 2.0 or ra[2] > ba[5] + 2.0:
+                    continue
+                b_tris = [t for e in b_elems for t in e["tris"]]
+                area = _footprint_overlap_area(r["tris"], b_tris, _SHAP)
+                if area > 0.05:
+                    bname = b_elems[0]["bldg_label"] or bid
+                    errors.append(
+                        f"{r['file']}: road {r['name']!r} intersects building {bname!r} footprint (area={area:.3f} m^2)"
+                    )
+
+        bids = sorted(building_groups)
+        for i in range(len(bids)):
+            for j in range(i + 1, len(bids)):
+                b1, b2 = bids[i], bids[j]
+                a1, a2 = bldg_aabbs[b1], bldg_aabbs[b2]
+                if not _aabb_overlap(a1, a2, tol=0.05):
+                    continue
+                t1 = [t for e in building_groups[b1] for t in e["tris"]]
+                t2 = [t for e in building_groups[b2] for t in e["tris"]]
+                area = _footprint_overlap_area(t1, t2, _SHAP)
+                if area > 0.05:
+                    l1 = building_groups[b1][0]["bldg_label"] or b1
+                    l2 = building_groups[b2][0]["bldg_label"] or b2
+                    errors.append(f"building overlap between {l1!r} and {l2!r} (area={area:.3f} m^2)")
+
+        # MEP solid clashes (> 2mm) and tray-to-busway separation (< 300mm)
+        def _is_mep(e):
+            return e["cls"] in MEP_CLASSES or (
+                e["cls"] in {"IfcBuildingElementProxy", "IfcCivilElement", "IfcProxy"}
+                and bool(MEP_NAME_RE.search(e["text"]))
+            )
+
+        mep_flags = [_is_mep(e) for e in all_elems]
+        if any(mep_flags):
+            clash_count = 0
+            for i in range(len(all_elems)):
+                if time.monotonic() - START_T > 30.0:
+                    warnings.append("MEP clash scan stopped at 30s time budget")
+                    break
+                ei = all_elems[i]
+                for j in range(i + 1, len(all_elems)):
+                    if not (mep_flags[i] or mep_flags[j]):
+                        continue
+                    ej = all_elems[j]
+                    if ei["file"] == ej["file"] and (ei["file"], min(ei["gid"], ej["gid"]), max(ei["gid"], ej["gid"])) in connected_pairs:
+                        continue
+                    if _aabb_overlap(ei["aabb"], ej["aabb"], tol=0.002) and _meshes_clash_gt_2mm(ei, ej, tol=0.002):
+                        clash_count += 1
+                        if clash_count <= 15:
+                            errors.append(
+                                f"MEP solid clash (>2mm): {ei['label']} ({ei['file']}) vs {ej['label']} ({ej['file']})"
+                            )
+                    # Check tray <-> busway 300mm separation
+                    ti = bool(TRAY_RE.search(ei["text"])) and not bool(BUSWAY_RE.search(ei["text"]))
+                    bj = bool(BUSWAY_RE.search(ej["text"]))
+                    tj = bool(TRAY_RE.search(ej["text"])) and not bool(BUSWAY_RE.search(ej["text"]))
+                    bi = bool(BUSWAY_RE.search(ei["text"]))
+                    if (ti and bj) or (tj and bi):
+                        tray_e, bus_e = (ei, ej) if (ti and bj) else (ej, ei)
+                        if _aabb_dist(tray_e["aabb"], bus_e["aabb"]) < 0.300:
+                            clr = _mesh_clearance(tray_e, bus_e)
+                            if clr < 0.299:
+                                errors.append(
+                                    f"tray-busway clearance {clr * 1000:.1f}mm < 300mm: {tray_e['label']} vs {bus_e['label']}"
+                                )
+                            elif clr < 0.300:
+                                warnings.append(
+                                    f"tray-busway borderline clearance {clr * 1000:.1f}mm (< 300mm): {tray_e['label']} vs {bus_e['label']}"
+                                )
+            if clash_count > 15:
+                errors.append(f"... plus {clash_count - 15} additional MEP solid clash(es)")
+
+print("__PLE_AUDIT_JSON__:" + json.dumps({"errors": errors[:30], "warnings": warnings[:30]}))
+'''
+
+
+def _build_programmatic_audit_script(task: str = "") -> str:
+    """Return a self-contained Python 3 audit script for task deliverables."""
+    _ = task
+    return _PROGRAMMATIC_AUDIT_SCRIPT
+
+
+async def run_programmatic_audit(
+    session: taskbridge.Session,
+    task: str = "",
+) -> Dict[str, Any]:
+    """Run deterministic CSV/XLSX/JSON/IFC checks in the task container before verification."""
+    empty: Dict[str, Any] = {"errors": [], "warnings": [], "summary": ""}
+    if getattr(session, "cancelled", None) and session.cancelled.is_set():
+        return empty
+    if not hasattr(session, "exec"):
+        return empty
+    script = _build_programmatic_audit_script(task)
+    cmd = (
+        "PY_BIN=$(command -v python3 || command -v python || true)\n"
+        'if [ -n "$PY_BIN" ]; then\n'
+        '  "$PY_BIN" - <<\'__PLE_AUDIT__\'\n'
+        f"{script}\n"
+        "__PLE_AUDIT__\n"
+        "fi\n"
+    )
+    try:
+        cap = _safe_int(
+            getattr(session, "limits", {}).get("exec_timeout_sec"),
+            default=600,
+            minimum=1,
+        )
+        res = await session.exec(cmd, timeout_sec=min(90, cap))
+    except (taskbridge.TaskError, KeyError, TypeError, ValueError, RuntimeError, OSError):
+        return empty
+    if getattr(session, "cancelled", None) and session.cancelled.is_set():
+        return empty
+
+    output = str((res or {}).get("output") or "")
+    for line in reversed(output.splitlines()):
+        if line.startswith(AUDIT_MARKER):
+            raw = line[len(AUDIT_MARKER):].strip()
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return empty
+            if not isinstance(parsed, dict):
+                return empty
+            errors = [str(x) for x in (parsed.get("errors") or []) if str(x).strip()]
+            warnings = [str(x) for x in (parsed.get("warnings") or []) if str(x).strip()]
+            lines: List[str] = []
+            if errors:
+                lines.append("ERRORS (must be fixed; cannot PASS while non-empty):")
+                lines.extend(f"- {e}" for e in errors[:20])
+            if warnings:
+                lines.append("WARNINGS (inspect carefully):")
+                lines.extend(f"- {w}" for w in warnings[:15])
+            return {
+                "errors": errors,
+                "warnings": warnings,
+                "summary": "\n".join(lines),
+            }
+    return empty
+
+
 async def solve(
     session: taskbridge.Session,
     *,
@@ -1241,7 +2265,7 @@ async def solve(
             runtime_cfg=runtime_cfg,
             mcp_registry=mcp_registry,
             breaker=breaker,
-            max_turns=runtime_cfg.get("max_plan_turns", 12),
+            max_turns=runtime_cfg.get("max_plan_turns", 18),
         )
         await session.log(f"plan: {plan[:1000]}")
 
@@ -1261,16 +2285,30 @@ async def solve(
             mcp_registry=mcp_registry,
             breaker=breaker,
             final=True,
-            max_turns=runtime_cfg.get("max_work_turns", 40),
+            max_turns=runtime_cfg.get("max_work_turns", 55),
         )
 
         max_fix_rounds = int(runtime_cfg.get("max_fix_rounds", 2))
+        audit = await run_programmatic_audit(session, task) if max_fix_rounds > 0 else {
+            "errors": [],
+            "warnings": [],
+            "summary": "",
+        }
+        if audit["errors"] or audit["warnings"]:
+            await session.log(
+                f"audit: errors={len(audit['errors'])} warnings={len(audit['warnings'])} "
+                f"{'; '.join(audit['errors'][:5])}"
+            )
+
         for _ in range(max_fix_rounds):
             if session.cancelled.is_set() or not _time_for(_until(CHECK_SHARE / 2)):
                 break
             review = (
                 f"## Task\n{task}\n\n## Plan\n{plan}\n\n## The engineer's summary\n{summary}"
             )
+            if audit["summary"]:
+                review += f"\n\n## Programmatic Pre-Check\n{audit['summary']}"
+            verify_state: Dict[str, Any] = {}
             verdict = await agent(
                 session,
                 conversation(VERIFIER, session, review, mcp_note=mcp_note),
@@ -1280,17 +2318,49 @@ async def solve(
                 runtime_cfg=runtime_cfg,
                 mcp_registry=mcp_registry,
                 breaker=breaker,
-                max_turns=runtime_cfg.get("max_verify_turns", 15),
+                max_turns=runtime_cfg.get("max_verify_turns", 25),
+                wrap_up_message=VERIFIER_WRAP_UP,
+                run_state=verify_state,
             )
-            await session.log(f"verifier: {verdict[:1000]}")
-            if not verdict.strip() or is_pass_verdict(verdict) or not _time_for(WRAP_UP_SEC):
+            verifier_truncated = bool(verify_state.get("truncated"))
+            audit_errors = list(audit.get("errors") or [])
+            clean_pass = (
+                bool(verdict.strip())
+                and is_pass_verdict(verdict)
+                and not verifier_truncated
+                and not audit_errors
+            )
+            await session.log(
+                f"verifier: truncated={verifier_truncated} audit_errors={len(audit_errors)} "
+                f"{verdict[:1000]}"
+            )
+            if clean_pass or not _time_for(WRAP_UP_SEC):
                 break
+            if not verdict.strip() and not verifier_truncated and not audit_errors:
+                break
+
+            gap_sections: List[str] = []
+            if audit_errors:
+                gap_sections.append(
+                    "Programmatic Pre-Check ERRORS (must fix):\n"
+                    + "\n".join(f"- {err}" for err in audit_errors[:20])
+                )
+            if verifier_truncated and (not verdict.strip() or is_pass_verdict(verdict)):
+                gap_sections.append(
+                    "Verifier ran out of turns/time before completing all checks; do NOT assume "
+                    "completion. Re-verify every hard constraint, register/ID alignment, file path, "
+                    "and BIM/IFC geometry clearance directly on disk."
+                )
+            elif verdict.strip() and not is_pass_verdict(verdict):
+                gap_sections.append(verdict)
+            gaps_text = "\n\n".join(gap_sections)
+
             work.append(
                 {
                     "role": "user",
                     "content": (
                         "A reviewer checked your files and found these gaps:\n"
-                        f"{verdict}\n\n"
+                        f"{gaps_text}\n\n"
                         "Fix them immediately by writing or updating and regenerating "
                         "every required deliverable file on disk, re-run verification "
                         "checks on the updated files before your turn budget runs out, "
@@ -1308,9 +2378,15 @@ async def solve(
                 mcp_registry=mcp_registry,
                 breaker=breaker,
                 final=True,
-                max_turns=runtime_cfg.get("max_fix_turns", 20),
+                max_turns=runtime_cfg.get("max_fix_turns", 30),
             )
             summary = updated or summary
+            audit = await run_programmatic_audit(session, task)
+            if audit["errors"] or audit["warnings"]:
+                await session.log(
+                    f"audit(post-fix): errors={len(audit['errors'])} warnings={len(audit['warnings'])} "
+                    f"{'; '.join(audit['errors'][:5])}"
+                )
 
         return summary or session.final_message
     except (taskbridge.Cancelled, asyncio.CancelledError):

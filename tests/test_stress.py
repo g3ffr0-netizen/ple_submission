@@ -140,12 +140,12 @@ class TestStressFallbackAndRetry(unittest.TestCase):
             max_failures=3,
         )
         expected_models = [
+            "gemini-4-argon",
+            "gemini-3.1-pro-preview",
             "gemini-3.8-flash",
-            "gemini-4-argon",
             "gemini-3.1-pro-preview",
-            "gemini-4-argon",
+            "gemini-3.8-flash",
             "gemini-3.1-pro-preview",
-            "gemini-4-argon",
         ]
         seen_models: List[str] = []
         seen_prompts: List[str] = []
@@ -457,7 +457,10 @@ class TestStressConfigAndEval(unittest.TestCase):
             empty_f.write_text("", encoding="utf-8")
             e_empty = HarnessExecutionEngine(config_path=str(empty_f))
             self.assertEqual(e_empty.model, DEFAULT_MODEL)
-            self.assertEqual(e_empty.fallback_models, DEFAULT_FALLBACK_MODELS)
+            self.assertEqual(
+                e_empty.fallback_models,
+                [m for m in DEFAULT_FALLBACK_MODELS if m != e_empty.model],
+            )
 
             bad_yaml = tmp / "bad.yaml"
             bad_yaml.write_text(
