@@ -844,7 +844,7 @@ class TestAdversarialHarnessStress(unittest.TestCase):
             self.assertIn("MEP touching/overlapping clash (<2mm gap", bad_errs)
             self.assertIn("MEP micro-clash (<1mm clearance or overlapping)", bad_errs)
             self.assertIn("intersects building 'BRM (site_mep.ifc)'", bad_errs)
-            self.assertIn("tray-stack vertical headroom 136.0mm < 300mm", bad_warns)
+            self.assertIn("tray-stack vertical headroom 136.0mm < 300mm", bad_errs)
             self.assertIn("overhead clear height 1890.0mm < 2600mm", bad_warns)
 
             clean_dir = tmp_path / "clean_ifc_dir"
@@ -926,6 +926,9 @@ class TestAdversarialHarnessStress(unittest.TestCase):
 
                     if sys_msg.startswith("You plan an engineering task"):
                         return _reply("Plan: validate schedule.csv.")
+
+                    if sys_msg.startswith("You extract strict engineering constraints"):
+                        return _reply(json.dumps({"source": "llm_extractor", "deliverables": ["schedule.csv"]}))
 
                     if sys_msg.startswith("You check an engineer's work"):
                         if not tool_msgs and len(user_texts) == 1:

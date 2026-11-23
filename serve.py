@@ -22,7 +22,7 @@ import posixpath
 import re
 import signal
 import sys
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import openai
 from websockets.asyncio.server import serve as _ws_serve
@@ -32,6 +32,7 @@ from harness import (
     CircuitBreaker,
     DEFAULT_MODEL,
     _safe_int,
+    extract_json_payload,
     is_pass_verdict,
     load_submission_config,
     normalize_model_name,
@@ -80,10 +81,17 @@ UNSUPPORTED = re.compile(
 CUT_KEEP = 1000
 MAX_NUDGES = 3
 PLAN_SHARE = 0.10
+EXTRACT_SHARE = 0.04
 CHECK_SHARE = 0.25
 MIN_STEP_SEC = 120
 DIRECT_MCP_CHARS = 40_000
 MAX_TOOLS = 128
+EXTRACTOR_WRAP_UP = {
+    "role": "user",
+    "content": (
+        "Emit CONSTRAINTS.json now as a single JSON object without calling another tool."
+    ),
+}
 
 PLANNER = (
     "You plan an engineering task that another engineer will carry out in a "
@@ -100,18 +108,38 @@ PLANNER = (
     "5-10 mm non-touching joint gaps, coordinate clearances, and boundary checks)."
 )
 
+EXTRACTOR = (
+    "You extract strict engineering constraints and verification requirements from a "
+    "task and its plan. Do not create or edit files or spend more than 2 tool turns "
+    "(working dir {workdir}); if the prompt and plan already supply the constraints, "
+    "reply immediately with a single valid JSON object representing CONSTRAINTS.json "
+    "containing keys: deliverables (exact file paths and external MCP targets), "
+    "hard_constraints ([h=1] rules, prohibitions, record-date vs contingent-action "
+    "distinctions, empty-set triggers), numeric_thresholds, iso_dates, entities, "
+    "and verification_checks. Output JSON only."
+)
+
 WORKER = (
     "You are an expert engineer working on a task in a Linux container with "
     "no internet access. Your tools act inside it, and bash starts in "
-    "{workdir}. A plan for the task follows it; use it, and correct it where "
-    "the files show it is wrong. For image files (drawings, schedules, plots), "
-    "use view_image rather than pixel/ASCII OCR scripts (if a sheet is dense, "
-    "crop/zoom regions to a PNG under /tmp and inspect with view_image). "
+    "{workdir}. A plan and Extracted Constraints (CONSTRAINTS.json) follow; "
+    "satisfy EVERY constraint in CONSTRAINTS.json strictly, and correct the "
+    "plan where the files show it is wrong. For image files (drawings, schedules, "
+    "plots), use view_image rather than pixel/ASCII OCR scripts (if a sheet is "
+    "dense, crop/zoom regions to a PNG under /tmp and inspect with view_image). "
     "Compute with code, not by hand. Watch the [Turn X/Y] pacing indicator "
     "on tool outputs: never spend most of your budget exploring while leaving "
     "placeholder stubs untouched—write a working version of every required "
     "deliverable file on disk before half your turns are spent, then iterate "
-    "and verify. Before replying: (1) programmatically verify every numerical "
+    "and verify. Separate record-date posture from contingent future actions "
+    "(if an output list asks what can be released/approved as of the record date "
+    "and any prerequisite is pending, explicitly state that list is empty / zero "
+    "and never list pending items under releasable headers). When writing tracking "
+    "comments, journals, or status notes to external stores (OpenProject, Wiki, etc.), "
+    "format per-entity lines unambiguously as `Entity: Final_Status` using only the "
+    "authoritative final state—never echo superseded/historical conflicting status "
+    "words (e.g., do not write 'pre-marked carried' on a 'NOT CARRIED' line). "
+    "Before replying: (1) programmatically verify every numerical "
     "hard constraint, threshold, summation, and cross-table ID / register / tag "
     "consistency (zero missing/shifted columns, zero NaN/N/A/TBD values or "
     "formula errors); (2) if creating or modifying .ifc BIM deliverables, run "
@@ -121,7 +149,9 @@ WORKER = (
     "0 mm touching faces as hard clashes, trim L-corners, T-junctions, and "
     "inline segment joints to leave clean 5-10 mm non-touching air gaps (well "
     "within connectivity joint tolerance such as 250 mm) so BVH reports zero "
-    "clashes while keeping full graph connectivity, and verify all code "
+    "clashes while EVERY service network forms 1 connected component (<= 250 mm), "
+    "do not tag detached termination/drop proxies (> 250 mm away) with parent "
+    "route service tags (`CT-*`, `BW-*`, `CHW-*`), and verify all code "
     "clearances from tessellated 3D geometry (tray-to-busway >= 300 mm, "
     "tray-stack/access headroom >= 300 mm above/below trays per TIA-569-B, "
     "overhead clear height >= 2600 mm AFF unless explicitly permitted, "
@@ -134,25 +164,31 @@ WORKER = (
 
 VERIFIER = (
     "You check an engineer's work on a task in a Linux container. You get the "
-    "task, the plan, the engineer's summary of what was delivered, and an "
-    "automated Programmatic Pre-Check summary. Open and check every required "
-    "deliverable with your tools (bash starts in {workdir}; use view_image "
-    "when inspecting images or rendered plots) against the task: verify each "
-    "deliverable file exists on disk, is NOT an unmodified template/stub, "
-    "reflects the latest script edits, matches the exact path, headers, and "
-    "format, has no shifted CSV columns, formula errors, duplicate rows, or "
-    "missing/unpopulated register/device IDs, and satisfies every hard "
-    "constraint and tolerance recomputed directly from the file. For .ifc "
-    "deliverables, run Python checks using ifcopenshell.geom.tree BVH across "
-    "ALL elements without exempting IfcRelConnects* or 0 mm butt-joints "
-    "(verify 5-10 mm non-touching gaps at L-corners/T-junctions/joints so "
-    "BVH clash count is 0 while connectivity holds) plus 3D clearances "
-    "(tray-to-busway >= 300 mm, tray-stack headroom >= 300 mm, overhead clear "
-    "height >= 2600 mm AFF, sprinkler >= 457 mm, PDU clear zones, road vs. "
-    "building non-intersection) rather than trusting the summary. Do not "
-    "create or change any file. If every requirement and pre-check passes with "
-    "zero errors, reply with the single word PASS and nothing else. Otherwise "
-    "reply with a numbered list of every gap, each specific enough to fix."
+    "task, the plan, Extracted Constraints (CONSTRAINTS.json), the engineer's "
+    "summary of what was delivered, and an automated Programmatic Pre-Check summary. "
+    "Open and check every required deliverable with your tools (bash starts in "
+    "{workdir}; use view_image when inspecting images or rendered plots) against "
+    "the task and CONSTRAINTS.json: verify each deliverable file exists on disk, "
+    "is NOT an unmodified template/stub, reflects the latest script edits, "
+    "matches the exact path, headers, and format, respects every record-date / "
+    "empty-set / scope rule verbatim, has no shifted CSV columns, formula errors, "
+    "duplicate rows, or missing/unpopulated register/device IDs, and satisfies "
+    "every hard constraint and tolerance recomputed directly from the file. "
+    "Whenever external MCP stores were modified (e.g., OpenProject work packages/"
+    "comments/journals, Nextcloud, Wiki), read back the actual persisted MCP "
+    "records and comments/journals and verify single-valued entity consistency "
+    "against delivered files verbatim—reject PASS on any ambiguity or contradiction. "
+    "For .ifc deliverables, run Python checks using ifcopenshell.geom.tree BVH "
+    "across ALL elements without exempting IfcRelConnects* or 0 mm butt-joints "
+    "(verify 5-10 mm non-touching gaps at L-corners/T-junctions/joints so BVH clash "
+    "count is 0 while each service forms 1 connected component <= 250 mm) plus 3D "
+    "clearances (tray-to-busway >= 300 mm, tray-stack headroom >= 300 mm, overhead "
+    "clear height >= 2600 mm AFF, sprinkler >= 457 mm, PDU clear zones, road vs. "
+    "building non-intersection) and inspect every Programmatic Pre-Check warning "
+    "rather than trusting the summary. Do not create or change any file. If every "
+    "requirement, external readback, and pre-check passes with zero errors, reply "
+    "with the single word PASS and nothing else. Otherwise reply with a numbered "
+    "list of every gap, each specific enough to fix."
 )
 
 
@@ -316,6 +352,14 @@ def resolve_runtime_config(config_path: str = "submission.yaml") -> Dict[str, An
         default=18,
         minimum=2,
     )
+    max_extract_turns = min(
+        3,
+        _safe_int(
+            os.environ.get("MAX_EXTRACT_TURNS") or env_cfg.get("MAX_EXTRACT_TURNS"),
+            default=3,
+            minimum=1,
+        ),
+    )
     max_work_turns = _safe_int(
         os.environ.get("MAX_WORK_TURNS") or env_cfg.get("MAX_WORK_TURNS"),
         default=55,
@@ -366,6 +410,7 @@ def resolve_runtime_config(config_path: str = "submission.yaml") -> Dict[str, An
         "max_retries": max_retries,
         "max_failures": max_failures,
         "max_plan_turns": max_plan_turns,
+        "max_extract_turns": max_extract_turns,
         "max_work_turns": max_work_turns,
         "max_verify_turns": max_verify_turns,
         "max_fix_turns": max_fix_turns,
@@ -868,6 +913,199 @@ async def recover(
     return True
 
 
+_MCP_WRITE_RE = re.compile(
+    r"(?:^|_)(create|add|update|edit|write|post|put|upload|set|delete|remove|close|assign|send|reply|append|patch|upsert|comment|note)(?:_|$)",
+    re.I,
+)
+_MCP_READ_RE = re.compile(
+    r"(?:^|_)(get|list|read|fetch|search|find|query|view|show|inspect|download|info|relations|comments|journals|activities|history|pages|files|statuses)(?:_|$)",
+    re.I,
+)
+_MCP_COMMENT_WRITE_RE = re.compile(
+    r"(?:comment|note|journal|reply|update_work_package|create_work_package|update_issue)",
+    re.I,
+)
+_MCP_COMMENT_READ_RE = re.compile(
+    r"(?:comment|journal|activit|note|history|replies)",
+    re.I,
+)
+_META_STATUS_LINE_RE = re.compile(
+    r"\b(?:whether|one way or the other|yes/no|pass/fail|pass or fail|"
+    r"approved/rejected|eligible/ineligible)\b"
+    r"|\b([a-z]{3,20})\s*(?:/|or)\s*(?:not\s+|non-)\1\b",
+    re.I,
+)
+_NEG_STATUS_RE = re.compile(
+    r"\b(?:not\s+|non[-_\s]+)([a-z][a-z0-9_-]{2,24})\b",
+    re.I,
+)
+_POS_WORD_RE = re.compile(r"\b([a-z][a-z0-9_-]{2,24})\b", re.I)
+_CONTRADICTION_STOP_WORDS = frozenset(
+    {
+        "the", "and", "for", "with", "that", "this", "from", "are", "was", "were",
+        "have", "has", "been", "being", "will", "would", "could", "should", "can",
+        "may", "might", "must", "shall", "yet", "still", "any", "all", "one", "two",
+        "date", "note", "call", "only", "also", "more", "than", "each", "both",
+        "into", "onto", "upon", "under", "over", "per", "via", "due",
+    }
+)
+_ANTONYM_STATUS_PAIRS: Tuple[Tuple[re.Pattern[str], re.Pattern[str], str], ...] = (
+    (re.compile(r"\bpass(?:ed)?\b", re.I), re.compile(r"\bfail(?:ed|ing)?\b", re.I), "pass vs fail"),
+    (re.compile(r"\bapproved\b", re.I), re.compile(r"\b(?:rejected|denied)\b", re.I), "approved vs rejected/denied"),
+    (re.compile(r"\beligible\b", re.I), re.compile(r"\bineligible\b", re.I), "eligible vs ineligible"),
+    (re.compile(r"\bcompliant\b", re.I), re.compile(r"\bnon[- ]?compliant\b", re.I), "compliant vs non-compliant"),
+    (re.compile(r"\bin[- ]?scope\b", re.I), re.compile(r"\bout[- ]?of[- ]?scope\b", re.I), "in-scope vs out-of-scope"),
+    (re.compile(r"\bvalid\b", re.I), re.compile(r"\binvalid\b", re.I), "valid vs invalid"),
+    (re.compile(r"\baccepted\b", re.I), re.compile(r"\brejected\b", re.I), "accepted vs rejected"),
+    (re.compile(r"\bactive\b", re.I), re.compile(r"\bwithdrawn\b", re.I), "active vs withdrawn"),
+)
+_CONSTRAINT_PATH_RE = re.compile(
+    r"(?:(?:/[A-Za-z0-9._-]+){2,}|[A-Za-z0-9._-]+\.(?:docx|pdf|xlsx|xlsm|csv|tsv|ifc|json|yaml|yml|md|txt|py|png|jpg|jpeg))\b",
+    re.I,
+)
+_CONSTRAINT_THRESHOLD_RE = re.compile(
+    r"(?:(?:>=|<=|!=|==|>|<|±)\s*)?\d+(?:[.,]\d+)?(?:\s*-\s*\d+(?:[.,]\d+)?)?\s*"
+    r"(?:mm|cm|m|m\^2|m2|ft|in|kw|kva|mw|kv|hz|ms|deg|°c|°f|psi|bar|pa|db|rpm|s|%|aff)\b",
+    re.I,
+)
+_CONSTRAINT_DATE_RE = re.compile(
+    r"\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4}|\d{4}/\d{2}/\d{2})\b"
+)
+_CONSTRAINT_ENTITY_RE = re.compile(
+    r"\b(cable[_ -]?tray|busway|bus[_ -]?duct|chw[_ -]?pipe|sprinkler|pdu|conduit|duct|"
+    r"inverter|array|checklists?|work[_ -]?package|register|panel|breaker|transformer|"
+    r"building|road|ifc|csv|xlsx|docx|pdf|openproject|nextcloud|wiki)\b",
+    re.I,
+)
+_EMPTY_TRIGGER_LINE_RE = re.compile(
+    r"\b(empty|no entry|zero|none|as of|as the record stands|not yours to make|"
+    r"stays with|do not release|pending signature|withdrawn|out of scope|must not|"
+    r"never|prohibit|mandatory|releasable)\b|\[h\s*=\s*1\]",
+    re.I,
+)
+
+
+def _dedupe_strs(items: Iterable[str], limit: int = 30) -> List[str]:
+    out: List[str] = []
+    seen: set[str] = set()
+    for raw in items:
+        s = " ".join(str(raw).split()).strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+            if len(out) >= limit:
+                break
+    return out
+
+
+def _regex_extract_constraints(task: str, plan: str = "") -> Dict[str, Any]:
+    """Zero-latency deterministic fallback extractor for CONSTRAINTS.json."""
+    text = f"{task or ''}\n{plan or ''}".strip()
+    file_paths = _dedupe_strs(_CONSTRAINT_PATH_RE.findall(text))
+    numeric_thresholds = _dedupe_strs(_CONSTRAINT_THRESHOLD_RE.findall(text))
+    iso_dates = _dedupe_strs(_CONSTRAINT_DATE_RE.findall(text))
+    raw_entities = _CONSTRAINT_ENTITY_RE.findall(text)
+    entities = _dedupe_strs([re.sub(r"[\s-]+", "_", e.lower()) for e in raw_entities])
+    triggers: List[str] = []
+    for raw_line in re.split(r"[\r\n]+|(?<=[.!?])\s+", text):
+        line = " ".join(raw_line.split()).strip()
+        if line and _EMPTY_TRIGGER_LINE_RE.search(line):
+            triggers.append(line[:220])
+    empty_set_triggers = _dedupe_strs(triggers, limit=20)
+    out: Dict[str, Any] = {
+        "source": "regex_fallback",
+        "file_paths": file_paths,
+        "numeric_thresholds": numeric_thresholds,
+        "iso_dates": iso_dates,
+        "entities": entities,
+        "empty_set_triggers": empty_set_triggers,
+    }
+    if not (file_paths or numeric_thresholds or iso_dates or entities or empty_set_triggers):
+        out["note"] = "no_constraints_found"
+    return out
+
+
+def _parse_or_fallback_constraints(raw: str, task: str, plan: str) -> str:
+    """Parse LLM CONSTRAINTS.json reply, falling back to regex extraction on failure."""
+    payload = extract_json_payload(raw)
+    if payload:
+        try:
+            parsed = json.loads(payload, parse_constant=_reject_json_constant)
+            if isinstance(parsed, dict) and parsed:
+                parsed.setdefault("source", "llm_extractor")
+                return json.dumps(parsed, indent=2, ensure_ascii=False)[:12_000]
+        except Exception:
+            pass
+    return json.dumps(_regex_extract_constraints(task, plan), indent=2, ensure_ascii=False)
+
+
+def detect_contradictory_comment_statuses(text: str) -> List[str]:
+    """Flag same-line contradictory/negated status pairs in external tracking comments."""
+    if not text or not isinstance(text, str):
+        return []
+    findings: List[str] = []
+    seen_lines: set[str] = set()
+    for raw_line in text.splitlines():
+        line = " ".join(raw_line.split()).strip()
+        if not line or _META_STATUS_LINE_RE.search(line):
+            continue
+        norm_key = line.lower()
+        if norm_key in seen_lines:
+            continue
+        matched_label: Optional[str] = None
+        for neg_m in _NEG_STATUS_RE.finditer(line):
+            tok = neg_m.group(1).lower()
+            if tok in _CONTRADICTION_STOP_WORDS or len(tok) < 3:
+                continue
+            masked = _NEG_STATUS_RE.sub(" ", line)
+            if re.search(rf"(?<![a-z0-9_-]){re.escape(tok)}(?![a-z0-9_-])", masked, re.I):
+                matched_label = f"{tok} vs not/non-{tok}"
+                break
+        if matched_label is None:
+            for pos_re, neg_re, pair_label in _ANTONYM_STATUS_PAIRS:
+                if neg_re.search(line):
+                    masked = neg_re.sub(" ", line)
+                    if pos_re.search(masked):
+                        matched_label = pair_label
+                        break
+        if matched_label is not None:
+            seen_lines.add(norm_key)
+            findings.append(f"contradictory status ({matched_label}) in comment line: {line[:180]}")
+    return findings
+
+
+def _mcp_write_target_key(tool_name: str, args: Dict[str, Any]) -> Tuple[str, str]:
+    """Identify logical target for deduplicating superseded MCP writes."""
+    if not isinstance(args, dict):
+        return (tool_name, "")
+    req = args.get("request") if isinstance(args.get("request"), dict) else args
+    if not isinstance(req, dict):
+        return (tool_name, "")
+    for key in (
+        "work_package_id", "issue_id", "page_id", "id", "path", "file_path", "target", "subject"
+    ):
+        val = req.get(key)
+        if val is not None and str(val).strip():
+            # Group comment/update writes onto same work_package_id when amending via a new comment
+            kind = "comment" if _MCP_COMMENT_WRITE_RE.search(tool_name) else tool_name
+            return (kind, f"{key}={str(val).strip()}")
+    return (tool_name, "")
+
+
+def _extract_comment_texts_from_args(args: Any) -> List[str]:
+    texts: List[str] = []
+    if not isinstance(args, dict):
+        return texts
+    for holder in (args, args.get("request") if isinstance(args.get("request"), dict) else None):
+        if not isinstance(holder, dict):
+            continue
+        for key in ("comment", "note", "notes", "body", "description", "content", "message", "text"):
+            val = holder.get(key)
+            if isinstance(val, str) and val.strip():
+                texts.append(val)
+    return texts
+
+
 def conversation(
     system: str,
     session: taskbridge.Session,
@@ -895,6 +1133,7 @@ async def agent(
     max_turns: Optional[int] = None,
     wrap_up_message: Optional[Dict[str, Any]] = None,
     run_state: Optional[Dict[str, Any]] = None,
+    retry_waits: Optional[Sequence[int]] = None,
 ) -> str:
     """Run tool-calling loop on `messages` until the model produces a final reply."""
     model = runtime_cfg["model"]
@@ -919,10 +1158,14 @@ async def agent(
                 "turn_cap": False,
                 "time_cap": False,
                 "truncated": False,
+                "tool_calls": [],
+                "mcp_writes": [],
+                "mcp_reads": [],
             }
         )
 
-    nudges, head, waits, turns = 0, "", iter(RETRY_WAITS), 0
+    waits_seq = RETRY_WAITS if retry_waits is None else retry_waits
+    nudges, head, waits, turns = 0, "", iter(waits_seq), 0
     while True:
         if session.cancelled.is_set():
             return session.final_message or head
@@ -1114,7 +1357,41 @@ async def agent(
                 if tool_breaker.record_failure():
                     tripped = True
             else:
-                tool_breaker.record_success()
+                # Any clean tool execution ends an active error streak and clears stale tripped state.
+                tool_breaker.reset()
+                tripped = False
+                if run_state is not None:
+                    fn_name = str(fn.get("name") or "")
+                    actual_tool = ""
+                    actual_args: Dict[str, Any] = {}
+                    try:
+                        parsed_fn_args = json.loads(str(fn.get("arguments") or "{}"))
+                    except Exception:
+                        parsed_fn_args = {}
+                    if isinstance(parsed_fn_args, dict):
+                        if fn_name == "mcp_call":
+                            actual_tool = str(parsed_fn_args.get("tool") or "")
+                            raw_targs = parsed_fn_args.get("arguments")
+                            if isinstance(raw_targs, dict):
+                                actual_args = raw_targs
+                            elif isinstance(raw_targs, str):
+                                try:
+                                    dec = json.loads(raw_targs)
+                                    if isinstance(dec, dict):
+                                        actual_args = dec
+                                except Exception:
+                                    actual_args = {}
+                        elif fn_name in (mcp_registry or {}):
+                            actual_tool = fn_name
+                            actual_args = parsed_fn_args
+                    run_state.setdefault("tool_calls", []).append(actual_tool or fn_name)
+                    if actual_tool:
+                        if _MCP_WRITE_RE.search(actual_tool):
+                            run_state.setdefault("mcp_writes", []).append(
+                                {"tool": actual_tool, "arguments": actual_args}
+                            )
+                        elif _MCP_READ_RE.search(actual_tool):
+                            run_state.setdefault("mcp_reads", []).append(actual_tool)
             messages.append(
                 {
                     "role": "tool",
@@ -1185,7 +1462,7 @@ async def agent(
             messages.append({"role": "user", "content": parts})
             _prune_old_images(messages, max_images=MAX_ACTIVE_IMAGES)
 
-        if tripped:
+        if tripped and tool_breaker.failure_count > 0:
             await session.log(
                 f"tool circuit breaker tripped after {tool_breaker.failure_count} "
                 "consecutive tool errors; injecting recovery guidance"
@@ -1299,6 +1576,20 @@ class DryRunOpenAIClient:
                 )
             return _reply(
                 f"1. Inspect workspace.\n2. Write deliverable `{target_name}`.\n3. Verify file."
+            )
+
+        if "extract strict engineering constraints" in lower_sys:
+            return _reply(
+                json.dumps(
+                    {
+                        "source": "llm_extractor",
+                        "deliverables": [target_name],
+                        "hard_constraints": [],
+                        "numeric_thresholds": [],
+                        "iso_dates": [],
+                        "entities": [],
+                    }
+                )
             )
 
         if "check an engineer's work" in lower_sys:
@@ -1491,9 +1782,17 @@ MEP_CLASSES = {
 }
 ROAD_NAME_RE = re.compile(r"(?:^|[^a-z0-9])(road|roadway|driveway|access_road|street|pavement)", re.I)
 TRAY_RE = re.compile(r"tray", re.I)
-BUSWAY_RE = re.compile(r"(?:^|[^a-z0-9])(busway|bus_?duct|bus-duct|bus)(?:[^a-z0-9]|$)", re.I)
-MEP_NAME_RE = re.compile(r"(tray|busway|bus_?duct|conduit|pipe|duct|chilled|cable)", re.I)
+TRAY_TAG_RE = re.compile(r"(?:^|[^a-z0-9])ct[-_]?\d+(?:[^a-z0-9]|$)", re.I)
+BUSWAY_RE = re.compile(r"(?:^|[^a-z0-9])(busway|bus_?duct|bus-duct|bus|bw[-_]?\d+)(?:[^a-z0-9]|$)", re.I)
+CHW_PIPE_RE = re.compile(r"(?:pipe|(?:^|[^a-z0-9])chw[-_]?\d*(?:[^a-z0-9]|$))", re.I)
+MEP_NAME_RE = re.compile(r"(tray|busway|bus_?duct|conduit|pipe|duct|chilled|cable|(?:^|[^a-z0-9])(?:ct|bw|chw)[-_]?\d+)", re.I)
 SPRINKLER_RE = re.compile(r"(sprinkler|(?:^|[^a-z0-9])spr[-_])", re.I)
+EPS_MM = 1e-3
+EPS_M = EPS_MM / 1000.0
+GRID_CELL_M = 0.300
+CONNECTIVITY_TOL_M = 0.250 + EPS_M
+SEP_LIMIT_M = 0.300 - EPS_M
+STACK_LIMIT_M = 0.300 - EPS_M
 SUMMARY_ROW_RE = re.compile(
     r"^(total|subtotal|grand\s+total|summary|sum|average|avg|mean|min|max|note|notes)\b",
     re.I,
@@ -2421,11 +2720,10 @@ def _meshes_clash_gt_2mm(elem_a, elem_b, tol=0.002):
                     return True
     return False
 
-def _mesh_clearance(elem_a, elem_b):
+def _mesh_clearance(elem_a, elem_b, pad=0.35):
     best = _aabb_dist(elem_a["aabb"], elem_b["aabb"])
-    if best >= 0.35:
+    if best >= pad:
         return best
-    pad = 0.35
     ba = elem_a["aabb"]
     bb = elem_b["aabb"]
 
@@ -2463,21 +2761,21 @@ def _mesh_clearance(elem_a, elem_b):
             d2 = _pt_tri_dist_sq(p, tri)
             if d2 < min_d * min_d:
                 min_d = math.sqrt(d2)
-                if min_d < 0.299:
+                if min_d <= 1e-6:
                     return min_d
     for p in vb:
         for tri in ta:
             d2 = _pt_tri_dist_sq(p, tri)
             if d2 < min_d * min_d:
                 min_d = math.sqrt(d2)
-                if min_d < 0.299:
+                if min_d <= 1e-6:
                     return min_d
     for p1, q1 in ea:
         for p2, q2 in eb:
             d = _seg_seg_dist(p1, q1, p2, q2)
             if d < min_d:
                 min_d = d
-                if min_d < 0.299:
+                if min_d <= 1e-6:
                     return min_d
     return min_d
 
@@ -2509,11 +2807,98 @@ if ifc_files:
         reported_clash_pairs = set()
         clash_count = 0
 
+        def _extract_pset_text(prod, ifc_mod):
+            parts = []
+            try:
+                util_mod = getattr(ifc_mod, "util", None)
+                elem_mod = getattr(util_mod, "element", None) if util_mod else None
+                get_psets = getattr(elem_mod, "get_psets", None) if elem_mod else None
+                if callable(get_psets):
+                    psets = get_psets(prod) or {}
+                    if isinstance(psets, dict):
+                        for pname, pvals in psets.items():
+                            parts.append(str(pname))
+                            if isinstance(pvals, dict):
+                                for pk, pv in pvals.items():
+                                    if pk != "id" and pv is not None:
+                                        parts.append(f"{pk}={pv}")
+                        if parts:
+                            return " ".join(parts)
+            except Exception:
+                pass
+            try:
+                for rel_def in getattr(prod, "IsDefinedBy", None) or []:
+                    pdef = getattr(rel_def, "RelatingPropertyDefinition", None)
+                    if pdef is None:
+                        continue
+                    pname = getattr(pdef, "Name", None)
+                    if pname:
+                        parts.append(str(pname))
+                    for prop in getattr(pdef, "HasProperties", None) or []:
+                        k = getattr(prop, "Name", None)
+                        val = getattr(prop, "NominalValue", None)
+                        if val is not None:
+                            val = getattr(val, "wrappedValue", val)
+                        if k or val is not None:
+                            parts.append(f"{k or ''}={val if val is not None else ''}")
+            except Exception:
+                pass
+            return " ".join(parts)
+
+        def _mep_service_bucket(e):
+            txt = e["text"]
+            if BUSWAY_RE.search(txt):
+                return "busway"
+            if e["cls"] in {"IfcCableCarrierSegment", "IfcCableCarrierFitting"} or TRAY_RE.search(txt) or TRAY_TAG_RE.search(txt):
+                return "cable_tray"
+            if e["cls"] in {"IfcPipeSegment", "IfcPipeFitting"} or CHW_PIPE_RE.search(txt):
+                return "chw_pipe"
+            return None
+
         def _is_mep(e):
-            return e["cls"] in MEP_CLASSES or (
-                e["cls"] in {"IfcBuildingElementProxy", "IfcCivilElement", "IfcProxy"}
-                and bool(MEP_NAME_RE.search(e["text"]))
+            return (
+                e["cls"] in MEP_CLASSES
+                or _mep_service_bucket(e) is not None
+                or (
+                    e["cls"] in {"IfcBuildingElementProxy", "IfcCivilElement", "IfcProxy"}
+                    and bool(MEP_NAME_RE.search(e["text"]))
+                )
             )
+
+        def _build_spatial_hash(elems, cell_size=GRID_CELL_M):
+            grid = {}
+            oversized = []
+            bounds = []
+            inv = 1.0 / cell_size
+            for idx, e in enumerate(elems):
+                a = e["aabb"]
+                ix0, iy0, iz0 = math.floor(a[0] * inv), math.floor(a[1] * inv), math.floor(a[2] * inv)
+                ix1, iy1, iz1 = math.floor(a[3] * inv), math.floor(a[4] * inv), math.floor(a[5] * inv)
+                bounds.append((ix0, iy0, iz0, ix1, iy1, iz1))
+                if (ix1 - ix0 + 1) * (iy1 - iy0 + 1) * (iz1 - iz0 + 1) > 4096:
+                    oversized.append(idx)
+                    continue
+                for ix in range(ix0, ix1 + 1):
+                    for iy in range(iy0, iy1 + 1):
+                        for iz in range(iz0, iz1 + 1):
+                            grid.setdefault((ix, iy, iz), []).append(idx)
+            return grid, oversized, bounds
+
+        def _spatial_candidates(idx, grid, oversized, bounds, total_len):
+            ix0, iy0, iz0, ix1, iy1, iz1 = bounds[idx]
+            if (ix1 - ix0 + 1) * (iy1 - iy0 + 1) * (iz1 - iz0 + 1) > 4096:
+                out = set(range(total_len))
+                out.discard(idx)
+                return out
+            cands = set(oversized)
+            for ix in range(ix0 - 1, ix1 + 2):
+                for iy in range(iy0 - 1, iy1 + 2):
+                    for iz in range(iz0 - 1, iz1 + 2):
+                        bucket = grid.get((ix, iy, iz))
+                        if bucket:
+                            cands.update(bucket)
+            cands.discard(idx)
+            return cands
 
         def _is_floor_rest(ra, rb):
             for eq, slab in ((ra, rb), (rb, ra)):
@@ -2693,6 +3078,7 @@ if ifc_files:
                 edges = [(verts[u], verts[v]) for u, v in edge_set]
                 name = str(getattr(prod, "Name", "") or "")
                 obj_t = str(getattr(prod, "ObjectType", "") or "")
+                pset_t = _extract_pset_text(prod, ifcopenshell)
                 gid = str(getattr(prod, "GlobalId", None) or prod.id())
                 bid = elem_to_bldg.get(prod.id())
                 rec = {
@@ -2702,7 +3088,8 @@ if ifc_files:
                     "pid": prod.id(),
                     "name": name or gid,
                     "label": f"{cls} {name or gid}",
-                    "text": f"{cls} {name} {obj_t}",
+                    "pset_text": pset_t,
+                    "text": f"{cls} {name} {obj_t} {pset_t}",
                     "bldg": bid,
                     "bldg_label": bldg_labels.get(bid, bid) if bid else None,
                     "verts": verts,
@@ -2836,23 +3223,32 @@ if ifc_files:
                     l2 = building_groups[b2][0]["bldg_label"] or b2
                     errors.append(f"building overlap between {l1!r} and {l2!r} (area={area:.3f} m^2)")
 
-        # MEP touching/overlapping clashes, tray-to-busway (<300mm), tray-stack headroom, and clear height
+        # MEP touching/overlapping clashes, tray-to-busway (<300mm), tray-stack headroom, clear height & connectivity
         mep_flags = [_is_mep(e) for e in all_elems]
-        stack_warns = 0
+        stack_errs = 0
         if any(mep_flags):
+            grid, oversized, bounds = _build_spatial_hash(all_elems, cell_size=GRID_CELL_M)
+            checked_pairs = set()
             for i in range(len(all_elems)):
                 if time.monotonic() - START_T > 30.0:
                     warnings.append("MEP clash scan stopped at 30s time budget")
                     break
+                if not mep_flags[i]:
+                    continue
                 ei = all_elems[i]
-                for j in range(i + 1, len(all_elems)):
-                    if not (mep_flags[i] or mep_flags[j]):
+                bi = _mep_service_bucket(ei) == "busway"
+                ti = _mep_service_bucket(ei) == "cable_tray"
+                cands = _spatial_candidates(i, grid, oversized, bounds, len(all_elems))
+                for j in sorted(cands):
+                    pair = (i, j) if i < j else (j, i)
+                    if pair in checked_pairs:
                         continue
+                    checked_pairs.add(pair)
                     ej = all_elems[j]
                     pkey = tuple(sorted(((ei["file"], ei["gid"]), (ej["file"], ej["gid"]))))
                     if pkey not in reported_clash_pairs and not _is_floor_rest(ei, ej):
-                        if mep_flags[i] and mep_flags[j]:
-                            if _aabb_dist(ei["aabb"], ej["aabb"]) < 0.002 and _mesh_clearance(ei, ej) < 0.002:
+                        if mep_flags[j]:
+                            if _aabb_dist(ei["aabb"], ej["aabb"]) < 0.002 and _mesh_clearance(ei, ej, pad=0.01) < 0.002:
                                 _emit_mep_clash(
                                     ei,
                                     ej,
@@ -2860,7 +3256,7 @@ if ifc_files:
                                     f"{ei['label']} ({ei['file']}) vs {ej['label']} ({ej['file']})",
                                 )
                         elif (
-                            (_aabb_dist(ei["aabb"], ej["aabb"]) < 0.001 and _mesh_clearance(ei, ej) < 0.001)
+                            (_aabb_dist(ei["aabb"], ej["aabb"]) < 0.001 and _mesh_clearance(ei, ej, pad=0.01) < 0.001)
                             or (_aabb_overlap(ei["aabb"], ej["aabb"], tol=0.0002) and _meshes_clash_gt_2mm(ei, ej, tol=0.0002))
                         ):
                             _emit_mep_clash(
@@ -2868,44 +3264,86 @@ if ifc_files:
                                 ej,
                                 f"MEP micro-clash (<1mm clearance or overlapping): {ei['label']} ({ei['file']}) vs {ej['label']} ({ej['file']})",
                             )
-                    # Check tray <-> busway 300mm separation & tray-stack vertical headroom
-                    ti = (
-                        ei["cls"] in {"IfcCableCarrierSegment", "IfcCableCarrierFitting"}
-                        or bool(TRAY_RE.search(ei["text"]))
-                    ) and not bool(BUSWAY_RE.search(ei["text"]))
-                    bj = bool(BUSWAY_RE.search(ej["text"]))
-                    tj = (
-                        ej["cls"] in {"IfcCableCarrierSegment", "IfcCableCarrierFitting"}
-                        or bool(TRAY_RE.search(ej["text"]))
-                    ) and not bool(BUSWAY_RE.search(ej["text"]))
-                    bi = bool(BUSWAY_RE.search(ei["text"]))
+                    # Check tray <-> busway 300mm separation & tray-stack vertical headroom (with 1e-3mm epsilon)
+                    bj = _mep_service_bucket(ej) == "busway"
+                    tj = _mep_service_bucket(ej) == "cable_tray"
                     if (ti and bj) or (tj and bi):
                         tray_e, bus_e = (ei, ej) if (ti and bj) else (ej, ei)
-                        if _aabb_dist(tray_e["aabb"], bus_e["aabb"]) < 0.300:
-                            clr = _mesh_clearance(tray_e, bus_e)
-                            if clr < 0.299:
+                        if _aabb_dist(tray_e["aabb"], bus_e["aabb"]) < SEP_LIMIT_M:
+                            clr = _mesh_clearance(tray_e, bus_e, pad=0.305)
+                            if clr < SEP_LIMIT_M:
                                 errors.append(
                                     f"tray-busway clearance {clr * 1000:.1f}mm < 300mm: {tray_e['label']} vs {bus_e['label']}"
                                 )
-                            elif clr < 0.300:
-                                warnings.append(
-                                    f"tray-busway borderline clearance {clr * 1000:.1f}mm (< 300mm): {tray_e['label']} vs {bus_e['label']}"
-                                )
-                    if stack_warns < 10 and ((ti and mep_flags[j]) or (tj and mep_flags[i])):
+                    if stack_errs < 15 and ((ti and mep_flags[j]) or (tj and mep_flags[i])):
                         tray_e, other_e = (ei, ej) if ti else (ej, ei)
                         ta, oa = tray_e["aabb"], other_e["aabb"]
                         xy_dx = min(ta[3], oa[3]) - max(ta[0], oa[0])
                         xy_dy = min(ta[4], oa[4]) - max(ta[1], oa[1])
                         if xy_dx > 0.01 and xy_dy > 0.01 and (oa[2] > ta[5] or ta[2] > oa[5]):
                             vgap = max(0.0, oa[2] - ta[5], ta[2] - oa[5])
-                            if 0.0 < vgap < 0.299:
-                                stack_warns += 1
-                                warnings.append(
+                            if 0.0 < vgap < STACK_LIMIT_M:
+                                stack_errs += 1
+                                errors.append(
                                     f"tray-stack vertical headroom {vgap * 1000:.1f}mm < 300mm "
-                                    f"(check TIA-569-B access clearance): {tray_e['label']} vs {other_e['label']}"
+                                    f"(TIA-569-B access clearance): {tray_e['label']} vs {other_e['label']}"
                                 )
             if clash_count > 15:
                 errors.append(f"... plus {clash_count - 15} additional MEP solid clash(es)")
+
+        # Per-file, per-service BFS connectivity check (<= 250.0 + 1e-3 mm) via spatial hash
+        svc_groups = {}
+        for e in all_elems:
+            svc = _mep_service_bucket(e)
+            if svc is not None:
+                svc_groups.setdefault((e["file"], svc), []).append(e)
+        for (rel_f, svc), svc_elems in sorted(svc_groups.items()):
+            if len(svc_elems) < 2:
+                continue
+            sgrid, soversized, sbounds = _build_spatial_hash(svc_elems, cell_size=GRID_CELL_M)
+            adj = {idx: set() for idx in range(len(svc_elems))}
+            for u in range(len(svc_elems)):
+                scands = _spatial_candidates(u, sgrid, soversized, sbounds, len(svc_elems))
+                for v in scands:
+                    if v <= u:
+                        continue
+                    if (
+                        _aabb_dist(svc_elems[u]["aabb"], svc_elems[v]["aabb"]) <= CONNECTIVITY_TOL_M
+                        and _mesh_clearance(svc_elems[u], svc_elems[v], pad=0.255) <= CONNECTIVITY_TOL_M
+                    ):
+                        adj[u].add(v)
+                        adj[v].add(u)
+            visited = set()
+            comps = []
+            for start in range(len(svc_elems)):
+                if start in visited:
+                    continue
+                comp = []
+                bfs_q = [start]
+                visited.add(start)
+                while bfs_q:
+                    cur_node = bfs_q.pop(0)
+                    comp.append(cur_node)
+                    for nxt in adj[cur_node]:
+                        if nxt not in visited:
+                            visited.add(nxt)
+                            bfs_q.append(nxt)
+                comps.append(comp)
+            if len(comps) > 1:
+                comps.sort(key=len, reverse=True)
+                main_comp = comps[0]
+                rest_nodes = [n for c in comps[1:] for n in c]
+                min_gap_m = min(
+                    _aabb_dist(svc_elems[u]["aabb"], svc_elems[v]["aabb"])
+                    for u in main_comp
+                    for v in rest_nodes
+                )
+                detached_labels = [svc_elems[n]["label"] for n in rest_nodes[:4]]
+                errors.append(
+                    f"{rel_f}: disconnected MEP {svc} network ({len(comps)} separate components "
+                    f"across {len(svc_elems)} elements, largest={len(main_comp)}, tol=250mm, "
+                    f"min_gap={min_gap_m * 1000:.1f}mm; detached={detached_labels})"
+                )
 
         # Overhead clear-height check (>= 2600mm AFF for suspended MEP / sprinkler items)
         clear_warns = 0
@@ -3032,10 +3470,37 @@ async def solve(
         )
         await session.log(f"plan: {plan[:1000]}")
 
+        extract_prompt = f"## Task\n{task}\n\n## Plan\n{plan}"
+        extract_turns = min(3, max(1, int(runtime_cfg.get("max_extract_turns", 3))))
+        left_now = session.time_left()
+        extract_timeout = 90.0 if left_now is None else min(90.0, max(5.0, float(left_now) * 0.15))
+        try:
+            raw_constraints = await asyncio.wait_for(
+                agent(
+                    session,
+                    conversation(EXTRACTOR, session, extract_prompt, mcp_note=mcp_note),
+                    planner_tools,
+                    _until(1.0 - PLAN_SHARE - EXTRACT_SHARE),
+                    client=active_client,
+                    runtime_cfg=runtime_cfg,
+                    mcp_registry=mcp_registry,
+                    breaker=CircuitBreaker(max_failures=runtime_cfg["max_failures"]),
+                    max_turns=extract_turns,
+                    wrap_up_message=EXTRACTOR_WRAP_UP,
+                    retry_waits=(2,),
+                ),
+                timeout=extract_timeout,
+            )
+            constraints_json = _parse_or_fallback_constraints(raw_constraints, task, plan)
+        except (openai.APIError, asyncio.TimeoutError, RuntimeError, ValueError, TypeError) as exc:
+            await session.log(f"extractor failed ({exc}); falling back to regex constraint extraction")
+            constraints_json = json.dumps(_regex_extract_constraints(task, plan), indent=2, ensure_ascii=False)
+        await session.log(f"constraints: {constraints_json[:1000]}")
+
         work = conversation(
             WORKER,
             session,
-            f"{task}\n\n## Plan\n{plan}",
+            f"{task}\n\n## Plan\n{plan}\n\n## Extracted Constraints (CONSTRAINTS.json)\n{constraints_json}",
             mcp_note=mcp_note,
         )
         work_state: Dict[str, Any] = {}
@@ -3055,6 +3520,12 @@ async def solve(
         if work_state.get("truncated"):
             await session.log(f"worker: truncated=True turns={work_state.get('turns')}")
 
+        active_mcp_writes: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for wr in work_state.get("mcp_writes") or []:
+            tname = str(wr.get("tool") or "")
+            wargs = wr.get("arguments") or {}
+            active_mcp_writes[_mcp_write_target_key(tname, wargs)] = {"tool": tname, "arguments": wargs}
+
         max_fix_rounds = int(runtime_cfg.get("max_fix_rounds", 2))
         audit = await run_programmatic_audit(session, task) if max_fix_rounds > 0 else {
             "errors": [],
@@ -3070,8 +3541,18 @@ async def solve(
         for _ in range(max_fix_rounds):
             if session.cancelled.is_set() or not _time_for(_until(CHECK_SHARE / 2)):
                 break
+
+            comment_prefilter_errors: List[str] = []
+            for wr in active_mcp_writes.values():
+                for txt_val in _extract_comment_texts_from_args(wr.get("arguments")):
+                    for cf in detect_contradictory_comment_statuses(txt_val):
+                        if cf not in comment_prefilter_errors:
+                            comment_prefilter_errors.append(cf)
+
             review = (
-                f"## Task\n{task}\n\n## Plan\n{plan}\n\n## The engineer's summary\n{summary}"
+                f"## Task\n{task}\n\n## Plan\n{plan}"
+                f"\n\n## Extracted Constraints (CONSTRAINTS.json)\n{constraints_json}"
+                f"\n\n## The engineer's summary\n{summary}"
             )
             if work_state.get("truncated"):
                 review += (
@@ -3081,6 +3562,20 @@ async def solve(
                 )
             if audit["summary"]:
                 review += f"\n\n## Programmatic Pre-Check\n{audit['summary']}"
+            if active_mcp_writes:
+                written_list = sorted({str(w.get("tool") or "") for w in active_mcp_writes.values()})
+                review += (
+                    "\n\n## External-Store Readback Required\n"
+                    f"Written MCP tools: {', '.join(written_list)}. "
+                    "Read back the actual persisted MCP records/comments/journals and verify "
+                    "single-valued Entity: Final_Status consistency against delivered files."
+                )
+                if comment_prefilter_errors:
+                    review += (
+                        "\nContradictory Status Pre-Filter Flags:\n"
+                        + "\n".join(f"- {e}" for e in comment_prefilter_errors)
+                    )
+
             verify_state: Dict[str, Any] = {}
             verdict = await agent(
                 session,
@@ -3097,19 +3592,44 @@ async def solve(
             )
             verifier_truncated = bool(verify_state.get("truncated"))
             audit_errors = list(audit.get("errors") or [])
+
+            readback_errors: List[str] = []
+            if active_mcp_writes:
+                v_reads = [str(r) for r in (verify_state.get("mcp_reads") or [])]
+                if not v_reads:
+                    readback_errors.append(
+                        "External MCP stores were modified, but VERIFIER performed no MCP readback."
+                    )
+                else:
+                    wrote_comment = any(
+                        _MCP_COMMENT_WRITE_RE.search(str(w.get("tool") or ""))
+                        for w in active_mcp_writes.values()
+                    )
+                    reg_has_comment_reader = any(
+                        _MCP_COMMENT_READ_RE.search(k) for k in (mcp_registry or {})
+                    )
+                    if wrote_comment and reg_has_comment_reader and not any(
+                        _MCP_COMMENT_READ_RE.search(r) for r in v_reads
+                    ):
+                        readback_errors.append(
+                            "External comments/journals were updated, but VERIFIER did not call an MCP comment/journal readback tool."
+                        )
+
+            all_gate_errors = audit_errors + comment_prefilter_errors + readback_errors
             clean_pass = (
                 bool(verdict.strip())
                 and is_pass_verdict(verdict)
                 and not verifier_truncated
-                and not audit_errors
+                and not all_gate_errors
             )
             await session.log(
                 f"verifier: truncated={verifier_truncated} audit_errors={len(audit_errors)} "
+                f"prefilter_errors={len(comment_prefilter_errors)} readback_errors={len(readback_errors)} "
                 f"{verdict[:1000]}"
             )
             if clean_pass or not _time_for(WRAP_UP_SEC):
                 break
-            if not verdict.strip() and not verifier_truncated and not audit_errors:
+            if not verdict.strip() and not verifier_truncated and not all_gate_errors:
                 break
 
             gap_sections: List[str] = []
@@ -3117,6 +3637,16 @@ async def solve(
                 gap_sections.append(
                     "Programmatic Pre-Check ERRORS (must fix):\n"
                     + "\n".join(f"- {err}" for err in audit_errors[:20])
+                )
+            if comment_prefilter_errors:
+                gap_sections.append(
+                    "Cross-Store Contradictory Comment Pre-Filter ERRORS (rewrite using clean Entity: Final_Status lines):\n"
+                    + "\n".join(f"- {err}" for err in comment_prefilter_errors[:10])
+                )
+            if readback_errors:
+                gap_sections.append(
+                    "External-Store Readback ERRORS:\n"
+                    + "\n".join(f"- {err}" for err in readback_errors)
                 )
             if verdict.strip() and not is_pass_verdict(verdict):
                 gap_sections.append(verdict)
@@ -3134,8 +3664,11 @@ async def solve(
                     "content": (
                         "A reviewer checked your files and found these gaps:\n"
                         f"{gaps_text}\n\n"
+                        "## Extracted Constraints (CONSTRAINTS.json)\n"
+                        f"{constraints_json}\n\n"
                         "Fix them immediately by writing or updating and regenerating "
-                        "every required deliverable file on disk, re-run verification "
+                        "every required deliverable file on disk (and amending any external "
+                        "MCP records cleanly as `Entity: Final_Status`), re-run verification "
                         "checks on the updated files before your turn budget runs out, "
                         "then reply with your verified summary."
                     ),
@@ -3157,6 +3690,10 @@ async def solve(
             )
             if fix_state.get("truncated"):
                 await session.log(f"fix: truncated=True turns={fix_state.get('turns')}")
+            for wr in fix_state.get("mcp_writes") or []:
+                tname = str(wr.get("tool") or "")
+                wargs = wr.get("arguments") or {}
+                active_mcp_writes[_mcp_write_target_key(tname, wargs)] = {"tool": tname, "arguments": wargs}
             summary = updated or summary
             work_state = fix_state
             audit = await run_programmatic_audit(session, task)
