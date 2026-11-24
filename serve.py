@@ -22,6 +22,7 @@ import posixpath
 import re
 import signal
 import sys
+import urllib.parse
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import openai
@@ -278,7 +279,7 @@ def _normalize_gemini_openai_base(url: str) -> str:
     cleaned = url.strip().rstrip("/")
     if not cleaned:
         return ""
-    if "generativelanguage.googleapis.com" in cleaned.lower():
+    if urllib.parse.urlparse(cleaned).hostname == "generativelanguage.googleapis.com":
         if cleaned.endswith("/openai") or cleaned.endswith("/v1beta/openai"):
             return cleaned
         if cleaned.endswith("/v1beta"):
