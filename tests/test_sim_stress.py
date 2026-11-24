@@ -33,6 +33,9 @@ def _run_audit(
     env: Optional[Dict[str, str]] = None,
     baseline_xlsx: Optional[Dict[str, Any]] = None,
     baseline_ifc_gids: Optional[Iterable[str]] = None,
+    baseline_files: Optional[Dict[str, Any]] = None,
+    required_register_ids: Optional[Iterable[str]] = None,
+    target_deliverables: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """Run serve._PROGRAMMATIC_AUDIT_SCRIPT in a temp workdir and parse its JSON report."""
     proc = subprocess.run(
@@ -40,6 +43,9 @@ def _run_audit(
         input=serve._build_programmatic_audit_script(
             baseline_xlsx=baseline_xlsx,
             baseline_ifc_gids=baseline_ifc_gids,
+            baseline_files=baseline_files,
+            required_register_ids=required_register_ids,
+            target_deliverables=target_deliverables,
         ),
         cwd=workdir,
         env=env,
@@ -2285,8 +2291,8 @@ class TestLayer3HardeningPRA(unittest.TestCase):
                 encoding="utf-8",
             )
             sess = _LocalReplaySession(case_dir, "Route MEP cleanly.")
-            xlsx_base, ifc_gids = asyncio.run(serve.capture_workspace_baseline(sess))  # type: ignore[arg-type]
-            self.assertEqual(xlsx_base, {})
+            file_base, ifc_gids = asyncio.run(serve.capture_workspace_baseline(sess))  # type: ignore[arg-type]
+            self.assertIn("input/baseline.ifc", file_base)
             self.assertIn("BASE_SPK_01", ifc_gids)
             self.assertIn("BASE_STEP_02", ifc_gids)
 
@@ -2331,6 +2337,278 @@ class TestLayer3HardeningPRA(unittest.TestCase):
             self.assertIn("[terminals] [BASELINE_INPUT] overhead clear height 1890.0mm < 2600mm", warns)
             self.assertIn("[terminals] [MODIFIED/NEW] overhead clear height 1950.0mm < 2600mm", warns)
             self.assertIn("[routed_mep] [MODIFIED/NEW] overhead clear height 2350.0mm < 2600mm", warns)
+
+    def test_universal_sha256_baseline_skips_unmodified_csv_ifc_and_audits_modified(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env = _write_mock_ifcopenshell_pkg(tmp_path / "pkgs")
+            workdir = tmp_path / "case"
+
+            (workdir / "30_geotech" / "boring_logs").mkdir(parents=True)
+            (workdir / "50_bim").mkdir(parents=True)
+            (workdir / "40_inputs").mkdir(parents=True)
+
+            # Defective pre-existing read-only workspace inputs (.csv, .ifc, .json, .zip)
+            b01 = workdir / "30_geotech" / "boring_logs" / "B-01.csv"
+            b01.write_text("depth_m,spt_n\n1.0,NaN,SHIFTED\n2.0,#REF!\n", encoding="utf-8")
+
+            input_ifc_scene = {
+                "elements": [
+                    {"id": 1, "cls": "IfcFireSuppressionTerminal", "gid": "BASE_SPK_01", "name": "SPK-A01", "obj_type": "Sprinkler", "box": [2.0, 2.2, 4.0, 4.2, 1.89, 1.94]},
+                    {"id": 2, "cls": "IfcWall", "gid": "BASE_WALL_01", "name": "WALL-01", "box": [2.1, 2.3, 4.0, 4.2, 1.80, 2.50]},
+                ]
+            }
+            (workdir / "50_bim" / "BLDG4410-E_RevC.ifc").write_text(
+                f"ISO-10303-21;\n/* SCENE_JSON: {json.dumps(input_ifc_scene)} */\nEND-ISO-10303-21;",
+                encoding="utf-8",
+            )
+            (workdir / "40_inputs" / "raw_config.json").write_text("{not valid json", encoding="utf-8")
+            zip_buf = io.BytesIO()
+            with zipfile.ZipFile(zip_buf, "w") as zf:
+                zf.writestr("bad.csv", "a,b\n1,2,3\n")
+            (workdir / "40_inputs" / "archive.zip").write_bytes(zip_buf.getvalue())
+
+            sess = _LocalReplaySession(workdir, "Audit only modified deliverables.")
+            file_base, ifc_gids = asyncio.run(serve.capture_workspace_baseline(sess))  # type: ignore[arg-type]
+            xlsx_only = asyncio.run(serve.capture_xlsx_baseline(sess))  # type: ignore[arg-type]
+            self.assertEqual(xlsx_only, {})
+            for expected_rel in (
+                "30_geotech/boring_logs/B-01.csv",
+                "50_bim/BLDG4410-E_RevC.ifc",
+                "40_inputs/raw_config.json",
+                "40_inputs/archive.zip",
+            ):
+                self.assertIn(expected_rel, file_base)
+            self.assertIn("BASE_SPK_01", ifc_gids)
+
+            # Directory-qualified output deliverable never un-skips same-named input IFC
+            clean_report = _run_audit(
+                workdir,
+                env=env,
+                baseline_files=file_base,
+                baseline_ifc_gids=ifc_gids,
+                target_deliverables=["output/BLDG4410-E_RevC.ifc"],
+            )
+            self.assertEqual(clean_report["errors"], [])
+            self.assertEqual(clean_report["warnings"], [])
+            self.assertEqual(clean_report["skipped_unmodified_xlsx"], [])
+            self.assertEqual(
+                set(clean_report["skipped_unmodified_inputs"]),
+                {
+                    "30_geotech/boring_logs/B-01.csv",
+                    "50_bim/BLDG4410-E_RevC.ifc",
+                    "40_inputs/raw_config.json",
+                    "40_inputs/archive.zip",
+                },
+            )
+
+            # Untouched file explicitly listed in target_deliverables IS still audited
+            stub_report = _run_audit(
+                workdir,
+                env=env,
+                baseline_files=file_base,
+                baseline_ifc_gids=ifc_gids,
+                target_deliverables=["30_geotech/boring_logs/B-01.csv"],
+            )
+            self.assertIn("30_geotech/boring_logs/B-01.csv", "\n".join(stub_report["errors"]))
+            self.assertNotIn("30_geotech/boring_logs/B-01.csv", stub_report["skipped_unmodified_inputs"])
+            self.assertEqual(
+                serve._extract_target_deliverables(
+                    json.dumps(
+                        {
+                            "deliverables": [
+                                "/app/output/BLDG4410-E_RevC.ifc",
+                                {"path": "takeoff.csv"},
+                                "OpenProject work package #45",
+                            ]
+                        }
+                    ),
+                    workdir="/app",
+                ),
+                ["output/BLDG4410-E_RevC.ifc", "takeoff.csv"],
+            )
+
+            # Modify B-01.csv in place and write a new defective output/model.ifc (with BASE_SPK_01 copied)
+            b01.write_text("depth_m,spt_n\n1.0,15,SHIFTED\n", encoding="utf-8")
+            (workdir / "output").mkdir(parents=True)
+            out_scene = {
+                "elements": [
+                    {"id": 1, "cls": "IfcFireSuppressionTerminal", "gid": "BASE_SPK_01", "name": "SPK-A01", "obj_type": "Sprinkler", "box": [2.0, 2.2, 4.0, 4.2, 1.89, 1.94]},
+                    {"id": 2, "cls": "IfcCableCarrierSegment", "gid": "NEW_TRAY_CLASH", "name": "CT-1", "box": [2.05, 3.0, 4.0, 4.3, 1.89, 1.96]},
+                ]
+            }
+            (workdir / "output" / "model.ifc").write_text(
+                f"ISO-10303-21;\n/* SCENE_JSON: {json.dumps(out_scene)} */\nEND-ISO-10303-21;",
+                encoding="utf-8",
+            )
+
+            after_mod = _run_audit(
+                workdir,
+                env=env,
+                baseline_files=file_base,
+                baseline_ifc_gids=ifc_gids,
+            )
+            self.assertEqual(
+                set(after_mod["skipped_unmodified_inputs"]),
+                {
+                    "50_bim/BLDG4410-E_RevC.ifc",
+                    "40_inputs/raw_config.json",
+                    "40_inputs/archive.zip",
+                },
+            )
+            errs_text = "\n".join(after_mod["errors"])
+            self.assertIn("30_geotech/boring_logs/B-01.csv", errs_text)
+            self.assertIn("output/model.ifc", errs_text)
+            self.assertNotIn("BLDG4410-E_RevC.ifc", errs_text)
+            self.assertNotIn("raw_config.json", errs_text)
+            self.assertNotIn("archive.zip", errs_text)
+            term_by_gid = {item["gid"]: item for item in after_mod["clear_height"]["terminals"]}
+            self.assertEqual(term_by_gid["BASE_SPK_01"]["origin"], "[BASELINE_INPUT]")
+
+    def test_constraint_register_coverage_audit_extractor_ids_and_turn_budget(self):
+        import time
+
+        # 1. EXTRACTOR / regex extraction of R*/H*/S* IDs, hard caps, ReDoS safety, and non-req context filtering
+        t0 = time.monotonic()
+        _ = serve._regex_extract_constraints("R-" * 20_000 + " -" * 20_000, "")
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 0.5)
+
+        empty_fb = serve._regex_extract_constraints("Summarize general engineering notes.", "")
+        self.assertEqual(empty_fb["required_register_ids"], [])
+        self.assertEqual(empty_fb["hard_numeric_caps"], [])
+        self.assertEqual(empty_fb["note"], "no_constraints_found")
+
+        sample_task = (
+            "Cover requirements R01..R03, R-260573-05, H01, and S08. "
+            "Enforce <= 3% drift and <= 0.85 demand/capacity ratio. "
+            "Do not confuse R30 insulation, H20 truck load, or S40 pipe schedule."
+        )
+        fb = serve._regex_extract_constraints(sample_task, "")
+        self.assertEqual(
+            fb["required_register_ids"],
+            ["R01", "R02", "R03", "R-260573-05", "H01", "S08"],
+        )
+        self.assertIn("<= 3%", fb["hard_numeric_caps"])
+        self.assertIn("<= 0.85", fb["hard_numeric_caps"])
+
+        # Deterministic merge even when LLM extractor omits required_register_ids
+        merged_json = serve._parse_or_fallback_constraints(
+            json.dumps({"deliverables": ["constraint_register.csv"]}),
+            "Ensure R-260573-05 and R14 are verified (cap <= 0.90).",
+            "",
+        )
+        merged = json.loads(merged_json)
+        self.assertEqual(merged["required_register_ids"], ["R-260573-05", "R14"])
+        self.assertIn("<= 0.90", merged["hard_numeric_caps"])
+        self.assertEqual(
+            serve._extract_required_register_ids(merged_json),
+            ["R-260573-05", "R14"],
+        )
+
+        # 2. Programmatic audit catches missing IDs in standalone CSV, zipped CSV, and XLSX
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            # Case A: standalone constraint_register.csv
+            case_csv = root / "case_csv"
+            case_csv.mkdir()
+            reg_csv = case_csv / "constraint_register.csv"
+            reg_csv.write_text(
+                "requirement_id,status\nR01,PASS\nR02,PASS\n",
+                encoding="utf-8",
+            )
+            csv_miss = _run_audit(
+                case_csv,
+                required_register_ids=["R01", "R02", "R03", "R-260573-05"],
+            )
+            self.assertTrue(csv_miss["errors"])
+            self.assertIn("constraint_register missing 2 required ID(s)", csv_miss["errors"][0])
+            self.assertIn("R03", csv_miss["errors"][0])
+            self.assertIn("R-260573-05", csv_miss["errors"][0])
+
+            reg_csv.write_text(
+                "requirement_id,status\nR01,PASS\nR02,PASS\nR03,PASS\nR-260573-05,PASS\n",
+                encoding="utf-8",
+            )
+            csv_ok = _run_audit(
+                case_csv,
+                required_register_ids=["R01", "R02", "R03", "R-260573-05"],
+            )
+            self.assertEqual(csv_ok["errors"], [])
+
+            # Case B: ZIP-nested constraint_register.csv (and no false fail on unrelated S08)
+            case_zip = root / "case_zip"
+            (case_zip / "output").mkdir(parents=True)
+            z_bad = io.BytesIO()
+            with zipfile.ZipFile(z_bad, "w") as zf:
+                zf.writestr(
+                    "deliverables/constraint_register.csv",
+                    "req_id,result\nR-260573-01,OK\n",
+                )
+            (case_zip / "output" / "submission.zip").write_bytes(z_bad.getvalue())
+            zip_miss = _run_audit(
+                case_zip,
+                required_register_ids=["R-260573-01", "R-260573-05", "S08"],
+            )
+            self.assertEqual(len(zip_miss["errors"]), 1)
+            self.assertIn("output/submission.zip!deliverables/constraint_register.csv", zip_miss["errors"][0])
+            self.assertIn("R-260573-05", zip_miss["errors"][0])
+            self.assertNotIn("S08", zip_miss["errors"][0])
+
+            z_ok = io.BytesIO()
+            with zipfile.ZipFile(z_ok, "w") as zf:
+                zf.writestr(
+                    "deliverables/constraint_register.csv",
+                    "req_id,result\nR-260573-01,OK\nR-260573-05,OK\n",
+                )
+            (case_zip / "output" / "submission.zip").write_bytes(z_ok.getvalue())
+            zip_ok = _run_audit(
+                case_zip,
+                required_register_ids=["R-260573-01", "R-260573-05", "S08"],
+            )
+            self.assertEqual(zip_ok["errors"], [])
+
+            # Case C: constraint_register.xlsx missing R14
+            case_xlsx = root / "case_xlsx"
+            case_xlsx.mkdir()
+            reg_xlsx = case_xlsx / "constraint_register.xlsx"
+            reg_xlsx.write_bytes(
+                _make_ooxml_xlsx(
+                    {
+                        "Register": [
+                            ["id", "status"],
+                            ["R01", "OK"],
+                        ]
+                    }
+                )
+            )
+            xlsx_miss = _run_audit(case_xlsx, required_register_ids=["R01", "R14"])
+            self.assertEqual(len(xlsx_miss["errors"]), 1)
+            self.assertIn("R14", xlsx_miss["errors"][0])
+
+            reg_xlsx.write_bytes(
+                _make_ooxml_xlsx(
+                    {
+                        "Register": [
+                            ["id", "status"],
+                            ["R01", "OK"],
+                            ["R14", "OK"],
+                        ]
+                    }
+                )
+            )
+            xlsx_ok = _run_audit(case_xlsx, required_register_ids=["R01", "R14"])
+            self.assertEqual(xlsx_ok["errors"], [])
+
+        # 3. VERIFIER instructions and MAX_WORK_TURNS=75
+        self.assertIn("governing scenario", serve.VERIFIER.lower())
+        self.assertIn("near-boundary", serve.VERIFIER.lower())
+        clean_env = dict(os.environ)
+        clean_env.pop("MAX_WORK_TURNS", None)
+        with patch.dict(os.environ, clean_env, clear=True):
+            cfg = serve.resolve_runtime_config(str(REPO_ROOT / "submission.yaml"))
+            self.assertEqual(cfg["max_work_turns"], 75)
 
 
 if __name__ == "__main__":

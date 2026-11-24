@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 import posixpath
 import re
 import signal
@@ -116,9 +117,12 @@ EXTRACTOR = (
     "(working dir {workdir}); if the prompt and plan already supply the constraints, "
     "reply immediately with a single valid JSON object representing CONSTRAINTS.json "
     "containing keys: deliverables (exact file paths and external MCP targets), "
+    "required_register_ids (every requirement, finding, hazard, or scenario ID such as "
+    "R01..R99, R-xxxxxx-xx, H01.., S01.. referenced in the task, plan, or spec), "
     "hard_constraints ([h=1] rules, prohibitions, record-date vs contingent-action "
-    "distinctions, empty-set triggers), numeric_thresholds, iso_dates, entities, "
-    "and verification_checks. Output JSON only."
+    "distinctions, empty-set triggers, governing-scenario / load-case label rules), "
+    "hard_numeric_caps (exact <= cap, >= target, and controlling boundary limits), "
+    "numeric_thresholds, iso_dates, entities, and verification_checks. Output JSON only."
 )
 
 WORKER = (
@@ -179,8 +183,15 @@ VERIFIER = (
     "is NOT an unmodified template/stub, reflects the latest script edits, "
     "matches the exact path, headers, and format, respects every record-date / "
     "empty-set / scope rule verbatim, has no shifted CSV columns, formula errors, "
-    "duplicate rows, or missing/unpopulated register/device IDs, and satisfies "
-    "every hard constraint and tolerance recomputed directly from the file. "
+    "duplicate rows, or missing/unpopulated register/device/required IDs (verify "
+    "every required_register_ids entry is covered in any constraint_register file), "
+    "and satisfies every hard constraint and tolerance recomputed directly from the "
+    "file. Using Python directly against the final deliverable tables on disk "
+    "(never trusting narrative summaries), independently recompute: (a) all "
+    "governing scenario / load-case labels to confirm the reported governing label "
+    "matches the true controlling extreme across all scenarios in the table, and "
+    "(b) every hard numeric cap (<= cap, >= target), closely scrutinizing any "
+    "near-boundary values within ~5% of a limit from raw table numbers. "
     "Whenever external MCP stores were modified (e.g., OpenProject work packages/"
     "comments/journals, Nextcloud, Wiki), read back the actual persisted MCP "
     "records and comments/journals and verify single-valued entity consistency "
@@ -369,7 +380,7 @@ def resolve_runtime_config(config_path: str = "submission.yaml") -> Dict[str, An
     )
     max_work_turns = _safe_int(
         os.environ.get("MAX_WORK_TURNS") or env_cfg.get("MAX_WORK_TURNS"),
-        default=55,
+        default=75,
         minimum=2,
     )
     max_verify_turns = _safe_int(
@@ -1022,6 +1033,75 @@ _EMPTY_TRIGGER_LINE_RE = re.compile(
     r"never|prohibit|mandatory|releasable)\b|\[h\s{0,3}=\s{0,3}1\]",
     re.I,
 )
+_CONSTRAINT_REQ_ID_RANGE_RE = re.compile(
+    r"\b([RHS])(\d{2,3})\s{0,2}(?:\.\.|[-–—]|\bto\b|\bthrough\b)\s{0,2}\1(\d{2,3})\b"
+)
+_CONSTRAINT_HYPHEN_ID_RANGE_RE = re.compile(
+    r"\b(R-\d{2,6}-)(\d{1,4})\s{0,2}(?:\.\.|\bto\b|\bthrough\b)\s{0,2}(?:\1)?(\d{1,4})\b"
+    r"|\b(R-\d{2,6}-)(\d{1,4})\s{0,2}[-–—]\s{0,2}\4(\d{1,4})\b"
+)
+_CONSTRAINT_REQ_ID_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:R-\d{2,6}-\d{1,4}|(?<!-)[RHS]\d{2,3}(?!-\d))(?![A-Za-z0-9_])"
+)
+_CONSTRAINT_NON_REQ_CONTEXT_RE = re.compile(
+    r"\b(?:insulation|thermal|r-value|refrigerant|aashto|truck|schedule|sch\.?|radius|fillet|bend|resistor)\b",
+    re.I,
+)
+_CONSTRAINT_CAP_RE = re.compile(
+    r"(?:<=|>=|≤|≥|\b(?:max(?:imum)?|min(?:imum)?|at\s{1,2}most|at\s{1,2}least|"
+    r"no\s{1,2}more\s{1,2}than|not\s{1,2}to\s{1,2}exceed|cap(?:ped)?\s{1,2}at|target)\b(?:\s{1,2}of)?)"
+    r"\s{0,2}\$?\d{1,10}(?:[.,]\d{1,6})?"
+    r"(?:\s{0,2}(?:%|mm|cm|m/s|m\^2|m2|m|ft|in|kw|kva|mw|kv|v|a|hz|ms|deg|"
+    r"°c|°f|psi|kpa|bar|pa|db|rpm|gpm|cfm|fps|psf|plf|kip|kips|klf|lbs|lb|usd|\$))?"
+    r"(?![A-Za-z0-9])",
+    re.I,
+)
+_REGISTER_ID_TOKEN_RE = re.compile(r"^[A-Z]{1,6}(?:-[A-Z0-9]{1,8}){0,3}$")
+
+
+def _extract_id_token(item: Any) -> str:
+    """Extract a clean ID string from a string or dict entry."""
+    if isinstance(item, dict):
+        for key in ("id", "code", "requirement_id", "register_id"):
+            val = item.get(key)
+            if val is not None and str(val).strip():
+                return str(val).strip()
+        return ""
+    if item is None:
+        return ""
+    return str(item).strip()
+
+
+def _extract_req_ids(text: str, limit: int = 120) -> List[str]:
+    """Deterministically extract requirement/finding/scenario IDs in linear time."""
+    if not text:
+        return []
+    ids: List[str] = []
+    for m in _CONSTRAINT_REQ_ID_RANGE_RE.finditer(text):
+        prefix, s_str, e_str = m.group(1), m.group(2), m.group(3)
+        start_n, end_n = int(s_str), int(e_str)
+        if 0 <= end_n - start_n <= 100:
+            width = max(len(s_str), len(e_str))
+            for n in range(start_n, end_n + 1):
+                ids.append(f"{prefix}{n:0{width}d}")
+    for m in _CONSTRAINT_HYPHEN_ID_RANGE_RE.finditer(text):
+        prefix = m.group(1) or m.group(4)
+        s_str = m.group(2) or m.group(5)
+        e_str = m.group(3) or m.group(6)
+        start_n, end_n = int(s_str), int(e_str)
+        if 0 <= end_n - start_n <= 100:
+            width = max(len(s_str), len(e_str))
+            for n in range(start_n, end_n + 1):
+                ids.append(f"{prefix}{n:0{width}d}")
+    for m in _CONSTRAINT_REQ_ID_RE.finditer(text):
+        tok = m.group(0)
+        if "-" not in tok:
+            lo = max(0, m.start() - 25)
+            hi = min(len(text), m.end() + 25)
+            if _CONSTRAINT_NON_REQ_CONTEXT_RE.search(text[lo:hi]):
+                continue
+        ids.append(tok)
+    return _dedupe_strs(ids, limit=limit)
 
 
 def _extract_path_candidates(text: str) -> List[str]:
@@ -1063,6 +1143,8 @@ def _regex_extract_constraints(task: str, plan: str = "") -> Dict[str, Any]:
     """Zero-latency deterministic fallback extractor for CONSTRAINTS.json."""
     text = f"{task or ''}\n{plan or ''}".strip()
     file_paths = _dedupe_strs(_extract_path_candidates(text))
+    required_register_ids = _extract_req_ids(text, limit=120)
+    hard_numeric_caps = _dedupe_strs(_CONSTRAINT_CAP_RE.findall(text), limit=40)
     numeric_thresholds = _dedupe_strs(_CONSTRAINT_THRESHOLD_RE.findall(text))
     iso_dates = _dedupe_strs(_CONSTRAINT_DATE_RE.findall(text))
     raw_entities = _CONSTRAINT_ENTITY_RE.findall(text)
@@ -1076,12 +1158,22 @@ def _regex_extract_constraints(task: str, plan: str = "") -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "source": "regex_fallback",
         "file_paths": file_paths,
+        "required_register_ids": required_register_ids,
+        "hard_numeric_caps": hard_numeric_caps,
         "numeric_thresholds": numeric_thresholds,
         "iso_dates": iso_dates,
         "entities": entities,
         "empty_set_triggers": empty_set_triggers,
     }
-    if not (file_paths or numeric_thresholds or iso_dates or entities or empty_set_triggers):
+    if not (
+        file_paths
+        or required_register_ids
+        or hard_numeric_caps
+        or numeric_thresholds
+        or iso_dates
+        or entities
+        or empty_set_triggers
+    ):
         out["note"] = "no_constraints_found"
     return out
 
@@ -1094,10 +1186,108 @@ def _parse_or_fallback_constraints(raw: str, task: str, plan: str) -> str:
             parsed = json.loads(payload, parse_constant=_reject_json_constant)
             if isinstance(parsed, dict) and parsed:
                 parsed.setdefault("source", "llm_extractor")
+                text = f"{task or ''}\n{plan or ''}".strip()
+                if text:
+                    regex_ids = _extract_req_ids(text, limit=120)
+                    existing_raw_ids = parsed.get("required_register_ids")
+                    existing_ids = (
+                        [_extract_id_token(item) for item in existing_raw_ids]
+                        if isinstance(existing_raw_ids, list)
+                        else ([_extract_id_token(existing_raw_ids)] if existing_raw_ids else [])
+                    )
+                    existing_ids = [x for x in existing_ids if x]
+                    if regex_ids or existing_ids or "required_register_ids" in parsed:
+                        parsed["required_register_ids"] = _dedupe_strs(
+                            existing_ids + regex_ids,
+                            limit=160,
+                        )
+                    regex_caps = _dedupe_strs(_CONSTRAINT_CAP_RE.findall(text), limit=40)
+                    if regex_caps:
+                        existing_caps_raw = parsed.get("hard_numeric_caps")
+                        existing_caps = (
+                            [str(x) for x in existing_caps_raw if str(x).strip()]
+                            if isinstance(existing_caps_raw, list)
+                            else ([str(existing_caps_raw)] if isinstance(existing_caps_raw, str) and existing_caps_raw.strip() else [])
+                        )
+                        parsed["hard_numeric_caps"] = _dedupe_strs(
+                            existing_caps + regex_caps,
+                            limit=60,
+                        )
                 return json.dumps(parsed, indent=2, ensure_ascii=False)[:12_000]
         except Exception:
             pass
     return json.dumps(_regex_extract_constraints(task, plan), indent=2, ensure_ascii=False)
+
+
+def _extract_required_register_ids(
+    constraints_json: str,
+    task: str = "",
+    plan: str = "",
+) -> List[str]:
+    """Collect deduplicated required IDs from CONSTRAINTS.json and task/plan text."""
+    collected: List[str] = []
+    if constraints_json:
+        try:
+            parsed = json.loads(constraints_json, parse_constant=_reject_json_constant)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            raw_ids = parsed.get("required_register_ids")
+            items = raw_ids if isinstance(raw_ids, list) else ([raw_ids] if raw_ids else [])
+            for item in items:
+                tok = _extract_id_token(item).upper()
+                if tok and any(ch.isdigit() for ch in tok) and _REGISTER_ID_TOKEN_RE.match(tok):
+                    collected.append(tok)
+        collected.extend(_extract_req_ids(constraints_json, limit=160))
+    if task or plan:
+        collected.extend(_extract_req_ids(f"{task}\n{plan}", limit=160))
+    return _dedupe_strs(collected, limit=200)
+
+
+_AUDITABLE_DELIVERABLE_EXTS = (".xlsx", ".xlsm", ".csv", ".tsv", ".ifc", ".json", ".zip")
+
+
+def _extract_target_deliverables(
+    constraints_json: str,
+    workdir: str = "",
+) -> List[str]:
+    """Extract normalized declared deliverable file paths strictly from CONSTRAINTS.json deliverables."""
+    if not constraints_json:
+        return []
+    try:
+        parsed = json.loads(constraints_json, parse_constant=_reject_json_constant)
+    except Exception:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    raw_delivs = parsed.get("deliverables")
+    items = raw_delivs if isinstance(raw_delivs, list) else ([raw_delivs] if raw_delivs else [])
+    norm_wd = workdir.replace("\\", "/").strip().rstrip("/") if workdir else ""
+    out: List[str] = []
+    for item in items:
+        raw_val = ""
+        if isinstance(item, str):
+            raw_val = item
+        elif isinstance(item, dict):
+            for key in ("path", "file", "filename", "target"):
+                val = item.get(key)
+                if isinstance(val, str) and val.strip():
+                    raw_val = val
+                    break
+        if not raw_val:
+            continue
+        p = raw_val.strip().strip("`'\"")
+        p = p.replace("\\", "/").strip()
+        if norm_wd and p.lower().startswith(norm_wd.lower() + "/"):
+            p = p[len(norm_wd) + 1 :]
+        elif p.lower().startswith("/app/"):
+            p = p[len("/app/") :]
+        p = p.lstrip("./").lstrip("/")
+        if not p or " " in p:
+            continue
+        if any(p.lower().endswith(ext) for ext in _AUDITABLE_DELIVERABLE_EXTS):
+            out.append(p)
+    return _dedupe_strs(out, limit=100)
 
 
 def detect_contradictory_comment_statuses(text: str) -> List[str]:
@@ -1837,6 +2027,7 @@ class _DryRunCompletionsNamespace:
 
 AUDIT_MARKER = "__PLE_AUDIT_JSON__:"
 XLSX_BASELINE_MARKER = "__PLE_XLSX_BASELINE_JSON__:"
+FILE_BASELINE_MARKER = "__PLE_FILE_BASELINE_JSON__:"
 IFC_BASELINE_MARKER = "__PLE_IFC_BASELINE_JSON__:"
 
 _XLSX_BASELINE_SCRIPT = r'''
@@ -1860,6 +2051,8 @@ SKIP_DIRS = {
     "build",
     "site-packages",
 }
+AUDIT_BASELINE_EXTS = {".xlsx", ".xlsm", ".csv", ".tsv", ".ifc", ".json", ".zip"}
+LARGE_BASELINE_EXTS = {".ifc", ".zip"}
 
 root = Path.cwd()
 files = []
@@ -1876,7 +2069,8 @@ for cur, dirs, names in os.walk(root):
     if len(files) >= 2000:
         break
 
-baseline = {}
+xlsx_baseline = {}
+file_baseline = {}
 ifc_gids = set()
 _IFC_STEP_GID_RE = re.compile(
     r"#[0-9]+\s*=\s*IFC[A-Z0-9_]+\s*\(\s*'([0-9A-Za-z_$]{1,64})'",
@@ -1889,21 +2083,28 @@ except Exception:
 
 for p in files:
     suf = p.suffix.lower()
-    if suf in {".xlsx", ".xlsm"}:
-        try:
-            size = p.stat().st_size
-            if size > 25 * 1024 * 1024:
-                continue
-            raw = p.read_bytes()
+    if suf not in AUDIT_BASELINE_EXTS:
+        continue
+    max_bytes = 50 * 1024 * 1024 if suf in LARGE_BASELINE_EXTS else 25 * 1024 * 1024
+    try:
+        size = p.stat().st_size
+        if size <= max_bytes:
+            h = hashlib.sha256()
+            with p.open("rb") as fh:
+                while True:
+                    chunk = fh.read(65536)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            entry = [size, h.hexdigest()]
             rel = p.relative_to(root).as_posix()
-            baseline[rel] = [size, hashlib.sha256(raw).hexdigest()]
-        except OSError:
-            continue
-    elif suf == ".ifc":
+            file_baseline[rel] = entry
+            if suf in {".xlsx", ".xlsm"}:
+                xlsx_baseline[rel] = entry
+    except OSError:
+        continue
+    if suf == ".ifc" and size <= 50 * 1024 * 1024:
         try:
-            size = p.stat().st_size
-            if size > 50 * 1024 * 1024:
-                continue
             if _ifc_base_mod is not None:
                 try:
                     _m = _ifc_base_mod.open(str(p))
@@ -1930,7 +2131,8 @@ for p in files:
         except Exception:
             continue
 
-print("__PLE_XLSX_BASELINE_JSON__:" + json.dumps(baseline))
+print("__PLE_XLSX_BASELINE_JSON__:" + json.dumps(xlsx_baseline))
+print("__PLE_FILE_BASELINE_JSON__:" + json.dumps(file_baseline))
 print("__PLE_IFC_BASELINE_JSON__:" + json.dumps(sorted(ifc_gids)[:50000]))
 '''
 
@@ -1957,6 +2159,17 @@ if not BASELINE_XLSX and os.environ.get("PLE_AUDIT_BASELINE_XLSX_JSON"):
             BASELINE_XLSX = _env_base
     except Exception:
         BASELINE_XLSX = {}
+BASELINE_FILES = {}  # __PLE_BASELINE_FILES__
+if not BASELINE_FILES and os.environ.get("PLE_AUDIT_BASELINE_FILES_JSON"):
+    try:
+        _env_files = json.loads(os.environ["PLE_AUDIT_BASELINE_FILES_JSON"])
+        if isinstance(_env_files, dict):
+            BASELINE_FILES = _env_files
+    except Exception:
+        BASELINE_FILES = {}
+if isinstance(BASELINE_XLSX, dict):
+    for _bk, _bv in BASELINE_XLSX.items():
+        BASELINE_FILES.setdefault(_bk, _bv)
 BASELINE_IFC_GIDS = set()  # __PLE_BASELINE_IFC_GIDS__
 if not BASELINE_IFC_GIDS and os.environ.get("PLE_AUDIT_BASELINE_IFC_GIDS_JSON"):
     try:
@@ -1967,6 +2180,26 @@ if not BASELINE_IFC_GIDS and os.environ.get("PLE_AUDIT_BASELINE_IFC_GIDS_JSON"):
         BASELINE_IFC_GIDS = set()
 else:
     BASELINE_IFC_GIDS = {str(x) for x in BASELINE_IFC_GIDS if str(x).strip()}
+REQUIRED_REGISTER_IDS = []  # __PLE_REQUIRED_REGISTER_IDS__
+if not REQUIRED_REGISTER_IDS and os.environ.get("PLE_AUDIT_REQUIRED_REGISTER_IDS_JSON"):
+    try:
+        _env_rids = json.loads(os.environ["PLE_AUDIT_REQUIRED_REGISTER_IDS_JSON"])
+        if isinstance(_env_rids, list):
+            REQUIRED_REGISTER_IDS = [str(x).strip() for x in _env_rids if str(x).strip()]
+    except Exception:
+        REQUIRED_REGISTER_IDS = []
+else:
+    REQUIRED_REGISTER_IDS = [str(x).strip() for x in REQUIRED_REGISTER_IDS if str(x).strip()]
+TARGET_DELIVERABLES = []  # __PLE_TARGET_DELIVERABLES__
+if not TARGET_DELIVERABLES and os.environ.get("PLE_AUDIT_TARGET_DELIVERABLES_JSON"):
+    try:
+        _env_tdelivs = json.loads(os.environ["PLE_AUDIT_TARGET_DELIVERABLES_JSON"])
+        if isinstance(_env_tdelivs, list):
+            TARGET_DELIVERABLES = [str(x).strip() for x in _env_tdelivs if str(x).strip()]
+    except Exception:
+        TARGET_DELIVERABLES = []
+else:
+    TARGET_DELIVERABLES = [str(x).strip() for x in TARGET_DELIVERABLES if str(x).strip()]
 SKIP_DIRS = {
     ".git",
     "__pycache__",
@@ -2271,6 +2504,63 @@ def _check_summary_totals(rel: str, header, indexed_rows):
                     f"reported {reported:g} vs sum of {len(nums0)} detail rows {exp0:g}"
                 )
 
+REQ_CELL_ID_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:R-\d{2,6}-\d{1,4}|[A-Z]{1,6}-\d{1,6}|[RHS]\d{2,3})(?![A-Za-z0-9_])"
+)
+
+def _is_constraint_register(rel: str) -> bool:
+    leaf = rel.rsplit("!", 1)[-1]
+    stem = Path(leaf).stem.lower()
+    norm = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
+    return "constraint_register" in norm or "constraints_register" in norm
+
+def _req_id_family(rid: str) -> str:
+    up = str(rid).strip().upper()
+    if re.match(r"^R-\d{2,6}-\d{1,4}$", up):
+        return "R-hyphen:" + up.rsplit("-", 1)[0] + "-"
+    if re.match(r"^R\d{2,3}$", up):
+        return "R-num"
+    if re.match(r"^H\d{2,3}$", up):
+        return "H-num"
+    if re.match(r"^S\d{2,3}$", up):
+        return "S-num"
+    if "-" in up:
+        return "custom:" + up.rsplit("-", 1)[0] + "-"
+    return "custom:" + "".join(ch for ch in up if ch.isalpha())
+
+def _check_constraint_register_coverage(rel: str, cell_values):
+    if not REQUIRED_REGISTER_IDS or not _is_constraint_register(rel):
+        return
+    found_tokens = set()
+    for val in cell_values:
+        if val is None:
+            continue
+        s = str(val).strip()
+        if not s:
+            continue
+        if " " not in s and len(s) <= 40:
+            found_tokens.add(s.upper())
+        for tok in REQ_CELL_ID_RE.findall(s):
+            found_tokens.add(tok.upper())
+    present_families = {_req_id_family(tok) for tok in found_tokens if any(ch.isdigit() for ch in tok)}
+    required_families = {_req_id_family(rid) for rid in REQUIRED_REGISTER_IDS}
+    matched_families = present_families & required_families
+    has_r_family = any(f.startswith("R-") for f in present_families)
+    if matched_families or has_r_family:
+        targets = [
+            rid
+            for rid in REQUIRED_REGISTER_IDS
+            if _req_id_family(rid) in matched_families
+            or (has_r_family and _req_id_family(rid).startswith("R-"))
+        ]
+    else:
+        targets = list(REQUIRED_REGISTER_IDS)
+    missing = [rid for rid in targets if rid.upper() not in found_tokens]
+    if missing:
+        errors.append(
+            f"{rel}: constraint_register missing {len(missing)} required ID(s): {missing[:15]}"
+        )
+
 def _audit_csv_text(rel: str, text: str):
     if not text.strip():
         errors.append(f"{rel}: deliverable file is empty (0 bytes/blank)")
@@ -2290,6 +2580,8 @@ def _audit_csv_text(rel: str, text: str):
     if not header or all(not str(c).strip() for c in header):
         errors.append(f"{rel}: blank CSV header row")
         return
+    if REQUIRED_REGISTER_IDS and _is_constraint_register(rel):
+        _check_constraint_register_coverage(rel, [c for r in rows[1:] for c in r])
     data_rows = [r for r in rows[1:] if any(str(c).strip() for c in r)]
     bad_cols = [idx + 2 for idx, r in enumerate(rows[1:]) if r and len(r) != len(header)]
     if bad_cols:
@@ -2397,6 +2689,8 @@ def _audit_xlsx_stdlib(rel: str, raw_bytes: bytes):
                 sheets = [(Path(n).stem, n) for n in ws_names]
             if not sheets:
                 return
+            check_reg = bool(REQUIRED_REGISTER_IDS and _is_constraint_register(rel))
+            register_cells = []
             for sname, ws_path in sheets:
                 ws_root = ET.fromstring(zf.read(ws_path))
                 sheet_header = None
@@ -2485,6 +2779,8 @@ def _audit_xlsx_stdlib(rel: str, raw_bytes: bytes):
                             str(row_cells.get(i, "") or "") for i in range(max_c + 1)
                         ]
                         continue
+                    if check_reg:
+                        register_cells.extend(cv for cv in row_cells.values() if cv is not None)
                     if max_c >= len(sheet_header):
                         bad_cols.append(r_idx)
                         continue
@@ -2505,6 +2801,8 @@ def _audit_xlsx_stdlib(rel: str, raw_bytes: bytes):
                     if id_rows:
                         _check_headers_and_id_rows(f"{rel}[{sname}]", sheet_header, id_rows)
                     _check_summary_totals(f"{rel}[{sname}]", sheet_header, all_aligned)
+            if check_reg:
+                _check_constraint_register_coverage(rel, register_cells)
     except Exception as exc:
         errors.append(f"{rel}: failed reading XLSX XML (stdlib): {exc}")
 
@@ -2533,6 +2831,9 @@ def _audit_xlsx_bytes(rel: str, raw_bytes: bytes):
         return
     if openpyxl is not None:
         sheet_headers = {}
+        check_reg = bool(REQUIRED_REGISTER_IDS and _is_constraint_register(rel))
+        register_cells = []
+        saw_formula_pass = False
         for data_only in (False, True):
             wb = None
             try:
@@ -2554,6 +2855,8 @@ def _audit_xlsx_bytes(rel: str, raw_bytes: bytes):
                             sheet_header = [str(row[i]) if row[i] is not None else "" for i in range(last_ne + 1)]
                             sheet_headers[sname] = sheet_header
                         elif r_idx > 1 and last_ne >= 0:
+                            if check_reg and not data_only:
+                                register_cells.extend(c for c in row if c is not None)
                             if sheet_header is not None and last_ne >= len(sheet_header):
                                 if not data_only:
                                     bad_cols.append(r_idx)
@@ -2581,6 +2884,8 @@ def _audit_xlsx_bytes(rel: str, raw_bytes: bytes):
                         _check_headers_and_id_rows(f"{rel}[{sname}]", sheet_header, sheet_rows)
                     if data_only and sheet_header and any(h.strip() for h in sheet_header) and calc_indexed:
                         _check_summary_totals(f"{rel}[{sname}]", sheet_header, calc_indexed)
+                if not data_only:
+                    saw_formula_pass = True
             except Exception as exc:
                 errors.append(f"{rel}: failed reading workbook (data_only={data_only}): {exc}")
             finally:
@@ -2589,6 +2894,8 @@ def _audit_xlsx_bytes(rel: str, raw_bytes: bytes):
                         wb.close()
                     except Exception:
                         pass
+        if check_reg and saw_formula_pass:
+            _check_constraint_register_coverage(rel, register_cells)
 
 def _audit_json_text(rel: str, text: str):
     if not text.strip():
@@ -2644,8 +2951,37 @@ def _audit_zip_file(rel: str, p: Path):
     except Exception as exc:
         errors.append(f"{rel}: corrupt ZIP archive: {exc}")
 
+AUDITABLE_EXTS = {".xlsx", ".xlsm", ".csv", ".tsv", ".ifc", ".json", ".zip"}
+LARGE_AUDITABLE_EXTS = {".ifc", ".zip"}
+
+def _file_sha256(p: Path) -> str:
+    h = hashlib.sha256()
+    with p.open("rb") as fh:
+        while True:
+            chunk = fh.read(65536)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+def _is_target_deliverable(rel: str) -> bool:
+    if not TARGET_DELIVERABLES:
+        return False
+    rel_low = rel.replace("\\", "/").lstrip("./").lower()
+    for t in TARGET_DELIVERABLES:
+        t_low = str(t).replace("\\", "/").lstrip("./").lower()
+        if not t_low:
+            continue
+        if "/" in t_low:
+            if rel_low == t_low:
+                return True
+        elif rel_low == t_low or rel_low == f"output/{t_low}":
+            return True
+    return False
+
 ifc_files = []
 skipped_unmodified_xlsx = []
+skipped_unmodified_inputs = []
 mep_summary = {}
 clear_height = {"routed_mep": [], "terminals": []}
 for p in files:
@@ -2655,16 +2991,19 @@ for p in files:
         size = p.stat().st_size
     except OSError:
         continue
-    if ext in {".xlsx", ".xlsm"} and BASELINE_XLSX:
-        base_entry = BASELINE_XLSX.get(rel)
+    if ext in AUDITABLE_EXTS and BASELINE_FILES and not _is_target_deliverable(rel):
+        base_entry = BASELINE_FILES.get(rel)
         if isinstance(base_entry, (list, tuple)) and len(base_entry) >= 2:
+            max_base_bytes = 50 * 1024 * 1024 if ext in LARGE_AUDITABLE_EXTS else 25 * 1024 * 1024
             try:
                 if (
                     size == int(base_entry[0])
-                    and size <= 25 * 1024 * 1024
-                    and hashlib.sha256(p.read_bytes()).hexdigest() == str(base_entry[1])
+                    and size <= max_base_bytes
+                    and _file_sha256(p) == str(base_entry[1])
                 ):
-                    skipped_unmodified_xlsx.append(rel)
+                    skipped_unmodified_inputs.append(rel)
+                    if ext in {".xlsx", ".xlsm"}:
+                        skipped_unmodified_xlsx.append(rel)
                     continue
             except (TypeError, ValueError, OSError):
                 pass
@@ -3711,6 +4050,7 @@ print(
             "errors": errors[:30],
             "warnings": warnings[:30],
             "skipped_unmodified_xlsx": skipped_unmodified_xlsx[:30],
+            "skipped_unmodified_inputs": skipped_unmodified_inputs[:50],
             "mep_summary": mep_summary,
             "clear_height": clear_height,
         }
@@ -3719,18 +4059,23 @@ print(
 '''
 
 
-def _normalize_xlsx_baseline(baseline_xlsx: Optional[Dict[str, Any]]) -> Dict[str, List[Any]]:
-    """Validate and normalize a relative-path -> [size, sha256] XLSX baseline map."""
-    if not isinstance(baseline_xlsx, dict):
+def _normalize_file_baseline(baseline_files: Optional[Dict[str, Any]]) -> Dict[str, List[Any]]:
+    """Validate and normalize a relative-path -> [size, sha256] file baseline map."""
+    if not isinstance(baseline_files, dict):
         return {}
     clean: Dict[str, List[Any]] = {}
-    for k, v in baseline_xlsx.items():
+    for k, v in baseline_files.items():
         if isinstance(k, str) and isinstance(v, (list, tuple)) and len(v) >= 2:
             try:
                 clean[k] = [int(v[0]), str(v[1])]
             except (TypeError, ValueError):
                 continue
     return clean
+
+
+def _normalize_xlsx_baseline(baseline_xlsx: Optional[Dict[str, Any]]) -> Dict[str, List[Any]]:
+    """Validate and normalize a relative-path -> [size, sha256] XLSX baseline map."""
+    return _normalize_file_baseline(baseline_xlsx)
 
 
 def _normalize_ifc_baseline(baseline_ifc_gids: Optional[Iterable[str]]) -> List[str]:
@@ -3750,7 +4095,7 @@ def _normalize_ifc_baseline(baseline_ifc_gids: Optional[Iterable[str]]) -> List[
 async def capture_workspace_baseline(
     session: taskbridge.Session,
 ) -> Tuple[Dict[str, List[Any]], List[str]]:
-    """Capture pre-existing XLSX hashes and IFC GlobalIds before WORKER runs."""
+    """Capture pre-existing auditable file hashes and IFC GlobalIds before WORKER runs."""
     if getattr(session, "cancelled", None) and session.cancelled.is_set():
         return {}, []
     if not hasattr(session, "exec"):
@@ -3776,14 +4121,20 @@ async def capture_workspace_baseline(
         return {}, []
 
     output = str((res or {}).get("output") or "")
+    file_base: Dict[str, List[Any]] = {}
     xlsx_base: Dict[str, List[Any]] = {}
     ifc_base: List[str] = []
     for line in reversed(output.splitlines()):
-        if not xlsx_base and line.startswith(XLSX_BASELINE_MARKER):
+        if not file_base and line.startswith(FILE_BASELINE_MARKER):
+            raw = line[len(FILE_BASELINE_MARKER):].strip()
+            try:
+                file_base = _normalize_file_baseline(json.loads(raw))
+            except json.JSONDecodeError:
+                file_base = {}
+        elif not xlsx_base and line.startswith(XLSX_BASELINE_MARKER):
             raw = line[len(XLSX_BASELINE_MARKER):].strip()
             try:
-                parsed = json.loads(raw)
-                xlsx_base = _normalize_xlsx_baseline(parsed)
+                xlsx_base = _normalize_file_baseline(json.loads(raw))
             except json.JSONDecodeError:
                 xlsx_base = {}
         elif not ifc_base and line.startswith(IFC_BASELINE_MARKER):
@@ -3794,29 +4145,73 @@ async def capture_workspace_baseline(
                     ifc_base = _normalize_ifc_baseline(parsed_ifc)
             except json.JSONDecodeError:
                 ifc_base = []
-    return xlsx_base, ifc_base
+    return (file_base or xlsx_base), ifc_base
 
 
 async def capture_xlsx_baseline(session: taskbridge.Session) -> Dict[str, List[Any]]:
     """Capture a baseline snapshot of pre-existing XLSX/XLSM files in the task workspace."""
-    xlsx_base, _ = await capture_workspace_baseline(session)
-    return xlsx_base
+    file_base, _ = await capture_workspace_baseline(session)
+    return {
+        k: v
+        for k, v in file_base.items()
+        if Path(k).suffix.lower() in {".xlsx", ".xlsm"}
+    }
+
+
+def _normalize_required_register_ids(
+    required_register_ids: Optional[Iterable[str]],
+) -> List[str]:
+    """Validate and deduplicate required register/requirement IDs."""
+    if not required_register_ids or isinstance(required_register_ids, (str, bytes)):
+        return []
+    return _dedupe_strs(
+        (str(x).strip() for x in required_register_ids if str(x).strip()),
+        limit=200,
+    )
+
+
+def _normalize_target_deliverables(
+    target_deliverables: Optional[Iterable[str]],
+) -> List[str]:
+    """Validate and deduplicate normalized declared deliverable paths."""
+    if not target_deliverables or isinstance(target_deliverables, (str, bytes)):
+        return []
+    return _dedupe_strs(
+        (
+            str(x).strip().replace("\\", "/").lstrip("./").lstrip("/")
+            for x in target_deliverables
+            if str(x).strip()
+        ),
+        limit=100,
+    )
 
 
 def _build_programmatic_audit_script(
     task: str = "",
     baseline_xlsx: Optional[Dict[str, Any]] = None,
     baseline_ifc_gids: Optional[Iterable[str]] = None,
+    baseline_files: Optional[Dict[str, Any]] = None,
+    required_register_ids: Optional[Iterable[str]] = None,
+    target_deliverables: Optional[Iterable[str]] = None,
 ) -> str:
     """Return a self-contained Python 3 audit script for task deliverables."""
     _ = task
     script = _PROGRAMMATIC_AUDIT_SCRIPT
-    clean = _normalize_xlsx_baseline(baseline_xlsx)
-    if clean:
-        encoded = json.dumps(json.dumps(clean, separators=(",", ":")))
+    clean_xlsx = _normalize_file_baseline(baseline_xlsx)
+    if clean_xlsx:
+        encoded = json.dumps(json.dumps(clean_xlsx, separators=(",", ":")))
         script = script.replace(
             "BASELINE_XLSX = {}  # __PLE_BASELINE_XLSX__",
             f"BASELINE_XLSX = json.loads({encoded})",
+            1,
+        )
+    merged_files = dict(clean_xlsx)
+    merged_files.update(_normalize_file_baseline(baseline_files))
+    if merged_files:
+        encoded_files = json.dumps(json.dumps(merged_files, separators=(",", ":")))
+        script = script.replace(
+            "BASELINE_FILES = {}  # __PLE_BASELINE_FILES__",
+            f"BASELINE_FILES = json.loads({encoded_files})",
             1,
         )
     clean_gids = _normalize_ifc_baseline(baseline_ifc_gids)
@@ -3827,6 +4222,22 @@ def _build_programmatic_audit_script(
             f"BASELINE_IFC_GIDS = set(json.loads({encoded_gids}))",
             1,
         )
+    clean_rids = _normalize_required_register_ids(required_register_ids)
+    if clean_rids:
+        encoded_rids = json.dumps(json.dumps(clean_rids, separators=(",", ":")))
+        script = script.replace(
+            "REQUIRED_REGISTER_IDS = []  # __PLE_REQUIRED_REGISTER_IDS__",
+            f"REQUIRED_REGISTER_IDS = json.loads({encoded_rids})",
+            1,
+        )
+    clean_tdelivs = _normalize_target_deliverables(target_deliverables)
+    if clean_tdelivs:
+        encoded_tdelivs = json.dumps(json.dumps(clean_tdelivs, separators=(",", ":")))
+        script = script.replace(
+            "TARGET_DELIVERABLES = []  # __PLE_TARGET_DELIVERABLES__",
+            f"TARGET_DELIVERABLES = json.loads({encoded_tdelivs})",
+            1,
+        )
     return script
 
 
@@ -3835,12 +4246,16 @@ async def run_programmatic_audit(
     task: str = "",
     baseline_xlsx: Optional[Dict[str, Any]] = None,
     baseline_ifc_gids: Optional[Iterable[str]] = None,
+    baseline_files: Optional[Dict[str, Any]] = None,
+    required_register_ids: Optional[Iterable[str]] = None,
+    target_deliverables: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """Run deterministic CSV/XLSX/JSON/IFC checks in the task container before verification."""
     empty: Dict[str, Any] = {
         "errors": [],
         "warnings": [],
         "skipped_unmodified_xlsx": [],
+        "skipped_unmodified_inputs": [],
         "mep_summary": {},
         "clear_height": {"routed_mep": [], "terminals": []},
         "summary": "",
@@ -3853,6 +4268,9 @@ async def run_programmatic_audit(
         task,
         baseline_xlsx=baseline_xlsx,
         baseline_ifc_gids=baseline_ifc_gids,
+        baseline_files=baseline_files,
+        required_register_ids=required_register_ids,
+        target_deliverables=target_deliverables,
     )
     cmd = (
         "PY_BIN=$(command -v python3 || command -v python || true)\n"
@@ -3889,6 +4307,11 @@ async def run_programmatic_audit(
             skipped_xlsx = [
                 str(x) for x in (parsed.get("skipped_unmodified_xlsx") or []) if str(x).strip()
             ]
+            skipped_inputs = [
+                str(x) for x in (parsed.get("skipped_unmodified_inputs") or []) if str(x).strip()
+            ]
+            if not skipped_inputs and skipped_xlsx:
+                skipped_inputs = list(skipped_xlsx)
             mep_summary = (
                 parsed.get("mep_summary")
                 if isinstance(parsed.get("mep_summary"), dict)
@@ -3924,6 +4347,7 @@ async def run_programmatic_audit(
                 "errors": errors,
                 "warnings": warnings,
                 "skipped_unmodified_xlsx": skipped_xlsx,
+                "skipped_unmodified_inputs": skipped_inputs,
                 "mep_summary": mep_summary,
                 "clear_height": clear_height,
                 "summary": "\n".join(lines),
@@ -4001,8 +4425,13 @@ async def solve(
             await session.log(f"extractor failed ({exc}); falling back to regex constraint extraction")
             constraints_json = json.dumps(_regex_extract_constraints(task, plan), indent=2, ensure_ascii=False)
         await session.log(f"constraints: {constraints_json[:1000]}")
+        required_register_ids = _extract_required_register_ids(constraints_json, task, plan)
+        target_deliverables = _extract_target_deliverables(
+            constraints_json,
+            workdir=str(getattr(session, "workdir", "") or ""),
+        )
 
-        baseline_xlsx, baseline_ifc_gids = (
+        baseline_files, baseline_ifc_gids = (
             await capture_workspace_baseline(session) if max_fix_rounds > 0 else ({}, [])
         )
         work = conversation(
@@ -4022,7 +4451,7 @@ async def solve(
             mcp_registry=mcp_registry,
             breaker=breaker,
             final=True,
-            max_turns=runtime_cfg.get("max_work_turns", 55),
+            max_turns=runtime_cfg.get("max_work_turns", 75),
             run_state=work_state,
         )
         if work_state.get("truncated"):
@@ -4038,14 +4467,17 @@ async def solve(
             await run_programmatic_audit(
                 session,
                 task,
-                baseline_xlsx=baseline_xlsx,
+                baseline_files=baseline_files,
                 baseline_ifc_gids=baseline_ifc_gids,
+                required_register_ids=required_register_ids,
+                target_deliverables=target_deliverables,
             )
             if max_fix_rounds > 0
             else {
                 "errors": [],
                 "warnings": [],
                 "skipped_unmodified_xlsx": [],
+                "skipped_unmodified_inputs": [],
                 "mep_summary": {},
                 "clear_height": {"routed_mep": [], "terminals": []},
                 "summary": "",
@@ -4206,8 +4638,10 @@ async def solve(
             audit = await run_programmatic_audit(
                 session,
                 task,
-                baseline_xlsx=baseline_xlsx,
+                baseline_files=baseline_files,
                 baseline_ifc_gids=baseline_ifc_gids,
+                required_register_ids=required_register_ids,
+                target_deliverables=target_deliverables,
             )
             err_tail = f" {'; '.join(audit['errors'][:5])}" if audit["errors"] else ""
             await session.log(
