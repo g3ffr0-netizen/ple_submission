@@ -3645,7 +3645,6 @@ async def solve(
         worker_tools = TOOLS + mcp_tool_defs
         verifier_tools = READ_ONLY + mcp_tool_defs
         max_fix_rounds = int(runtime_cfg.get("max_fix_rounds", 2))
-        baseline_xlsx = await capture_xlsx_baseline(session) if max_fix_rounds > 0 else {}
 
         task = session.instruction
         plan = await agent(
@@ -3688,6 +3687,7 @@ async def solve(
             constraints_json = json.dumps(_regex_extract_constraints(task, plan), indent=2, ensure_ascii=False)
         await session.log(f"constraints: {constraints_json[:1000]}")
 
+        baseline_xlsx = await capture_xlsx_baseline(session) if max_fix_rounds > 0 else {}
         work = conversation(
             WORKER,
             session,

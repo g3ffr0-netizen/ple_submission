@@ -2028,7 +2028,7 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
                 )
                 self.assertEqual(ans_b, "Repaired Schedule.xlsx cleanly.")
                 self.assertEqual(client_b.verifier_calls, 2)
-                self.assertIn("Schedule.xlsx[Schedule]: spreadsheet error '#REF!'", client_b.fix_prompt)
+                self.assertIn("Schedule.xlsx[Schedule] R2C2: Excel error/NaN token '#REF!'", client_b.fix_prompt)
                 self.assertNotIn("DER_Program_Contact_Directory.xlsx", client_b.fix_prompt)
                 self.assertIn("compact, minimal-length BIM/MEP routes", client_b.fix_prompt)
                 self.assertTrue(any("audit(post-fix): errors=0 warnings=0" in ln for ln in sess_b.logs))
