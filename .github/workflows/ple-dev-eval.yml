@@ -28,6 +28,10 @@ permissions:
   contents: write
   packages: write
 
+concurrency:
+  group: ple-dev-eval-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   plan-and-check:
     runs-on: ubuntu-latest
@@ -347,9 +351,15 @@ jobs:
 
       - name: Reclaim runner disk space for container images
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/boost /usr/local/share/chromium /usr/local/lib/node_modules || true
-          sudo docker system prune -af --volumes || true
-          sudo apt-get clean || true
+          FREE_GB=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
+          echo "Available root disk before reclaim: ${FREE_GB:-0} GB"
+          if [ "${FREE_GB:-0}" -lt 35 ]; then
+            sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/boost /usr/local/share/chromium /usr/local/lib/node_modules || true
+            sudo docker system prune -af --volumes || true
+            sudo apt-get clean || true
+          else
+            echo "Skipping disk reclaim (>= 35 GB free)"
+          fi
           df -h
 
       - name: Set up Python 3.12
@@ -587,6 +597,71 @@ jobs:
           echo "::error::Model proxy did not become ready within 180s"
           tail -n 60 "$RUNNER_TEMP/model_proxy.log" || true
           exit 1
+
+      - name: Pre-flight Vertex AI Opus judge quota check (rubric / checks-judge)
+        if: ${{ steps.task_meta.outputs.grading == 'rubric' || steps.task_meta.outputs.grading == 'checks-judge' }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          proxy_key = os.environ["MODEL_PROXY_KEY"]
+          base_url = os.environ.get("MODEL_PROXY_URL", "http://127.0.0.1:4000").rstrip("/")
+          headers = {
+              "Authorization": f"Bearer {proxy_key}",
+              "Content-Type": "application/json",
+          }
+
+          models = []
+          try:
+              req = urllib.request.Request(f"{base_url}/v1/models", headers=headers, method="GET")
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  payload = json.loads(resp.read().decode("utf-8"))
+                  models = [str(m.get("id") or "") for m in (payload.get("data") or []) if m.get("id")]
+          except Exception as exc:
+              print(f"::warning::Could not list proxy models during Opus pre-flight: {exc}")
+
+          judge_model = next(
+              (cand for cand in ("claude-opus-5-5-judge", "claude-opus-5-5") if cand in models),
+              None,
+          )
+          if judge_model is None:
+              judge_model = next((m for m in models if "opus" in m.lower()), None)
+          if judge_model is None:
+              print(f"No Opus model found in proxy /v1/models ({models}); skipping 1-token judge probe.")
+              sys.exit(0)
+
+          body = json.dumps(
+              {
+                  "model": judge_model,
+                  "messages": [{"role": "user", "content": "Reply with ok"}],
+                  "max_tokens": 1,
+              }
+          ).encode("utf-8")
+          probe = urllib.request.Request(
+              f"{base_url}/v1/chat/completions",
+              data=body,
+              headers=headers,
+              method="POST",
+          )
+          try:
+              with urllib.request.urlopen(probe, timeout=300) as resp:
+                  print(f"Pre-flight Opus judge probe PASSED for {judge_model} (HTTP {resp.status}).")
+          except urllib.error.HTTPError as exc:
+              err_body = exc.read().decode("utf-8", errors="replace")
+              err_low = err_body.lower()
+              if exc.code == 429 or any(tok in err_low for tok in ("ratelimiterror", "quota exceeded", "resource_exhausted")):
+                  print(
+                      f"::error::Vertex AI Opus judge quota is currently throttled (HTTP {exc.code}) for {judge_model}; "
+                      f"aborting before Harbor/agent spend: {err_body[:400]}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+              print(f"::warning::Opus pre-flight returned HTTP {exc.code} (non-429); continuing: {err_body[:250]}")
+          PY
 
       - name: Run task evaluation with 60s live progress stream
         id: run_task
