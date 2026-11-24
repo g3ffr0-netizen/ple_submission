@@ -296,8 +296,16 @@ def gdocs_set_task_status(doc_id: str, task_id: str, new_status: str) -> None:
     norm = new_status.strip().upper()
     struct = gdocs_read_structure(doc_id)
     elem_idx = gdocs_find_task_elem(struct, task_id)
-    expr = f"{elem_idx}s/STATUS:\\s*(PENDING|IN_PROGRESS|DONE|COMPLETED)/STATUS: {norm}/"
-    _run_gdocs(["mutate", "sed", doc_id, "-e", expr, "--regex", "--first"])
+    doc_md = gdocs_read_markdown(doc_id)
+    current = "PENDING"
+    for cand in ("PENDING", "IN_PROGRESS", "DONE", "COMPLETED"):
+        if re.search(rf"\[{re.escape(task_id)}\\\]?\s*.*?STATUS:\s*{cand.replace('_', r'\\?_')}", _unescape_gdocs_md(doc_md), re.S):
+            current = cand
+            break
+    if current == norm:
+        return
+    expr = f"{elem_idx}s/STATUS: {current}/STATUS: {norm}/"
+    _run_gdocs(["mutate", "sed", doc_id, expr, "--first"])
 
 
 def gdocs_append_section3(
