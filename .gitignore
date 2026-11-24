@@ -21,3 +21,5 @@ Thumbs.db
 # Local eval & test artifacts
 eval/results.json
 .pytest_cache/
+.eval_cache/
+eval_results/
