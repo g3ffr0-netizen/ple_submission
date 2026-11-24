@@ -28,11 +28,15 @@ import taskbridge
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
-def _run_audit(workdir: Path, env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+def _run_audit(
+    workdir: Path,
+    env: Optional[Dict[str, str]] = None,
+    baseline_xlsx: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Run serve._PROGRAMMATIC_AUDIT_SCRIPT in a temp workdir and parse its JSON report."""
     proc = subprocess.run(
         [sys.executable, "-"],
-        input=serve._build_programmatic_audit_script(),
+        input=serve._build_programmatic_audit_script(baseline_xlsx=baseline_xlsx),
         cwd=workdir,
         env=env,
         capture_output=True,
@@ -388,11 +392,25 @@ class _LocalReplaySession:
             rel = norm
         return self._root / rel
 
+    @staticmethod
+    def _extract_heredoc(command: str, tag: str) -> Optional[str]:
+        lines = command.splitlines()
+        start_marker = f"<<'{tag}'"
+        for idx, ln in enumerate(lines):
+            if start_marker in ln:
+                for end_idx in range(idx + 1, len(lines)):
+                    if lines[end_idx].strip() == tag:
+                        return "\n".join(lines[idx + 1 : end_idx])
+        return None
+
     async def exec(self, command: str, timeout_sec: int = 120) -> Dict[str, Any]:
-        is_audit = "__PLE_AUDIT__" in command
+        script_body = (
+            self._extract_heredoc(command, "__PLE_XLSX_BASELINE__")
+            or self._extract_heredoc(command, "__PLE_AUDIT__")
+        )
         res = subprocess.run(
-            [sys.executable, "-"] if is_audit else [sys.executable, "-c", "print('ok')"],
-            input=serve._build_programmatic_audit_script() if is_audit else None,
+            [sys.executable, "-"] if script_body is not None else [sys.executable, "-c", "print('ok')"],
+            input=script_body,
             cwd=self._root,
             capture_output=True,
             text=True,
@@ -740,6 +758,110 @@ class TestLayer1SyntheticFailureFixtures(unittest.TestCase):
             clean = _run_audit(clean_dir, env=env)
             self.assertEqual(clean["errors"], [])
             self.assertEqual(clean["warnings"], [])
+
+    def test_xlsx_audit_skips_unmodified_baseline_inputs_and_catches_modified_or_new(self):
+        import stat
+
+        defective_sheet = _make_ooxml_xlsx(
+            {
+                "Summary": [
+                    ["Array", "Status"],
+                    ["Cravenwood", "Carried", "EXTRA_SHIFTED_COL"],
+                    ["Darnwick", "=1/0 (#REF!)"],
+                ]
+            }
+        )
+        clean_sheet = _make_ooxml_xlsx(
+            {
+                "Schedule": [
+                    ["device_id", "register_id", "qty"],
+                    ["INV-1", "REG-1", 4],
+                    ["TOTAL", "", 4],
+                ]
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            ro_input = workdir / "DER_Program_Contact_Directory.xlsx"
+            untouched_equip = workdir / "Equipment" / "2025-06_Supplier_Lead_Time_Report.xlsx"
+            untouched_equip.parent.mkdir(parents=True, exist_ok=True)
+            ro_input.write_bytes(defective_sheet)
+            untouched_equip.write_bytes(defective_sheet)
+            os.chmod(ro_input, stat.S_IREAD)
+            try:
+                base_proc = subprocess.run(
+                    [sys.executable, "-"],
+                    input=serve._XLSX_BASELINE_SCRIPT,
+                    cwd=workdir,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                base_line = next(
+                    ln
+                    for ln in base_proc.stdout.splitlines()
+                    if ln.startswith(serve.XLSX_BASELINE_MARKER)
+                )
+                baseline_xlsx = json.loads(base_line[len(serve.XLSX_BASELINE_MARKER) :])
+                self.assertIn("DER_Program_Contact_Directory.xlsx", baseline_xlsx)
+                self.assertIn("Equipment/2025-06_Supplier_Lead_Time_Report.xlsx", baseline_xlsx)
+
+                # With baseline snapshot, untouched input spreadsheets produce 0 errors
+                filtered = _run_audit(workdir, baseline_xlsx=baseline_xlsx)
+                self.assertEqual(filtered["errors"], [])
+                self.assertEqual(filtered["warnings"], [])
+                self.assertEqual(
+                    set(filtered["skipped_unmodified_xlsx"]),
+                    {
+                        "DER_Program_Contact_Directory.xlsx",
+                        "Equipment/2025-06_Supplier_Lead_Time_Report.xlsx",
+                    },
+                )
+
+                # Without baseline snapshot (legacy standalone call), defects remain caught
+                unfiltered = _run_audit(workdir)
+                unfiltered_errs = "\n".join(unfiltered["errors"])
+                self.assertIn("DER_Program_Contact_Directory.xlsx", unfiltered_errs)
+                self.assertIn("Equipment/2025-06_Supplier_Lead_Time_Report.xlsx", unfiltered_errs)
+
+                # Modifying one baseline XLSX in-place and adding a new defective XLSX deliverable:
+                # read-only baseline stays skipped, modified & new deliverables are strictly audited
+                modified_xlsx = _make_ooxml_xlsx(
+                    {
+                        "Orders": [
+                            ["item_id", "qty"],
+                            ["EQ-1", "#REF!"],
+                        ]
+                    }
+                )
+                new_bad_xlsx = _make_ooxml_xlsx(
+                    {
+                        "Takeoff": [
+                            ["device_id", "qty"],
+                            ["D1", 10, "SHIFTED"],
+                            ["", 20],
+                        ]
+                    }
+                )
+                untouched_equip.write_bytes(modified_xlsx)
+                (workdir / "output").mkdir(exist_ok=True)
+                (workdir / "output" / "Takeoff.xlsx").write_bytes(new_bad_xlsx)
+
+                after_mod = _run_audit(workdir, baseline_xlsx=baseline_xlsx)
+                errs_text = "\n".join(after_mod["errors"])
+                self.assertEqual(after_mod["skipped_unmodified_xlsx"], ["DER_Program_Contact_Directory.xlsx"])
+                self.assertNotIn("DER_Program_Contact_Directory.xlsx", errs_text)
+                self.assertIn("Equipment/2025-06_Supplier_Lead_Time_Report.xlsx[Orders]", errs_text)
+                self.assertIn("output/Takeoff.xlsx[Takeoff]", errs_text)
+
+                # Cleanly repairing both resolves all audit errors while read-only input remains skipped
+                untouched_equip.write_bytes(clean_sheet)
+                (workdir / "output" / "Takeoff.xlsx").write_bytes(clean_sheet)
+                repaired = _run_audit(workdir, baseline_xlsx=baseline_xlsx)
+                self.assertEqual(repaired["errors"], [])
+            finally:
+                if ro_input.exists():
+                    os.chmod(ro_input, stat.S_IREAD | stat.S_IWRITE)
 
 
 # ---------------------------------------------------------------------------
@@ -1689,6 +1811,230 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
                 self.assertIn("busway", injected)
                 self.assertIn("empty", injected)
             self.assertEqual(_run_audit(workdir)["errors"], [])
+
+    def test_e2e_solve_skips_untouched_input_xlsx_audits_modified_xlsx_and_includes_mep_efficiency_guidance(self):
+        import stat
+
+        self.assertIn("keep runs compact and direct", serve.WORKER)
+        self.assertIn("minimal local lateral offsets", serve.WORKER)
+        self.assertIn("perimeter detours", serve.WORKER)
+
+        ro_defective_xlsx = _make_ooxml_xlsx(
+            {
+                "Contact Directory": [
+                    ["Name"],
+                    ["Alice", "alice@example.com", "SHIFTED_COL"],
+                    ["Bob", "#REF!"],
+                ]
+            }
+        )
+        clean_schedule_xlsx = _make_ooxml_xlsx(
+            {
+                "Schedule": [
+                    ["device_id", "qty"],
+                    ["INV-1", 4],
+                    ["TOTAL", 4],
+                ]
+            }
+        )
+        broken_schedule_xlsx = _make_ooxml_xlsx(
+            {
+                "Schedule": [
+                    ["device_id", "qty"],
+                    ["INV-1", "#REF!"],
+                ]
+            }
+        )
+
+        # Sub-case A: untouched read-only defective input XLSX is skipped; clean WORKER + PASS needs 0 FIX rounds
+        with tempfile.TemporaryDirectory() as tmp_a:
+            dir_a = Path(tmp_a)
+            ro_a = dir_a / "DER_Program_Contact_Directory.xlsx"
+            ro_a.write_bytes(ro_defective_xlsx)
+            os.chmod(ro_a, stat.S_IREAD)
+            try:
+                class _CleanClientA:
+                    def __init__(self) -> None:
+                        self.verifier_calls = 0
+                        self.chat = self
+                        self.completions = self
+
+                    async def create(self, **kwargs: Any) -> serve._DryRunObject:
+                        msgs = kwargs["messages"]
+                        sys_msg = str(msgs[0].get("content") or "")
+                        tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+                        if sys_msg.startswith("You plan an engineering task"):
+                            return serve._DryRunObject(
+                                {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Plan: write report.csv."}}]}
+                            )
+                        if sys_msg.startswith("You extract strict engineering constraints"):
+                            return serve._DryRunObject(
+                                {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps({"deliverables": ["report.csv"]})}}]}
+                            )
+                        if sys_msg.startswith("You check an engineer's work"):
+                            self.verifier_calls += 1
+                            return serve._DryRunObject(
+                                {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "PASS"}}]}
+                            )
+                        if not tool_msgs:
+                            return serve._DryRunObject(
+                                {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "tool_calls",
+                                            "message": {
+                                                "role": "assistant",
+                                                "content": None,
+                                                "tool_calls": [
+                                                    {
+                                                        "id": "wa_csv",
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": "write_file",
+                                                            "arguments": json.dumps(
+                                                                {"path": "report.csv", "content": "device_id,qty\nINV-1,4\nTOTAL,4\n"}
+                                                            ),
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        }
+                                    ]
+                                }
+                            )
+                        return serve._DryRunObject(
+                            {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Report delivered."}}]}
+                        )
+
+                sess_a = _LocalReplaySession(dir_a, "Generate clean report.csv without altering input spreadsheets.")
+                client_a = _CleanClientA()
+                ans_a = asyncio.run(
+                    serve.solve(
+                        sess_a,  # type: ignore[arg-type]
+                        client=client_a,
+                        config_path=str(REPO_ROOT / "submission.yaml"),
+                    )
+                )
+                self.assertEqual(ans_a, "Report delivered.")
+                self.assertEqual(client_a.verifier_calls, 1)
+                self.assertFalse(any("audit: errors=" in ln for ln in sess_a.logs))
+            finally:
+                if ro_a.exists():
+                    os.chmod(ro_a, stat.S_IREAD | stat.S_IWRITE)
+
+        # Sub-case B: modified deliverable Schedule.xlsx with #REF! is caught, read-only input skipped, FIX gets exact error + MEP efficiency note
+        with tempfile.TemporaryDirectory() as tmp_b:
+            dir_b = Path(tmp_b)
+            ro_b = dir_b / "DER_Program_Contact_Directory.xlsx"
+            sched_b = dir_b / "Schedule.xlsx"
+            ro_b.write_bytes(ro_defective_xlsx)
+            sched_b.write_bytes(clean_schedule_xlsx)
+            os.chmod(ro_b, stat.S_IREAD)
+            try:
+                class _ModifiedXlsxClientB:
+                    def __init__(self) -> None:
+                        self.verifier_calls = 0
+                        self.fix_prompt = ""
+                        self.chat = self
+                        self.completions = self
+
+                    async def create(self, **kwargs: Any) -> serve._DryRunObject:
+                        msgs = kwargs["messages"]
+                        sys_msg = str(msgs[0].get("content") or "")
+                        user_msgs = [str(m.get("content") or "") for m in msgs if m.get("role") == "user"]
+                        tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+                        if sys_msg.startswith("You plan an engineering task"):
+                            return serve._DryRunObject(
+                                {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Plan: update Schedule.xlsx."}}]}
+                            )
+                        if sys_msg.startswith("You extract strict engineering constraints"):
+                            return serve._DryRunObject(
+                                {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps({"deliverables": ["Schedule.xlsx"]})}}]}
+                            )
+                        if sys_msg.startswith("You check an engineer's work"):
+                            self.verifier_calls += 1
+                            return serve._DryRunObject(
+                                {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "PASS"}}]}
+                            )
+                        if len(user_msgs) >= 2 and any("found these gaps" in u for u in user_msgs):
+                            self.fix_prompt = user_msgs[-1]
+                            if not any(m.get("tool_call_id") == "fix_sched" for m in tool_msgs):
+                                sched_b.write_bytes(clean_schedule_xlsx)
+                                return serve._DryRunObject(
+                                    {
+                                        "choices": [
+                                            {
+                                                "finish_reason": "tool_calls",
+                                                "message": {
+                                                    "role": "assistant",
+                                                    "content": None,
+                                                    "tool_calls": [
+                                                        {
+                                                            "id": "fix_sched",
+                                                            "type": "function",
+                                                            "function": {
+                                                                "name": "bash",
+                                                                "arguments": json.dumps({"command": "echo repaired Schedule.xlsx"}),
+                                                            },
+                                                        }
+                                                    ],
+                                                },
+                                            }
+                                        ]
+                                    }
+                                )
+                            return serve._DryRunObject(
+                                {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Repaired Schedule.xlsx cleanly."}}]}
+                            )
+
+                        # WORKER corrupts Schedule.xlsx in place while leaving DER_Program_Contact_Directory.xlsx untouched
+                        if not tool_msgs:
+                            sched_b.write_bytes(broken_schedule_xlsx)
+                            return serve._DryRunObject(
+                                {
+                                    "choices": [
+                                        {
+                                            "finish_reason": "tool_calls",
+                                            "message": {
+                                                "role": "assistant",
+                                                "content": None,
+                                                "tool_calls": [
+                                                    {
+                                                        "id": "work_sched",
+                                                        "type": "function",
+                                                        "function": {
+                                                            "name": "bash",
+                                                            "arguments": json.dumps({"command": "echo updated Schedule.xlsx"}),
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        }
+                                    ]
+                                }
+                            )
+                        return serve._DryRunObject(
+                            {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Updated Schedule.xlsx."}}]}
+                        )
+
+                sess_b = _LocalReplaySession(dir_b, "Update Schedule.xlsx without modifying DER_Program_Contact_Directory.xlsx.")
+                client_b = _ModifiedXlsxClientB()
+                ans_b = asyncio.run(
+                    serve.solve(
+                        sess_b,  # type: ignore[arg-type]
+                        client=client_b,
+                        config_path=str(REPO_ROOT / "submission.yaml"),
+                    )
+                )
+                self.assertEqual(ans_b, "Repaired Schedule.xlsx cleanly.")
+                self.assertEqual(client_b.verifier_calls, 2)
+                self.assertIn("Schedule.xlsx[Schedule]: spreadsheet error '#REF!'", client_b.fix_prompt)
+                self.assertNotIn("DER_Program_Contact_Directory.xlsx", client_b.fix_prompt)
+                self.assertIn("compact, minimal-length BIM/MEP routes", client_b.fix_prompt)
+                self.assertTrue(any("audit(post-fix): errors=0 warnings=0" in ln for ln in sess_b.logs))
+            finally:
+                if ro_b.exists():
+                    os.chmod(ro_b, stat.S_IREAD | stat.S_IWRITE)
 
 
 if __name__ == "__main__":

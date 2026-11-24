@@ -156,7 +156,12 @@ WORKER = (
     "tray-stack/access headroom >= 300 mm above/below trays per TIA-569-B, "
     "overhead clear height >= 2600 mm AFF unless explicitly permitted, "
     "sprinkler clearance >= 457 mm, PDU clear zones, and site building/road "
-    "non-intersection). After any edit or fix, immediately regenerate and re-run "
+    "non-intersection). When routing MEP networks or resolving clash, separation, "
+    "or headroom violations, keep runs compact and direct—prefer minimal local "
+    "lateral offsets, clean parallel lane allocation, or valid elevation/zone "
+    "separation over perimeter detours or redundant backtracks that bloat total "
+    "routed length and degrade length-efficiency objectives. "
+    "After any edit or fix, immediately regenerate and re-run "
     "verification checks on the actual deliverable file before replying. When "
     "done, reply without calling a tool: summarize each deliverable, its exact "
     "path, and the verified results."
@@ -1699,9 +1704,64 @@ class _DryRunCompletionsNamespace:
 
 
 AUDIT_MARKER = "__PLE_AUDIT_JSON__:"
+XLSX_BASELINE_MARKER = "__PLE_XLSX_BASELINE_JSON__:"
+
+_XLSX_BASELINE_SCRIPT = r'''
+import hashlib
+import json
+import os
+from pathlib import Path
+
+SKIP_DIRS = {
+    ".git",
+    "__pycache__",
+    ".venv",
+    "venv",
+    "node_modules",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    "dist",
+    "build",
+    "site-packages",
+}
+
+root = Path.cwd()
+files = []
+for cur, dirs, names in os.walk(root):
+    dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and not d.startswith("."))
+    for name in sorted(names):
+        if name.startswith("."):
+            continue
+        p = Path(cur) / name
+        if p.is_file():
+            files.append(p)
+        if len(files) >= 600:
+            break
+    if len(files) >= 600:
+        break
+
+baseline = {}
+for p in files:
+    if p.suffix.lower() not in {".xlsx", ".xlsm"}:
+        continue
+    try:
+        size = p.stat().st_size
+        if size > 25 * 1024 * 1024:
+            continue
+        raw = p.read_bytes()
+        rel = p.relative_to(root).as_posix()
+        baseline[rel] = [size, hashlib.sha256(raw).hexdigest()]
+    except OSError:
+        continue
+
+print("__PLE_XLSX_BASELINE_JSON__:" + json.dumps(baseline))
+'''
 
 _PROGRAMMATIC_AUDIT_SCRIPT = r'''
 import csv
+import hashlib
 import inspect
 import io
 import json
@@ -1714,6 +1774,14 @@ import zipfile
 from pathlib import Path
 
 START_T = time.monotonic()
+BASELINE_XLSX = {}  # __PLE_BASELINE_XLSX__
+if not BASELINE_XLSX and os.environ.get("PLE_AUDIT_BASELINE_XLSX_JSON"):
+    try:
+        _env_base = json.loads(os.environ["PLE_AUDIT_BASELINE_XLSX_JSON"])
+        if isinstance(_env_base, dict):
+            BASELINE_XLSX = _env_base
+    except Exception:
+        BASELINE_XLSX = {}
 SKIP_DIRS = {
     ".git",
     "__pycache__",
@@ -2392,6 +2460,7 @@ def _audit_zip_file(rel: str, p: Path):
         errors.append(f"{rel}: corrupt ZIP archive: {exc}")
 
 ifc_files = []
+skipped_unmodified_xlsx = []
 for p in files:
     rel = _rel(p)
     ext = p.suffix.lower()
@@ -2399,6 +2468,19 @@ for p in files:
         size = p.stat().st_size
     except OSError:
         continue
+    if ext in {".xlsx", ".xlsm"} and BASELINE_XLSX:
+        base_entry = BASELINE_XLSX.get(rel)
+        if isinstance(base_entry, (list, tuple)) and len(base_entry) >= 2:
+            try:
+                if (
+                    size == int(base_entry[0])
+                    and size <= 25 * 1024 * 1024
+                    and hashlib.sha256(p.read_bytes()).hexdigest() == str(base_entry[1])
+                ):
+                    skipped_unmodified_xlsx.append(rel)
+                    continue
+            except (TypeError, ValueError, OSError):
+                pass
     if ext in ZERO_BYTE_EXTS and size == 0:
         errors.append(f"{rel}: deliverable file is empty (0 bytes)")
         continue
@@ -3384,27 +3466,105 @@ if ifc_files:
                         f"(check TIA-942 clear-height rule): {e['label']} ({e['file']})"
                     )
 
-print("__PLE_AUDIT_JSON__:" + json.dumps({"errors": errors[:30], "warnings": warnings[:30]}))
+print(
+    "__PLE_AUDIT_JSON__:"
+    + json.dumps(
+        {
+            "errors": errors[:30],
+            "warnings": warnings[:30],
+            "skipped_unmodified_xlsx": skipped_unmodified_xlsx[:30],
+        }
+    )
+)
 '''
 
 
-def _build_programmatic_audit_script(task: str = "") -> str:
+def _normalize_xlsx_baseline(baseline_xlsx: Optional[Dict[str, Any]]) -> Dict[str, List[Any]]:
+    """Validate and normalize a relative-path -> [size, sha256] XLSX baseline map."""
+    if not isinstance(baseline_xlsx, dict):
+        return {}
+    clean: Dict[str, List[Any]] = {}
+    for k, v in baseline_xlsx.items():
+        if isinstance(k, str) and isinstance(v, (list, tuple)) and len(v) >= 2:
+            try:
+                clean[k] = [int(v[0]), str(v[1])]
+            except (TypeError, ValueError):
+                continue
+    return clean
+
+
+async def capture_xlsx_baseline(session: taskbridge.Session) -> Dict[str, List[Any]]:
+    """Capture a baseline snapshot of pre-existing XLSX/XLSM files in the task workspace."""
+    if getattr(session, "cancelled", None) and session.cancelled.is_set():
+        return {}
+    if not hasattr(session, "exec"):
+        return {}
+    cmd = (
+        "PY_BIN=$(command -v python3 || command -v python || true)\n"
+        'if [ -n "$PY_BIN" ]; then\n'
+        '  "$PY_BIN" - <<\'__PLE_XLSX_BASELINE__\'\n'
+        f"{_XLSX_BASELINE_SCRIPT}\n"
+        "__PLE_XLSX_BASELINE__\n"
+        "fi\n"
+    )
+    try:
+        cap = _safe_int(
+            getattr(session, "limits", {}).get("exec_timeout_sec"),
+            default=600,
+            minimum=1,
+        )
+        res = await session.exec(cmd, timeout_sec=min(20, cap))
+    except (taskbridge.TaskError, KeyError, TypeError, ValueError, RuntimeError, OSError):
+        return {}
+    if getattr(session, "cancelled", None) and session.cancelled.is_set():
+        return {}
+
+    output = str((res or {}).get("output") or "")
+    for line in reversed(output.splitlines()):
+        if line.startswith(XLSX_BASELINE_MARKER):
+            raw = line[len(XLSX_BASELINE_MARKER):].strip()
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return {}
+            return _normalize_xlsx_baseline(parsed)
+    return {}
+
+
+def _build_programmatic_audit_script(
+    task: str = "",
+    baseline_xlsx: Optional[Dict[str, Any]] = None,
+) -> str:
     """Return a self-contained Python 3 audit script for task deliverables."""
     _ = task
-    return _PROGRAMMATIC_AUDIT_SCRIPT
+    clean = _normalize_xlsx_baseline(baseline_xlsx)
+    if not clean:
+        return _PROGRAMMATIC_AUDIT_SCRIPT
+    encoded = json.dumps(json.dumps(clean, separators=(",", ":")))
+    return _PROGRAMMATIC_AUDIT_SCRIPT.replace(
+        "BASELINE_XLSX = {}  # __PLE_BASELINE_XLSX__",
+        f"BASELINE_XLSX = json.loads({encoded})",
+        1,
+    )
 
 
 async def run_programmatic_audit(
     session: taskbridge.Session,
     task: str = "",
+    baseline_xlsx: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Run deterministic CSV/XLSX/JSON/IFC checks in the task container before verification."""
-    empty: Dict[str, Any] = {"errors": [], "warnings": [], "summary": ""}
+    empty: Dict[str, Any] = {
+        "errors": [],
+        "warnings": [],
+        "skipped_unmodified_xlsx": [],
+        "summary": "",
+    }
     if getattr(session, "cancelled", None) and session.cancelled.is_set():
         return empty
     if not hasattr(session, "exec"):
         return empty
-    script = _build_programmatic_audit_script(task)
+    script = _build_programmatic_audit_script(task, baseline_xlsx=baseline_xlsx)
     cmd = (
         "PY_BIN=$(command -v python3 || command -v python || true)\n"
         'if [ -n "$PY_BIN" ]; then\n'
@@ -3437,6 +3597,9 @@ async def run_programmatic_audit(
                 return empty
             errors = [str(x) for x in (parsed.get("errors") or []) if str(x).strip()]
             warnings = [str(x) for x in (parsed.get("warnings") or []) if str(x).strip()]
+            skipped_xlsx = [
+                str(x) for x in (parsed.get("skipped_unmodified_xlsx") or []) if str(x).strip()
+            ]
             lines: List[str] = []
             if errors:
                 lines.append("ERRORS (must be fixed; cannot PASS while non-empty):")
@@ -3447,6 +3610,7 @@ async def run_programmatic_audit(
             return {
                 "errors": errors,
                 "warnings": warnings,
+                "skipped_unmodified_xlsx": skipped_xlsx,
                 "summary": "\n".join(lines),
             }
     return empty
@@ -3480,6 +3644,8 @@ async def solve(
         planner_tools = READ_ONLY + mcp_tool_defs
         worker_tools = TOOLS + mcp_tool_defs
         verifier_tools = READ_ONLY + mcp_tool_defs
+        max_fix_rounds = int(runtime_cfg.get("max_fix_rounds", 2))
+        baseline_xlsx = await capture_xlsx_baseline(session) if max_fix_rounds > 0 else {}
 
         task = session.instruction
         plan = await agent(
@@ -3551,12 +3717,16 @@ async def solve(
             wargs = wr.get("arguments") or {}
             active_mcp_writes[_mcp_write_target_key(tname, wargs)] = {"tool": tname, "arguments": wargs}
 
-        max_fix_rounds = int(runtime_cfg.get("max_fix_rounds", 2))
-        audit = await run_programmatic_audit(session, task) if max_fix_rounds > 0 else {
-            "errors": [],
-            "warnings": [],
-            "summary": "",
-        }
+        audit = (
+            await run_programmatic_audit(session, task, baseline_xlsx=baseline_xlsx)
+            if max_fix_rounds > 0
+            else {
+                "errors": [],
+                "warnings": [],
+                "skipped_unmodified_xlsx": [],
+                "summary": "",
+            }
+        )
         if audit["errors"] or audit["warnings"]:
             await session.log(
                 f"audit: errors={len(audit['errors'])} warnings={len(audit['warnings'])} "
@@ -3693,9 +3863,13 @@ async def solve(
                         f"{constraints_json}\n\n"
                         "Fix them immediately by writing or updating and regenerating "
                         "every required deliverable file on disk (and amending any external "
-                        "MCP records cleanly as `Entity: Final_Status`), re-run verification "
-                        "checks on the updated files before your turn budget runs out, "
-                        "then reply with your verified summary."
+                        "MCP records cleanly as `Entity: Final_Status`), preserve compact, "
+                        "minimal-length BIM/MEP routes when resolving clash, separation, or "
+                        "headroom gaps (use minimal local offsets, clean parallel lanes, or "
+                        "valid elevation separation rather than long perimeter detours that "
+                        "bloat total routed length), re-run verification checks on the "
+                        "updated files before your turn budget runs out, then reply with "
+                        "your verified summary."
                     ),
                 }
             )
@@ -3721,7 +3895,7 @@ async def solve(
                 active_mcp_writes[_mcp_write_target_key(tname, wargs)] = {"tool": tname, "arguments": wargs}
             summary = updated or summary
             work_state = fix_state
-            audit = await run_programmatic_audit(session, task)
+            audit = await run_programmatic_audit(session, task, baseline_xlsx=baseline_xlsx)
             err_tail = f" {'; '.join(audit['errors'][:5])}" if audit["errors"] else ""
             await session.log(
                 f"audit(post-fix): errors={len(audit['errors'])} warnings={len(audit['warnings'])}{err_tail}"
