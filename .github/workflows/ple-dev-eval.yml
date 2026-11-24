@@ -363,14 +363,18 @@ jobs:
           path: |
             ~/.cache/uv
             ~/.local/share/uv/tools
-          key: ple-uv-harbor-0.20.0-${{ runner.os }}-py312
+            ~/.local/bin
+          key: ple-uv-harbor-v2-0.20.0-${{ runner.os }}-py312
           restore-keys: |
-            ple-uv-harbor-0.20.0-${{ runner.os }}-
+            ple-uv-harbor-v2-0.20.0-${{ runner.os }}-
 
       - name: Install uv and Harbor
         run: |
           python -m pip install --upgrade pip uv
-          uv tool install harbor==0.20.0 --with websockets
+          if ! "$HOME/.local/bin/harbor" --version >/dev/null 2>&1; then
+            uv tool install --force harbor==0.20.0 --with websockets
+          fi
+          "$HOME/.local/bin/harbor" --version
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Clone official PLE starter kit and install dependencies
