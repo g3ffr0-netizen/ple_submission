@@ -8,7 +8,7 @@ import math
 import os
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +176,112 @@ def is_pass_verdict(verdict: Any) -> bool:
         ):
             return True
     return False
+
+
+_SPEC_BLANK_RE = re.compile(r"\[\s*_+\s*\]")
+_SPEC_CONCAT_AS_IND_RE = re.compile(r"[A-Za-z0-9]+as indicated\b")
+_SPEC_BARE_AS_IND_RE = re.compile(r"(?m)^\s*(?:\d+\.|[a-z]\.)\s*as indicated\.?\s*$")
+_SPEC_ADJ_BRACKET_RE = re.compile(r"\]\s*\[")
+_SPEC_XREF_COMMA_RE = re.compile(r"\bSection\s+\d{2}\s+\d{2}\s+\d{2}(?:\.\d{2}\s+\d{2})?,\s+[A-Z]")
+_SPEC_SECTION_XREF_RE = re.compile(r"\bSection\s+(\d{2}\s+\d{2}\s+\d{2}(?:\.\d{2}\s+\d{2})?)\b")
+_SPEC_UFC_CITE_RE = re.compile(r"\bUFC\s+\d+-\d+-\d+\b|\bUnified\s+Facilities\s+Criteria\b", re.I)
+
+
+def check_spec_text_artifacts(
+    rel: str,
+    text: str,
+    *,
+    forbidden_citations: Sequence[str] = (),
+    allowed_sections: Sequence[str] = (),
+    disallowed_sections: Sequence[str] = (),
+    required_scope_exclusions: Sequence[str] = (),
+    is_docx: bool = True,
+) -> List[str]:
+    """Deterministically detect placeholder corruption and task-excluded citations/sections."""
+    if not text:
+        return []
+    issues: List[str] = []
+
+    if _SPEC_BLANK_RE.search(text):
+        issues.append(f"{rel}: unresolved bracket blank '[_____]' placeholder in specification text")
+    m_concat = _SPEC_CONCAT_AS_IND_RE.search(text)
+    if m_concat:
+        issues.append(f"{rel}: concatenated placeholder artifact {m_concat.group(0)!r}")
+    if _SPEC_BARE_AS_IND_RE.search(text):
+        issues.append(f"{rel}: bare standalone 'as indicated' clause replacing blank placeholder")
+    if is_docx and _SPEC_ADJ_BRACKET_RE.search(text):
+        issues.append(f"{rel}: adjacent unresolved bracketed choices ']['")
+    m_comma = _SPEC_XREF_COMMA_RE.search(text)
+    if m_comma:
+        issues.append(
+            f"{rel}: disallowed comma between section number and title in cross-reference {m_comma.group(0)!r}"
+        )
+
+    for raw_tok in forbidden_citations:
+        tok = str(raw_tok).strip()
+        if not tok:
+            continue
+        if tok.upper() == "UFC":
+            m_ufc = _SPEC_UFC_CITE_RE.search(text)
+            if m_ufc:
+                issues.append(f"{rel}: forbidden citation per task exclusion rules: {m_ufc.group(0)!r}")
+        else:
+            pat = re.compile(r"(?<!\w)" + re.escape(tok) + r"(?!\w)", re.I)
+            m_forb = pat.search(text)
+            if m_forb:
+                issues.append(f"{rel}: forbidden citation {m_forb.group(0)!r}")
+
+    norm_disallowed = {" ".join(str(s).split()) for s in disallowed_sections if str(s).strip()}
+    norm_allowed = {" ".join(str(s).split()) for s in allowed_sections if str(s).strip()}
+    seen_bad_secs: set = set()
+    for m_sec in _SPEC_SECTION_XREF_RE.finditer(text):
+        sec_num = " ".join(m_sec.group(1).split())
+        if sec_num in seen_bad_secs:
+            continue
+        if norm_disallowed and sec_num in norm_disallowed:
+            seen_bad_secs.add(sec_num)
+            issues.append(f"{rel}: disallowed section cross-reference 'Section {sec_num}'")
+        elif norm_allowed and sec_num not in norm_allowed:
+            seen_bad_secs.add(sec_num)
+            issues.append(f"{rel}: section cross-reference 'Section {sec_num}' not in allowed project manual sections")
+
+    if required_scope_exclusions:
+        low_text = text.lower()
+        for raw_excl in required_scope_exclusions:
+            phrase = str(raw_excl).strip()
+            if phrase and phrase.lower() not in low_text:
+                issues.append(f"{rel}: required scope exclusion missing: {phrase!r}")
+
+    return issues
+
+
+def evaluate_pre_pass_gate(
+    verdict: Any,
+    *,
+    audit_errors: Sequence[str] = (),
+    prefilter_errors: Sequence[str] = (),
+    readback_errors: Sequence[str] = (),
+    completeness_errors: Sequence[str] = (),
+    verifier_truncated: bool = False,
+) -> Tuple[bool, List[str]]:
+    """Evaluate programmatic gate errors and return (clean_pass, deduplicated_blocking_errors)."""
+    blocking_errors: List[str] = []
+    seen: set = set()
+    for group in (audit_errors, prefilter_errors, readback_errors, completeness_errors):
+        for raw in group:
+            s = str(raw).strip()
+            if s and s not in seen:
+                seen.add(s)
+                blocking_errors.append(s)
+
+    clean_pass = (
+        isinstance(verdict, str)
+        and bool(verdict.strip())
+        and is_pass_verdict(verdict)
+        and not verifier_truncated
+        and not blocking_errors
+    )
+    return clean_pass, blocking_errors
 
 
 def make_verify_fn(

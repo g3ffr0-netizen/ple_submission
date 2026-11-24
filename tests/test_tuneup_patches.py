@@ -1,0 +1,499 @@
+"""Unit tests for the Run #30 Tune-Up Shop patches in serve.py and harness.py."""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import json
+import subprocess
+import sys
+import tempfile
+import unittest
+import zipfile
+from pathlib import Path
+from types import SimpleNamespace
+from xml.sax.saxutils import escape as xml_escape
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+import harness
+import serve
+import taskbridge
+
+
+def _make_minimal_xlsx_bytes(sheets: dict[str, list[list[object]]]) -> bytes:
+    """Create a valid minimal .xlsx workbook in memory without openpyxl dependency."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        sh_names = list(sheets.keys())
+        ct_overrides = "\n".join(
+            f'<Override PartName="/xl/worksheets/sheet{i}.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+            for i in range(1, len(sh_names) + 1)
+        )
+        zf.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+            '<Default Extension="xml" ContentType="application/xml"/>'
+            '<Override PartName="/xl/workbook.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+            f"{ct_overrides}</Types>",
+        )
+        wb_sheets = "\n".join(
+            f'<sheet name="{xml_escape(name)}" sheetId="{i}" r:id="rId{i}"/>'
+            for i, name in enumerate(sh_names, 1)
+        )
+        zf.writestr(
+            "xl/workbook.xml",
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            f"<sheets>{wb_sheets}</sheets></workbook>",
+        )
+        rels = "\n".join(
+            f'<Relationship Id="rId{i}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+            f'Target="worksheets/sheet{i}.xml"/>'
+            for i in range(1, len(sh_names) + 1)
+        )
+        zf.writestr(
+            "xl/_rels/workbook.xml.rels",
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f"{rels}</Relationships>",
+        )
+        for i, name in enumerate(sh_names, 1):
+            rows_xml: list[str] = []
+            for r_idx, row in enumerate(sheets[name], 1):
+                cells_xml: list[str] = []
+                for c_idx, val in enumerate(row):
+                    col_letter = chr(ord("A") + c_idx)
+                    ref = f"{col_letter}{r_idx}"
+                    txt = xml_escape("" if val is None else str(val))
+                    cells_xml.append(f'<c r="{ref}" t="inlineStr"><is><t>{txt}</t></is></c>')
+                rows_xml.append(f'<row r="{r_idx}">{"".join(cells_xml)}</row>')
+            zf.writestr(
+                f"xl/worksheets/sheet{i}.xml",
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+                f"<sheetData>{''.join(rows_xml)}</sheetData></worksheet>",
+            )
+    return buf.getvalue()
+
+
+def _make_minimal_docx_bytes(paragraphs: list[str]) -> bytes:
+    """Create a valid minimal .docx archive with word/document.xml paragraphs."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+            '<Override PartName="/word/document.xml" '
+            'ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+            "</Types>",
+        )
+        p_xml = "".join(
+            f"<w:p><w:r><w:t>{xml_escape(p)}</w:t></w:r></w:p>" for p in paragraphs
+        )
+        zf.writestr(
+            "word/document.xml",
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            f"<w:body>{p_xml}</w:body></w:document>",
+        )
+    return buf.getvalue()
+
+
+def _run_audit_script(workdir: Path, **kwargs: object) -> dict:
+    script = serve._build_programmatic_audit_script(**kwargs)  # type: ignore[arg-type]
+    proc = subprocess.run(
+        [sys.executable, "-"],
+        input=script,
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    line = next(ln for ln in proc.stdout.splitlines() if ln.startswith(serve.AUDIT_MARKER))
+    return json.loads(line[len(serve.AUDIT_MARKER) :])
+
+
+class _ScriptedClient:
+    """Offline scripted AsyncOpenAI stand-in recording every request payload."""
+
+    def __init__(self, handler):
+        self._handler = handler
+        self.calls: list[dict] = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _create(self, **kwargs):
+        self.calls.append(
+            {
+                "model": kwargs.get("model"),
+                "messages": json.loads(json.dumps(kwargs.get("messages") or [])),
+                "has_tools": "tools" in kwargs,
+            }
+        )
+        return self._handler(len(self.calls), kwargs)
+
+
+def _msg_reply(content: str = "", tool_calls: list[dict] | None = None):
+    msg = SimpleNamespace(content=content, tool_calls=tool_calls)
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=msg, finish_reason="stop")],
+        usage=None,
+    )
+
+
+class TestTuneupPatches(unittest.TestCase):
+    def test_insertion_time_exec_spill_keeps_inline_compact_and_spills_full(self):
+        class _SpillSession:
+            def __init__(self):
+                self.files: dict[str, bytes] = {}
+                self.limits = {"exec_timeout_sec": 60}
+
+            async def exec(self, command, timeout_sec=120):
+                big = ("HEAD_LINE_MARKER\n" * 200) + ("MIDDLE_NOISE_12345\n" * 400) + ("TAIL_LINE_MARKER\n" * 100)
+                return {"exit_code": 0, "output": big, "timed_out": False}
+
+            async def write_file(self, path, data, append=False):
+                raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+                self.files[path] = raw
+                return len(raw)
+
+        async def _run():
+            sess = _SpillSession()
+            res = await serve.run_tool(sess, {"name": "bash", "arguments": json.dumps({"command": "dump"})})  # type: ignore[arg-type]
+            self.assertLessEqual(len(res), serve.EXEC_INLINE_CAP_CHARS)
+            self.assertIn("/tmp/ple_exec_out_", res)
+            self.assertIn("HEAD_LINE_MARKER", res)
+            self.assertIn("TAIL_LINE_MARKER", res)
+            self.assertEqual(len(sess.files), 1)
+            spilled_text = next(iter(sess.files.values())).decode("utf-8")
+            self.assertIn("MIDDLE_NOISE_12345", spilled_text)
+
+        asyncio.run(_run())
+
+    def test_prune_old_tool_outputs_respects_age_size_refs_and_idempotency(self):
+        messages: list[dict] = [{"role": "system", "content": "sys"}, {"role": "user", "content": "task"}]
+        old_big_unreferenced = ("UNREFERENCED_ALPHA_9991 " * 1000)  # > 20k chars
+        old_big_referenced = ("KEEP_REF_TOKEN_884422 CRITICAL_FEEDER_Z9 " * 300)  # > 10k chars
+        small_old = "short ok"
+        for t in range(12):
+            cid = f"call_{t}"
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{"id": cid, "type": "function", "function": {"name": "bash", "arguments": "{}"}}],
+                }
+            )
+            if t == 0:
+                body = old_big_unreferenced
+            elif t == 1:
+                body = old_big_referenced
+            elif t == 2:
+                body = small_old
+            elif t == 9:
+                body = "recent " + ("RECENT_BIG_7733 " * 400)  # <= 8 turns old (age=2)
+            elif t == 11:
+                body = "Referencing KEEP_REF_TOKEN_884422 and CRITICAL_FEEDER_Z9 in recent turn"
+            else:
+                body = f"turn_{t}_ok"
+            messages.append({"role": "tool", "tool_call_id": cid, "content": body})
+
+        pruned, saved = serve.prune_old_tool_outputs(messages)
+        self.assertEqual(pruned, 1)
+        self.assertGreater(saved, 19_000)
+
+        stub = messages[3]["content"]  # call_0 tool output
+        self.assertTrue(stub.startswith("[pruned 24,000-char exec output"))
+        self.assertLessEqual(len(stub), serve.PRUNE_STUB_CHARS + 20)
+
+        # Old referenced output (call_1), old small output (call_2), recent big output (call_9) preserved!
+        self.assertEqual(messages[5]["content"], old_big_referenced)
+        self.assertEqual(messages[7]["content"], small_old)
+        self.assertIn("RECENT_BIG_7733", messages[21]["content"])
+
+        # Idempotent on second call
+        self.assertEqual(serve.prune_old_tool_outputs(messages), (0, 0))
+
+    def test_agent_coarse_checkpoint_pruning_and_duplicate_failing_bash_guard(self):
+        class _LoopSession:
+            workdir = "/app"
+            limits = {"exec_timeout_sec": 60}
+            final_message = ""
+            cancelled = asyncio.Event()
+
+            def __init__(self):
+                self.logs: list[str] = []
+                self.usages: list[tuple] = []
+                self.bash_cmds: list[str] = []
+
+            def time_left(self):
+                return 3600.0
+
+            async def exec(self, command, timeout_sec=120):
+                self.bash_cmds.append(command)
+                if "bad_script.py" in command:
+                    return {"exit_code": 1, "output": "Traceback: SyntaxError", "timed_out": False}
+                if "emit_big" in command:
+                    return {"exit_code": 0, "output": "NOISE_CHUNK_4455 " * 300, "timed_out": False}  # ~5,100 chars
+                return {"exit_code": 0, "output": "ok", "timed_out": False}
+
+            async def write_file(self, path, data, append=False):
+                return len(data)
+
+            async def log(self, text):
+                self.logs.append(text)
+
+            async def usage(self, model, inp, out, cached=0):
+                self.usages.append((model, inp, out, cached))
+
+        def _handler(step_num, _kwargs):
+            if step_num == 1:
+                return _msg_reply(tool_calls=[{"id": "c1", "type": "function", "function": {"name": "bash", "arguments": '{"command":"emit_big"}'}}])
+            if step_num == 2:
+                return _msg_reply(tool_calls=[{"id": "c2", "type": "function", "function": {"name": "bash", "arguments": '{"command":"python3 bad_script.py"}'}}])
+            if step_num == 3:
+                # Immediately repeat exact same failing bash command -> must be short-circuited!
+                return _msg_reply(tool_calls=[{"id": "c3", "type": "function", "function": {"name": "bash", "arguments": '{"command":"python3 bad_script.py"}'}}])
+            if 4 <= step_num <= 13:
+                return _msg_reply(tool_calls=[{"id": f"c{step_num}", "type": "function", "function": {"name": "bash", "arguments": f'{{"command":"echo step_{step_num}"}}'}}])
+            return _msg_reply(content="done")
+
+        async def _run():
+            sess = _LoopSession()
+            client = _ScriptedClient(_handler)
+            cfg = {"model": "gemini-4-argon", "max_output_tokens": 1024, "fallback_models": [], "max_failures": 5}
+            msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "run"}]
+            out = await serve.agent(sess, msgs, serve.TOOLS, 0.0, client=client, runtime_cfg=cfg)  # type: ignore[arg-type]
+            self.assertEqual(out, "done")
+            # Duplicate failing bash command ran only ONCE inside container
+            self.assertEqual(sess.bash_cmds.count("python3 bad_script.py"), 1)
+            # Calls 2..12 kept prefix c1 UNMUTATED (prompt-cache preserved), while checkpoint at turn 12 pruned c1 for call 13+!
+            call_12_tool1 = [m for m in client.calls[11]["messages"] if m.get("tool_call_id") == "c1"][0]["content"]
+            call_13_tool1 = [m for m in client.calls[12]["messages"] if m.get("tool_call_id") == "c1"][0]["content"]
+            self.assertIn("NOISE_CHUNK_4455", call_12_tool1)
+            self.assertTrue(call_13_tool1.startswith("[pruned "))
+
+        asyncio.run(_run())
+
+    def test_dynamic_exclusion_rules_and_alphanumeric_register_ids(self):
+        # 1. Seismic task that ALLOWS UFC 3-301-01 must NOT infer UFC as forbidden!
+        seismic_task = "Use UFC 3-301-01 Chapter 12 and FEMA P-2082-1. Register R14, R17, R25, R29, R31, R32, R35."
+        c_seis = json.dumps(serve._regex_extract_constraints(seismic_task, ""))
+        excl_seis = serve.extract_exclusion_rules(c_seis, seismic_task, "")
+        self.assertEqual(excl_seis["forbidden_citations"], [])
+        rids_seis = serve._extract_required_register_ids(c_seis, seismic_task, "")
+        for rid in ("R14", "R17", "R25", "R29", "R31", "R32", "R35"):
+            self.assertIn(rid, rids_seis)
+
+        # 2. Division-26 task that prohibits UFC citations + excludes section + requires alphanumeric R-ILLUM
+        div26_task = (
+            "Do not cite UFC or Unified Facilities Criteria documents in any edited section. "
+            "Section 26 27 14.00 20 is not part of the project manual. "
+            "Allowed sections: 26 05 73, 26 20 00, 26 24 13, 26 32 15, 26 36 23, 26 51 00, 01 33 00. "
+            "Cover R-260573-02, R-260573-05, R-262413-01, and R-ILLUM in output/submission.zip."
+        )
+        c_div = json.dumps(serve._regex_extract_constraints(div26_task, ""))
+        excl_div = serve.extract_exclusion_rules(c_div, div26_task, "")
+        self.assertIn("UFC", excl_div["forbidden_citations"])
+        self.assertIn("26 27 14.00 20", excl_div["disallowed_sections"])
+        self.assertIn("26 20 00", excl_div["allowed_sections"])
+        rids_div = serve._extract_required_register_ids(c_div, div26_task, "")
+        for rid in ("R-260573-02", "R-260573-05", "R-262413-01", "R-ILLUM"):
+            self.assertIn(rid, rids_div)
+
+    def test_register_sheet_and_docx_pre_verifier_gate_block_and_recover(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            out_dir = workdir / "output"
+            out_dir.mkdir(parents=True)
+
+            # Build submission.zip with Register sheet missing R-ILLUM & R29 + flawed DOCX
+            wb_bytes = _make_minimal_xlsx_bytes(
+                {
+                    "Sections": [["number", "title"], ["26 05 73", "POWER SYSTEM STUDIES"]],
+                    "Register": [["requirement_id", "status"], ["R-260573-02", "covered"], ["R17", "covered"]],
+                }
+            )
+            bad_docx = _make_minimal_docx_bytes(
+                [
+                    "2.1 GENERAL: Provide lighting panels [_____] or Option A as indicated.",
+                    "2.2 CABLES: Category 5 UTPas indicated cables per UFC 3-520-01.",
+                    "2.3 REF: Provide in accordance with Section 01 33 00, SUBMITTAL PROCEDURES and Section 26 27 14.00 20.",
+                ]
+            )
+            with zipfile.ZipFile(out_dir / "submission.zip", "w") as zf:
+                zf.writestr("design_basis.xlsx", wb_bytes)
+                zf.writestr("specs/26 20 00.docx", bad_docx)
+
+            res_bad = _run_audit_script(
+                workdir,
+                required_register_ids=["R-260573-02", "R-ILLUM", "R17", "R29"],
+                target_deliverables=["output/submission.zip", "output/missing_summary.csv"],
+                forbidden_citations=["UFC"],
+                allowed_sections=["01 33 00", "26 20 00"],
+                disallowed_sections=["26 27 14.00 20"],
+                required_scope_exclusions=["Submetering excluded from Division 26"],
+                enforce_deliverables=True,
+            )
+            err_blob = "\n".join(res_bad["errors"])
+            blocker_blob = "\n".join(res_bad["pre_verifier_blockers"])
+            self.assertIn("missing", err_blob.lower())
+            self.assertIn("R-ILLUM", err_blob)
+            self.assertIn("R29", err_blob)
+            self.assertIn("missing_summary.csv", err_blob)
+            self.assertIn("[_____]", blocker_blob)
+            self.assertIn("UTPas indicated", blocker_blob)
+            self.assertIn("UFC 3-520-01", blocker_blob)
+            self.assertIn("01 33 00,", blocker_blob)
+            self.assertIn("26 27 14.00 20", blocker_blob)
+            self.assertIn("Submetering excluded from Division 26", blocker_blob)
+
+            # harness.evaluate_pre_pass_gate blocks PASS when errors exist
+            ok_gate, merged = harness.evaluate_pre_pass_gate(
+                "PASS",
+                audit_errors=res_bad["errors"],
+            )
+            self.assertFalse(ok_gate)
+            self.assertTrue(len(merged) >= 5)
+
+            # Fix all issues -> 0 errors, 0 pre_verifier_blockers, evaluate_pre_pass_gate passes!
+            (out_dir / "missing_summary.csv").write_text("id,val\nA,1\n", encoding="utf-8")
+            wb_good = _make_minimal_xlsx_bytes(
+                {
+                    "Sections": [["number", "title"], ["26 05 73", "POWER SYSTEM STUDIES"]],
+                    "Register": [
+                        ["requirement_id", "status"],
+                        ["R-260573-02", "covered"],
+                        ["R-ILLUM", "covered"],
+                        ["R17", "covered"],
+                        ["R29", "covered"],
+                    ],
+                }
+            )
+            good_docx = _make_minimal_docx_bytes(
+                [
+                    "2.1 GENERAL: Submetering excluded from Division 26 per SOW.",
+                    "2.2 CABLES: Category 5 UTP cables per TIA-568.",
+                    "2.3 REF: Provide in accordance with Section 01 33 00 SUBMITTAL PROCEDURES.",
+                ]
+            )
+            with zipfile.ZipFile(out_dir / "submission.zip", "w") as zf:
+                zf.writestr("design_basis.xlsx", wb_good)
+                zf.writestr("specs/26 20 00.docx", good_docx)
+
+            res_good = _run_audit_script(
+                workdir,
+                required_register_ids=["R-260573-02", "R-ILLUM", "R17", "R29"],
+                target_deliverables=["output/submission.zip", "output/missing_summary.csv"],
+                forbidden_citations=["UFC"],
+                allowed_sections=["01 33 00", "26 20 00"],
+                disallowed_sections=["26 27 14.00 20"],
+                required_scope_exclusions=["Submetering excluded from Division 26"],
+                enforce_deliverables=True,
+            )
+            self.assertEqual(res_good["errors"], [])
+            self.assertEqual(res_good["pre_verifier_blockers"], [])
+            self.assertEqual(harness.evaluate_pre_pass_gate("PASS", audit_errors=res_good["errors"]), (True, []))
+
+    def test_solve_skips_verifier_call_when_pre_verifier_blocker_fires(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            out_dir = workdir / "output"
+            out_dir.mkdir()
+            with zipfile.ZipFile(out_dir / "submission.zip", "w") as zf:
+                zf.writestr(
+                    "specs/26 20 00.docx",
+                    _make_minimal_docx_bytes(["Broken blank [_____] and UFC 3-520-01 citation."]),
+                )
+
+            class _PreBlockSession:
+                instruction = (
+                    "Update specs/26 20 00.docx in /app/output/submission.zip. "
+                    "Do not cite UFC or Unified Facilities Criteria. Register R-ILLUM."
+                )
+                mcp_servers: list[dict] = []
+                limits = {"exec_timeout_sec": 60}
+
+                def __init__(self):
+                    self.workdir = str(workdir)
+                    self.logs: list[str] = []
+                    self.final_message = ""
+                    self.cancelled = asyncio.Event()
+                    self.fixed = False
+
+                def time_left(self):
+                    return 3600.0
+
+                async def exec(self, command, timeout_sec=120):
+                    if "__PLE_XLSX_BASELINE__" in command:
+                        return {"exit_code": 0, "output": "", "timed_out": False}
+                    if "__PLE_AUDIT__" in command:
+                        res = _run_audit_script(
+                            workdir,
+                            required_register_ids=["R-ILLUM"],
+                            forbidden_citations=["UFC"],
+                        )
+                        return {"exit_code": 0, "output": serve.AUDIT_MARKER + json.dumps(res), "timed_out": False}
+                    # Fix step invoked by Worker
+                    if "fix_submission" in command:
+                        with zipfile.ZipFile(out_dir / "submission.zip", "w") as zf:
+                            zf.writestr(
+                                "specs/26 20 00.docx",
+                                _make_minimal_docx_bytes(["Clean spec covering R-ILLUM per NFPA 70."]),
+                            )
+                        self.fixed = True
+                        return {"exit_code": 0, "output": "fixed", "timed_out": False}
+                    return {"exit_code": 0, "output": "ok", "timed_out": False}
+
+                async def write_file(self, path, data, append=False):
+                    return len(data)
+
+                async def read_file(self, path):
+                    return b""
+
+                async def log(self, text):
+                    self.logs.append(text)
+
+                async def usage(self, model, inp, out, cached=0):
+                    pass
+
+            verifier_calls = []
+
+            def _solve_handler(_idx, kwargs):
+                msgs = kwargs.get("messages") or []
+                sys_txt = str(msgs[0].get("content") or "") if msgs else ""
+                if "check an engineer's work" in sys_txt.lower():
+                    verifier_calls.append(len(msgs))
+                    return _msg_reply(content="PASS")
+                if "extract strict engineering constraints" in sys_txt.lower():
+                    return _msg_reply(content='{"deliverables": ["output/submission.zip"], "forbidden_citations": ["UFC"], "required_register_ids": ["R-ILLUM"]}')
+                if "A reviewer checked your files" in str(msgs[-1].get("content") or "") and not any(
+                    m.get("role") == "tool" and "fixed" in str(m.get("content") or "") for m in msgs
+                ):
+                    return _msg_reply(tool_calls=[{"id": "fix1", "type": "function", "function": {"name": "bash", "arguments": '{"command":"fix_submission"}'}}])
+                return _msg_reply(content="Completed cleanly.")
+
+            async def _run():
+                sess = _PreBlockSession()
+                client = _ScriptedClient(_solve_handler)
+                ans = await serve.solve(sess, client=client)  # type: ignore[arg-type]
+                self.assertEqual(ans, "Completed cleanly.")
+                self.assertTrue(sess.fixed)
+                # Round 1 bypassed VERIFIER completely; Round 2 called VERIFIER once -> PASS!
+                self.assertEqual(len(verifier_calls), 1)
+                self.assertTrue(any("pre-verifier gate blocked" in lg for lg in sess.logs))
+
+            asyncio.run(_run())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

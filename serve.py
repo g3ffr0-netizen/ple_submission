@@ -35,6 +35,7 @@ from harness import (
     CircuitBreaker,
     DEFAULT_MODEL,
     _safe_int,
+    evaluate_pre_pass_gate,
     extract_json_payload,
     is_pass_verdict,
     load_submission_config,
@@ -59,6 +60,14 @@ VERIFIER_WRAP_UP = {
     ),
 }
 RESULT_CHARS = 20_000
+EXEC_INLINE_CAP_CHARS = 6_000
+EXEC_SPILL_HEAD_CHARS = 3_400
+EXEC_SPILL_TAIL_CHARS = 2_000
+PRUNE_TOOL_AGE_TURNS = 8
+PRUNE_TOOL_MIN_CHARS = 4_000
+PRUNE_REF_WINDOW_TURNS = 4
+PRUNE_STUB_CHARS = 300
+PRUNE_CHECKPOINT_EVERY = 12
 MAX_IMAGE_BYTES = 5 << 20
 MAX_ACTIVE_IMAGES = 10
 IMAGE_MAGIC: Tuple[Tuple[bytes, str], ...] = (
@@ -118,7 +127,11 @@ EXTRACTOR = (
     "reply immediately with a single valid JSON object representing CONSTRAINTS.json "
     "containing keys: deliverables (exact file paths and external MCP targets), "
     "required_register_ids (every requirement, finding, hazard, or scenario ID such as "
-    "R01..R99, R-xxxxxx-xx, H01.., S01.. referenced in the task, plan, or spec), "
+    "R01..R99, R-xxxxxx-xx, R-ILLUM, H01.., S01.. referenced in the task, plan, or spec), "
+    "forbidden_citations (any standards/codes explicitly excluded by the task such as UFC), "
+    "allowed_sections (explicitly listed allowed spec/manual section numbers, if specified), "
+    "disallowed_sections (explicitly excluded section numbers, if any), "
+    "scope_exclusions (explicit scope exclusions that must be documented), "
     "hard_constraints ([h=1] rules, prohibitions, record-date vs contingent-action "
     "distinctions, empty-set triggers, governing-scenario / load-case label rules), "
     "hard_numeric_caps (exact <= cap, >= target, and controlling boundary limits), "
@@ -147,8 +160,11 @@ WORKER = (
     "words (e.g., do not write 'pre-marked carried' on a 'NOT CARRIED' line). "
     "Before replying: (1) programmatically verify every numerical "
     "hard constraint, threshold, summation, and cross-table ID / register / tag "
-    "consistency (zero missing/shifted columns, zero NaN/N/A/TBD values or "
-    "formula errors); (2) if creating or modifying .ifc BIM deliverables, run "
+    "consistency (register EVERY requirement ID from the task/project docs including "
+    "alphanumeric IDs like R-ILLUM because unregistered IDs forfeit engineering credit, "
+    "zero missing/shifted columns, zero NaN/N/A/TBD or unresolved '[_____]'/'*as indicated' "
+    "artifacts, and on optimization/sizing tasks with hard resource caps run a discrete search "
+    "preserving positive margins with >= 0.5% buffer where feasible); (2) if creating or modifying .ifc BIM deliverables, run "
     "ifcopenshell.validate plus ifcopenshell.geom.tree BVH clash checks across "
     "ALL elements (including same-service MEP segments—never exempt "
     "IfcRelConnects* links or 0 mm touching butt-joints). Because BVH flags "
@@ -522,6 +538,145 @@ def _prune_old_images(
     return pruned
 
 
+_PRUNE_BOILERPLATE_TOKENS = frozenset(
+    {
+        "exit_code", "traceback", "python3", "filesystem", "warning", "directory",
+        "section", "standard", "output", "submission", "submission.zip", "command",
+        "timeout_sec", "truncated", "errors", "warnings", "indicated",
+    }
+)
+_PRUNE_TOKEN_RE = re.compile(r"\b[A-Za-z0-9_.-]{7,}\b")
+_PACING_TAIL_RE = re.compile(r"\n+\[(?:Turn \d+/\d+|Pacing:|URGENT:|\d+ minutes left)[^\n]*$")
+
+
+def prune_old_tool_outputs(
+    messages: List[Dict[str, Any]],
+    *,
+    max_age_turns: int = PRUNE_TOOL_AGE_TURNS,
+    min_chars: int = PRUNE_TOOL_MIN_CHARS,
+    ref_window_turns: int = PRUNE_REF_WINDOW_TURNS,
+    stub_chars: int = PRUNE_STUB_CHARS,
+) -> Tuple[int, int]:
+    """Compact old (> max_age_turns) large (> min_chars) unreferenced tool outputs into short stubs."""
+    turn_idx = -1
+    msg_turns: List[int] = []
+    call_id_to_tool: Dict[str, str] = {}
+
+    for msg in messages:
+        role = msg.get("role")
+        if role == "assistant":
+            turn_idx += 1
+            for tc in msg.get("tool_calls") or ():
+                if isinstance(tc, dict):
+                    cid = str(tc.get("id") or "")
+                    fn = str(((tc.get("function") or {}) if isinstance(tc.get("function"), dict) else {}).get("name") or "")
+                    if cid:
+                        call_id_to_tool[cid] = "exec" if fn in ("bash", "exec") else (fn or "tool")
+        msg_turns.append(max(0, turn_idx))
+
+    latest_turn = max(msg_turns, default=0)
+    if latest_turn <= max_age_turns:
+        return 0, 0
+
+    recent_cutoff = latest_turn - max(1, ref_window_turns)
+    recent_parts: List[str] = []
+    for m_turn, msg in zip(msg_turns, messages):
+        if m_turn > recent_cutoff:
+            c = msg.get("content")
+            if isinstance(c, str):
+                recent_parts.append(c)
+            elif isinstance(c, list):
+                recent_parts.extend(str(p.get("text") or "") for p in c if isinstance(p, dict))
+            for tc in msg.get("tool_calls") or ():
+                if isinstance(tc, dict):
+                    fn_d = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                    recent_parts.append(str(fn_d.get("arguments") or ""))
+
+    recent_text = "\n".join(recent_parts)
+    recent_text_low = recent_text.lower()
+    recent_tokens = {
+        tok for tok in _PRUNE_TOKEN_RE.findall(recent_text_low) if tok not in _PRUNE_BOILERPLATE_TOKENS
+    }
+
+    pruned_count = 0
+    saved_chars = 0
+    for m_turn, msg in zip(msg_turns, messages):
+        if msg.get("role") != "tool":
+            continue
+        age = latest_turn - m_turn
+        if age <= max_age_turns:
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str) or len(content) <= min_chars or content.startswith("[pruned "):
+            continue
+
+        call_id = str(msg.get("tool_call_id") or "")
+        if len(call_id) >= 4 and call_id in recent_text:
+            continue
+
+        body_clean = _PACING_TAIL_RE.sub("", content)
+        toks = sorted(
+            {
+                tok
+                for tok in _PRUNE_TOKEN_RE.findall(body_clean.lower()[:20000])
+                if tok not in _PRUNE_BOILERPLATE_TOKENS
+            },
+            key=lambda t: (-len(t), t),
+        )[:24]
+        if toks and len(set(toks) & recent_tokens) >= 2:
+            continue
+
+        tool_label = call_id_to_tool.get(call_id, "exec")
+        orig_len = len(content)
+        spill_match = re.search(r"/tmp/ple_exec_out_[0-9a-f]+\.txt", content)
+        spill_note = f" | spill={spill_match.group(0)}" if spill_match else ""
+        header = f"[pruned {orig_len:,}-char {tool_label} output{spill_note}; re-run if needed]"
+
+        budget = max(40, stub_chars - len(header) - 8)
+        head_len = budget // 2
+        tail_len = max(20, budget - head_len)
+        flat = " ".join(body_clean.split())
+        head = flat[:head_len]
+        tail = flat[-tail_len:] if len(flat) > head_len + tail_len else ""
+        stub = f"{header}\n{head}\n...\n{tail}" if tail else f"{header}\n{head}"
+
+        msg["content"] = stub
+        pruned_count += 1
+        saved_chars += orig_len - len(stub)
+
+    return pruned_count, saved_chars
+
+
+async def _format_or_spill_exec_output(
+    session: taskbridge.Session,
+    raw_output: str,
+    *,
+    inline_cap: int = EXEC_INLINE_CAP_CHARS,
+) -> str:
+    """Keep concise exec output inline; spill oversized output to /tmp to preserve prompt cache."""
+    if len(raw_output) <= inline_cap:
+        return raw_output
+    digest = hashlib.sha256(raw_output.encode("utf-8", errors="replace")).hexdigest()[:10]
+    spill_path = f"/tmp/ple_exec_out_{digest}.txt"
+    spilled = False
+    if hasattr(session, "write_file"):
+        try:
+            await session.write_file(spill_path, raw_output)
+            spilled = True
+        except Exception:
+            spilled = False
+    marker = (
+        f"\n... [spilled {len(raw_output):,}-char exec output to {spill_path}; "
+        "inspect specific lines with bash/sed/grep if needed] ...\n"
+        if spilled
+        else f"\n... [truncated {len(raw_output):,}-char exec output] ...\n"
+    )
+    avail = max(400, inline_cap - len(marker))
+    head_len = min(EXEC_SPILL_HEAD_CHARS, int(avail * 0.62))
+    tail_len = max(100, avail - head_len)
+    return raw_output[:head_len] + marker + raw_output[-tail_len:]
+
+
 def _image_dedup_key(resolved: str, data: bytes) -> Tuple[Any, ...]:
     """Build dedup key `(resolved_path, mtime_ns, size, sha16)` for active `view_image` tracking."""
     sha = hashlib.sha256(data).hexdigest()[:16]
@@ -778,7 +933,8 @@ async def run_tool(
             timeout_sec = taskbridge.positive_int(args.get("timeout_sec", 120), 120, cap)
             result = await session.exec(command, timeout_sec=timeout_sec)
             note = " (timed out)" if result.get("timed_out") else ""
-            return clip(f"exit code {result['exit_code']}{note}\n{result.get('output') or ''}")
+            formatted = f"exit code {result['exit_code']}{note}\n{result.get('output') or ''}"
+            return await _format_or_spill_exec_output(session, clip(formatted))
 
         if name == "read_file":
             resolved = _resolve_path(session, args["path"])
@@ -1041,7 +1197,7 @@ _CONSTRAINT_HYPHEN_ID_RANGE_RE = re.compile(
     r"|\b(R-\d{2,6}-)(\d{1,4})\s{0,2}[-–—]\s{0,2}\4(\d{1,4})\b"
 )
 _CONSTRAINT_REQ_ID_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:R-\d{2,6}-\d{1,4}|(?<!-)[RHS]\d{2,3}(?!-\d))(?![A-Za-z0-9_])"
+    r"(?<![A-Za-z0-9_])(?:R-\d{2,6}-\d{1,4}|R-[A-Z]{2,12}(?:-\d{1,4})?|(?<!-)[RHS]\d{2,3}(?!-\d))(?![A-Za-z0-9_])"
 )
 _CONSTRAINT_NON_REQ_CONTEXT_RE = re.compile(
     r"\b(?:insulation|thermal|r-value|refrigerant|aashto|truck|schedule|sch\.?|radius|fillet|bend|resistor)\b",
@@ -1236,7 +1392,7 @@ def _extract_required_register_ids(
             items = raw_ids if isinstance(raw_ids, list) else ([raw_ids] if raw_ids else [])
             for item in items:
                 tok = _extract_id_token(item).upper()
-                if tok and any(ch.isdigit() for ch in tok) and _REGISTER_ID_TOKEN_RE.match(tok):
+                if tok and (any(ch.isdigit() for ch in tok) or tok.startswith("R-")) and _REGISTER_ID_TOKEN_RE.match(tok):
                     collected.append(tok)
         collected.extend(_extract_req_ids(constraints_json, limit=160))
     if task or plan:
@@ -1288,6 +1444,89 @@ def _extract_target_deliverables(
         if any(p.lower().endswith(ext) for ext in _AUDITABLE_DELIVERABLE_EXTS):
             out.append(p)
     return _dedupe_strs(out, limit=100)
+
+
+_FORBIDDEN_STD_CLAUSE_RE = re.compile(
+    r"\b(?:no|not|never|do\s+not|must\s+not|shall\s+not|prohibit\w*|forbid\w*|without|exclud\w*|ban(?:ned)?|omit)\b"
+    r"[^\n.;]{0,70}?\b(UFC|Unified\s+Facilities\s+Criteria|UFGS|MIL-STD-\d+[A-Z]?|"
+    r"NFPA\s+\d+[A-Z]?|IEEE\s+[A-Z0-9.-]+|ASHRAE\s+[0-9.]+)\b",
+    re.I,
+)
+_DISALLOWED_SEC_CLAUSE_RE = re.compile(
+    r"(?:\b(?:no|not|never|do\s+not|must\s+not|disallowed|prohibit\w*|forbid\w*|exclud\w*|"
+    r"not\s+part\s+of\s+the\s+project\s+manual|not\s+in\s+(?:the\s+)?project\s+manual)\b"
+    r"[^\n.;]{0,70}?\bSection\s+(\d{2}\s+\d{2}\s+\d{2}(?:\.\d{2}\s+\d{2})?)\b"
+    r"|\bSection\s+(\d{2}\s+\d{2}\s+\d{2}(?:\.\d{2}\s+\d{2})?)\b[^\n.;]{0,45}?"
+    r"\b(?:is\s+)?(?:disallowed|prohibited|forbidden|excluded|not\s+part\s+of|not\s+permitted)\b)",
+    re.I,
+)
+_ALLOWED_SEC_LINE_RE = re.compile(
+    r"(?:allowed\s+(?:spec\w*\s+)?sections|project\s+manual\s+sections|only\s+cross[- ]reference[^\n]*sections)[^\n]*",
+    re.I,
+)
+_SEC_CODE_RE = re.compile(r"\b(\d{2}\s+\d{2}\s+\d{2}(?:\.\d{2}\s+\d{2})?)\b")
+
+
+def extract_exclusion_rules(
+    constraints_json: str,
+    task: str = "",
+    plan: str = "",
+) -> Dict[str, List[str]]:
+    """Derive task-specific forbidden citations, section rules, and scope exclusions dynamically."""
+    forbidden_citations: List[str] = []
+    allowed_sections: List[str] = []
+    disallowed_sections: List[str] = []
+    required_scope_exclusions: List[str] = []
+
+    if constraints_json:
+        try:
+            parsed = json.loads(constraints_json, parse_constant=_reject_json_constant)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            for key in ("forbidden_citations", "prohibited_citations", "excluded_citations"):
+                val = parsed.get(key)
+                if isinstance(val, list):
+                    forbidden_citations.extend(str(x).strip() for x in val if str(x).strip())
+                elif isinstance(val, str) and val.strip():
+                    forbidden_citations.append(val.strip())
+            for key in ("allowed_sections",):
+                val = parsed.get(key)
+                if isinstance(val, list):
+                    allowed_sections.extend(" ".join(str(x).split()) for x in val if str(x).strip())
+            for key in ("disallowed_sections", "excluded_sections", "prohibited_sections"):
+                val = parsed.get(key)
+                if isinstance(val, list):
+                    disallowed_sections.extend(" ".join(str(x).split()) for x in val if str(x).strip())
+            for key in ("scope_exclusions", "required_scope_exclusions"):
+                val = parsed.get(key)
+                if isinstance(val, list):
+                    required_scope_exclusions.extend(str(x).strip() for x in val if str(x).strip())
+
+    # Scan task, plan, and any raw hard_constraints strings inside constraints_json dynamically
+    combined = "\n".join(p for p in (task, plan, constraints_json) if p)
+    for m in _FORBIDDEN_STD_CLAUSE_RE.finditer(combined):
+        tok = " ".join(m.group(1).split())
+        if tok.lower() == "unified facilities criteria":
+            forbidden_citations.append("UFC")
+        else:
+            forbidden_citations.append(tok)
+
+    for m in _DISALLOWED_SEC_CLAUSE_RE.finditer(combined):
+        sec = m.group(1) or m.group(2)
+        if sec:
+            disallowed_sections.append(" ".join(sec.split()))
+
+    for m_line in _ALLOWED_SEC_LINE_RE.finditer(combined):
+        for sec in _SEC_CODE_RE.findall(m_line.group(0)):
+            allowed_sections.append(" ".join(sec.split()))
+
+    return {
+        "forbidden_citations": _dedupe_strs(forbidden_citations, limit=40),
+        "allowed_sections": _dedupe_strs(allowed_sections, limit=80),
+        "disallowed_sections": _dedupe_strs(disallowed_sections, limit=80),
+        "required_scope_exclusions": _dedupe_strs(required_scope_exclusions, limit=60),
+    }
 
 
 def detect_contradictory_comment_statuses(text: str) -> List[str]:
@@ -1494,6 +1733,7 @@ async def agent(
     waits_seq = RETRY_WAITS if retry_waits is None else retry_waits
     nudges, head, waits, turns = 0, "", iter(waits_seq), 0
     image_key_by_part_id: Dict[int, Tuple[Any, ...]] = {}
+    last_failed_bash_sig: Optional[str] = None
     while True:
         if session.cancelled.is_set():
             return session.final_message or head
@@ -1517,6 +1757,13 @@ async def agent(
             timeout = max(1.0, min(float(WRAP_UP_SEC), left))
         else:
             timeout = max(1.0, left - until)
+
+        if turns > 0 and turns % PRUNE_CHECKPOINT_EVERY == 0:
+            pruned_tools, saved_tool_chars = prune_old_tool_outputs(messages)
+            if pruned_tools:
+                await session.log(
+                    f"context pruner: pruned {pruned_tools} old tool output(s) ({saved_tool_chars:,} chars)"
+                )
 
         active_model = str(call_opts.get("model") or model)
         active_cache_mark = bool(cache_mark or ("claude" in active_model.lower()))
@@ -1687,13 +1934,38 @@ async def agent(
             await session.log(
                 f"{fn.get('name', '')} {str(fn.get('arguments', ''))[:200]}"
             )
-            content = await run_tool(
-                session,
-                fn,
-                mcp_registry=mcp_registry,
-                image_sink=pending_images,
-                active_image_keys=active_image_keys,
-            )
+            fn_name_cur = str(fn.get("name") or "").strip()
+            bash_sig: Optional[str] = None
+            if fn_name_cur == "bash":
+                try:
+                    b_args = json.loads(str(fn.get("arguments") or "{}"))
+                    b_cmd = " ".join(str(b_args.get("command") or "").split()) if isinstance(b_args, dict) else ""
+                    if b_cmd:
+                        bash_sig = hashlib.sha256(b_cmd.encode("utf-8", errors="replace")).hexdigest()[:16]
+                except Exception:
+                    bash_sig = None
+
+            if bash_sig and bash_sig == last_failed_bash_sig:
+                content = (
+                    "error: identical failing bash command repeated without any intervening file edit; "
+                    "inspect the previous error and modify your command or script before re-running."
+                )
+            else:
+                content = await run_tool(
+                    session,
+                    fn,
+                    mcp_registry=mcp_registry,
+                    image_sink=pending_images,
+                    active_image_keys=active_image_keys,
+                )
+
+            if fn_name_cur in ("write_file", "edit_file") and not content.startswith("error:"):
+                last_failed_bash_sig = None
+            elif fn_name_cur == "bash" and bash_sig:
+                if content.startswith("exit code 0\n") or content == "exit code 0":
+                    last_failed_bash_sig = None
+                elif content.startswith("exit code ") and not content.startswith("exit code 0"):
+                    last_failed_bash_sig = bash_sig
             if content.startswith("error:"):
                 if tool_breaker.record_failure():
                     tripped = True
@@ -2051,7 +2323,7 @@ SKIP_DIRS = {
     "build",
     "site-packages",
 }
-AUDIT_BASELINE_EXTS = {".xlsx", ".xlsm", ".csv", ".tsv", ".ifc", ".json", ".zip"}
+AUDIT_BASELINE_EXTS = {".xlsx", ".xlsm", ".csv", ".tsv", ".ifc", ".json", ".zip", ".docx", ".md"}
 LARGE_BASELINE_EXTS = {".ifc", ".zip"}
 
 root = Path.cwd()
@@ -2200,6 +2472,47 @@ if not TARGET_DELIVERABLES and os.environ.get("PLE_AUDIT_TARGET_DELIVERABLES_JSO
         TARGET_DELIVERABLES = []
 else:
     TARGET_DELIVERABLES = [str(x).strip() for x in TARGET_DELIVERABLES if str(x).strip()]
+FORBIDDEN_CITATIONS = []  # __PLE_FORBIDDEN_CITATIONS__
+if not FORBIDDEN_CITATIONS and os.environ.get("PLE_AUDIT_FORBIDDEN_CITATIONS_JSON"):
+    try:
+        _env_forb = json.loads(os.environ["PLE_AUDIT_FORBIDDEN_CITATIONS_JSON"])
+        if isinstance(_env_forb, list):
+            FORBIDDEN_CITATIONS = [str(x).strip() for x in _env_forb if str(x).strip()]
+    except Exception:
+        FORBIDDEN_CITATIONS = []
+else:
+    FORBIDDEN_CITATIONS = [str(x).strip() for x in FORBIDDEN_CITATIONS if str(x).strip()]
+ALLOWED_SECTIONS = []  # __PLE_ALLOWED_SECTIONS__
+if not ALLOWED_SECTIONS and os.environ.get("PLE_AUDIT_ALLOWED_SECTIONS_JSON"):
+    try:
+        _env_asec = json.loads(os.environ["PLE_AUDIT_ALLOWED_SECTIONS_JSON"])
+        if isinstance(_env_asec, list):
+            ALLOWED_SECTIONS = [" ".join(str(x).split()) for x in _env_asec if str(x).strip()]
+    except Exception:
+        ALLOWED_SECTIONS = []
+else:
+    ALLOWED_SECTIONS = [" ".join(str(x).split()) for x in ALLOWED_SECTIONS if str(x).strip()]
+DISALLOWED_SECTIONS = []  # __PLE_DISALLOWED_SECTIONS__
+if not DISALLOWED_SECTIONS and os.environ.get("PLE_AUDIT_DISALLOWED_SECTIONS_JSON"):
+    try:
+        _env_dsec = json.loads(os.environ["PLE_AUDIT_DISALLOWED_SECTIONS_JSON"])
+        if isinstance(_env_dsec, list):
+            DISALLOWED_SECTIONS = [" ".join(str(x).split()) for x in _env_dsec if str(x).strip()]
+    except Exception:
+        DISALLOWED_SECTIONS = []
+else:
+    DISALLOWED_SECTIONS = [" ".join(str(x).split()) for x in DISALLOWED_SECTIONS if str(x).strip()]
+REQUIRED_SCOPE_EXCLUSIONS = []  # __PLE_REQUIRED_SCOPE_EXCLUSIONS__
+if not REQUIRED_SCOPE_EXCLUSIONS and os.environ.get("PLE_AUDIT_SCOPE_EXCLUSIONS_JSON"):
+    try:
+        _env_excl = json.loads(os.environ["PLE_AUDIT_SCOPE_EXCLUSIONS_JSON"])
+        if isinstance(_env_excl, list):
+            REQUIRED_SCOPE_EXCLUSIONS = [str(x).strip() for x in _env_excl if str(x).strip()]
+    except Exception:
+        REQUIRED_SCOPE_EXCLUSIONS = []
+else:
+    REQUIRED_SCOPE_EXCLUSIONS = [str(x).strip() for x in REQUIRED_SCOPE_EXCLUSIONS if str(x).strip()]
+ENFORCE_DELIVERABLES = False  # __PLE_ENFORCE_DELIVERABLES__
 SKIP_DIRS = {
     ".git",
     "__pycache__",
@@ -2318,6 +2631,11 @@ NON_SUM_COL_RE = re.compile(
 
 errors = []
 warnings = []
+pre_verifier_blockers = []
+missing_deliverables = []
+delivered_paths = set()
+register_checked = False
+combined_spec_texts = []
 root = Path.cwd()
 files = []
 for cur, dirs, names in os.walk(root):
@@ -2505,7 +2823,7 @@ def _check_summary_totals(rel: str, header, indexed_rows):
                 )
 
 REQ_CELL_ID_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?:R-\d{2,6}-\d{1,4}|[A-Z]{1,6}-\d{1,6}|[RHS]\d{2,3})(?![A-Za-z0-9_])"
+    r"(?<![A-Za-z0-9_])(?:R-\d{2,6}-\d{1,4}|R-[A-Z]{2,12}(?:-\d{1,4})?|[A-Z]{1,6}-\d{1,6}|[RHS]\d{2,3})(?![A-Za-z0-9_])"
 )
 
 def _is_constraint_register(rel: str) -> bool:
@@ -2514,9 +2832,13 @@ def _is_constraint_register(rel: str) -> bool:
     norm = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
     return "constraint_register" in norm or "constraints_register" in norm
 
+def _is_register_sheet(sname: str) -> bool:
+    low = str(sname or "").strip().lower()
+    return "register" in low or "constraint" in low
+
 def _req_id_family(rid: str) -> str:
     up = str(rid).strip().upper()
-    if re.match(r"^R-\d{2,6}-\d{1,4}$", up):
+    if re.match(r"^R-\d{2,6}-\d{1,4}$", up) or re.match(r"^R-[A-Z]{2,12}(?:-\d{1,4})?$", up):
         return "R-hyphen:" + up.rsplit("-", 1)[0] + "-"
     if re.match(r"^R\d{2,3}$", up):
         return "R-num"
@@ -2529,8 +2851,12 @@ def _req_id_family(rid: str) -> str:
     return "custom:" + "".join(ch for ch in up if ch.isalpha())
 
 def _check_constraint_register_coverage(rel: str, cell_values):
-    if not REQUIRED_REGISTER_IDS or not _is_constraint_register(rel):
+    global register_checked
+    if not REQUIRED_REGISTER_IDS:
         return
+    if not _is_constraint_register(rel) and "[" not in rel:
+        return
+    register_checked = True
     found_tokens = set()
     for val in cell_values:
         if val is None:
@@ -2542,7 +2868,7 @@ def _check_constraint_register_coverage(rel: str, cell_values):
             found_tokens.add(s.upper())
         for tok in REQ_CELL_ID_RE.findall(s):
             found_tokens.add(tok.upper())
-    present_families = {_req_id_family(tok) for tok in found_tokens if any(ch.isdigit() for ch in tok)}
+    present_families = {_req_id_family(tok) for tok in found_tokens if any(ch.isdigit() for ch in tok) or tok.startswith("R-")}
     required_families = {_req_id_family(rid) for rid in REQUIRED_REGISTER_IDS}
     matched_families = present_families & required_families
     has_r_family = any(f.startswith("R-") for f in present_families)
@@ -2557,9 +2883,8 @@ def _check_constraint_register_coverage(rel: str, cell_values):
         targets = list(REQUIRED_REGISTER_IDS)
     missing = [rid for rid in targets if rid.upper() not in found_tokens]
     if missing:
-        errors.append(
-            f"{rel}: constraint_register missing {len(missing)} required ID(s): {missing[:15]}"
-        )
+        msg = f"{rel}: constraint_register missing {len(missing)} required ID(s): {missing[:15]}"
+        errors.append(msg)
 
 def _audit_csv_text(rel: str, text: str):
     if not text.strip():
@@ -2689,7 +3014,7 @@ def _audit_xlsx_stdlib(rel: str, raw_bytes: bytes):
                 sheets = [(Path(n).stem, n) for n in ws_names]
             if not sheets:
                 return
-            check_reg = bool(REQUIRED_REGISTER_IDS and _is_constraint_register(rel))
+            check_reg_wb = bool(REQUIRED_REGISTER_IDS and _is_constraint_register(rel))
             register_cells = []
             for sname, ws_path in sheets:
                 ws_root = ET.fromstring(zf.read(ws_path))
@@ -2697,6 +3022,8 @@ def _audit_xlsx_stdlib(rel: str, raw_bytes: bytes):
                 bad_cols = []
                 id_rows = []
                 all_aligned = []
+                sheet_reg_cells = []
+                check_reg_sheet = bool(REQUIRED_REGISTER_IDS and _is_register_sheet(sname))
                 auto_r = 0
                 for row_el in ws_root.iter():
                     if _xml_tag(row_el) != "row":
@@ -2779,8 +3106,10 @@ def _audit_xlsx_stdlib(rel: str, raw_bytes: bytes):
                             str(row_cells.get(i, "") or "") for i in range(max_c + 1)
                         ]
                         continue
-                    if check_reg:
+                    if check_reg_wb:
                         register_cells.extend(cv for cv in row_cells.values() if cv is not None)
+                    if check_reg_sheet:
+                        sheet_reg_cells.extend(cv for cv in row_cells.values() if cv is not None)
                     if max_c >= len(sheet_header):
                         bad_cols.append(r_idx)
                         continue
@@ -2801,7 +3130,9 @@ def _audit_xlsx_stdlib(rel: str, raw_bytes: bytes):
                     if id_rows:
                         _check_headers_and_id_rows(f"{rel}[{sname}]", sheet_header, id_rows)
                     _check_summary_totals(f"{rel}[{sname}]", sheet_header, all_aligned)
-            if check_reg:
+                if check_reg_sheet and not check_reg_wb:
+                    _check_constraint_register_coverage(f"{rel}[{sname}]", sheet_reg_cells)
+            if check_reg_wb:
                 _check_constraint_register_coverage(rel, register_cells)
     except Exception as exc:
         errors.append(f"{rel}: failed reading XLSX XML (stdlib): {exc}")
@@ -2831,8 +3162,9 @@ def _audit_xlsx_bytes(rel: str, raw_bytes: bytes):
         return
     if openpyxl is not None:
         sheet_headers = {}
-        check_reg = bool(REQUIRED_REGISTER_IDS and _is_constraint_register(rel))
+        check_reg_wb = bool(REQUIRED_REGISTER_IDS and _is_constraint_register(rel))
         register_cells = []
+        sheet_reg_cells = {}
         saw_formula_pass = False
         for data_only in (False, True):
             wb = None
@@ -2844,6 +3176,9 @@ def _audit_xlsx_bytes(rel: str, raw_bytes: bytes):
                     sheet_rows = []
                     calc_indexed = []
                     bad_cols = []
+                    check_reg_sheet = bool(REQUIRED_REGISTER_IDS and _is_register_sheet(sname))
+                    if check_reg_sheet and not data_only:
+                        sheet_reg_cells.setdefault(sname, [])
                     for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
                         if r_idx > 20000:
                             break
@@ -2855,8 +3190,10 @@ def _audit_xlsx_bytes(rel: str, raw_bytes: bytes):
                             sheet_header = [str(row[i]) if row[i] is not None else "" for i in range(last_ne + 1)]
                             sheet_headers[sname] = sheet_header
                         elif r_idx > 1 and last_ne >= 0:
-                            if check_reg and not data_only:
+                            if check_reg_wb and not data_only:
                                 register_cells.extend(c for c in row if c is not None)
+                            if check_reg_sheet and not data_only:
+                                sheet_reg_cells[sname].extend(c for c in row if c is not None)
                             if sheet_header is not None and last_ne >= len(sheet_header):
                                 if not data_only:
                                     bad_cols.append(r_idx)
@@ -2894,8 +3231,12 @@ def _audit_xlsx_bytes(rel: str, raw_bytes: bytes):
                         wb.close()
                     except Exception:
                         pass
-        if check_reg and saw_formula_pass:
-            _check_constraint_register_coverage(rel, register_cells)
+        if saw_formula_pass:
+            if check_reg_wb:
+                _check_constraint_register_coverage(rel, register_cells)
+            else:
+                for sname, s_cells in sheet_reg_cells.items():
+                    _check_constraint_register_coverage(f"{rel}[{sname}]", s_cells)
 
 def _audit_json_text(rel: str, text: str):
     if not text.strip():
@@ -2921,6 +3262,87 @@ def _audit_json_text(rel: str, text: str):
     except Exception as exc:
         errors.append(f"{rel}: invalid JSON or non-finite numeric literal: {exc}")
 
+_DOCX_BLANK_RE = re.compile(r"\[\s*_+\s*\]")
+_CONCAT_AS_IND_RE = re.compile(r"[A-Za-z0-9]+as indicated\b")
+_BARE_AS_IND_RE = re.compile(r"(?m)^\s*(?:\d+\.|[a-z]\.)\s*as indicated\.?\s*$")
+_ADJ_BRACKET_RE = re.compile(r"\]\s*\[")
+_XREF_COMMA_RE = re.compile(r"\bSection\s+\d{2}\s+\d{2}\s+\d{2}(?:\.\d{2}\s+\d{2})?,\s+[A-Z]")
+_SECTION_XREF_RE = re.compile(r"\bSection\s+(\d{2}\s+\d{2}\s+\d{2}(?:\.\d{2}\s+\d{2})?)\b")
+_UFC_CITE_RE = re.compile(r"\bUFC\s+\d+-\d+-\d+\b|\bUnified\s+Facilities\s+Criteria\b", re.I)
+_SKIP_DOC_MD_NAMES = {"task.md", "readme.md", "plan.md", "notes.md"}
+
+def _record_pre_verifier_issue(msg):
+    if msg not in errors:
+        errors.append(msg)
+    if msg not in pre_verifier_blockers:
+        pre_verifier_blockers.append(msg)
+
+def _audit_spec_text(rel: str, text: str, is_docx: bool = False):
+    if not text or not text.strip():
+        return
+    combined_spec_texts.append(text)
+    if _DOCX_BLANK_RE.search(text):
+        _record_pre_verifier_issue(f"{rel}: unresolved bracket blank '[_____]' placeholder in specification text")
+    m_cat = _CONCAT_AS_IND_RE.search(text)
+    if m_cat:
+        _record_pre_verifier_issue(f"{rel}: concatenated placeholder artifact {m_cat.group(0)!r}")
+    if _BARE_AS_IND_RE.search(text):
+        _record_pre_verifier_issue(f"{rel}: bare standalone 'as indicated' line replacing blank placeholder")
+    if is_docx and _ADJ_BRACKET_RE.search(text):
+        _record_pre_verifier_issue(f"{rel}: adjacent unresolved bracketed choices ']['")
+    m_cm = _XREF_COMMA_RE.search(text)
+    if m_cm:
+        _record_pre_verifier_issue(
+            f"{rel}: disallowed comma between section number and title in cross-reference {m_cm.group(0)!r}"
+        )
+    for raw_tok in FORBIDDEN_CITATIONS:
+        tok = str(raw_tok).strip()
+        if not tok:
+            continue
+        if tok.upper() == "UFC":
+            m_u = _UFC_CITE_RE.search(text)
+            if m_u:
+                _record_pre_verifier_issue(f"{rel}: forbidden citation per task exclusion rules: {m_u.group(0)!r}")
+        else:
+            m_f = re.search(r"(?<!\w)" + re.escape(tok) + r"(?!\w)", text, re.I)
+            if m_f:
+                _record_pre_verifier_issue(f"{rel}: forbidden citation per task exclusion rules: {m_f.group(0)!r}")
+    seen_secs = set()
+    allowed_set = set(ALLOWED_SECTIONS)
+    disallowed_set = set(DISALLOWED_SECTIONS)
+    for m_s in _SECTION_XREF_RE.finditer(text):
+        sec_num = " ".join(m_s.group(1).split())
+        if sec_num in seen_secs:
+            continue
+        if sec_num in disallowed_set:
+            seen_secs.add(sec_num)
+            _record_pre_verifier_issue(f"{rel}: disallowed section cross-reference 'Section {sec_num}'")
+        elif allowed_set and sec_num not in allowed_set:
+            seen_secs.add(sec_num)
+            _record_pre_verifier_issue(
+                f"{rel}: section cross-reference 'Section {sec_num}' not in allowed project manual sections"
+            )
+
+def _audit_docx_bytes(rel: str, raw_bytes: bytes):
+    if not raw_bytes:
+        errors.append(f"{rel}: deliverable file is empty (0 bytes)")
+        return
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw_bytes), "r") as dz:
+            if "word/document.xml" not in set(dz.namelist()):
+                errors.append(f"{rel}: invalid DOCX archive (missing word/document.xml)")
+                return
+            doc_root = ET.fromstring(dz.read("word/document.xml"))
+        paras = []
+        for el in doc_root.iter():
+            if _xml_tag(el) == "p":
+                ptxt = "".join(t.text or "" for t in el.iter() if _xml_tag(t) == "t")
+                if ptxt.strip():
+                    paras.append(ptxt)
+        _audit_spec_text(rel, "\n".join(paras), is_docx=True)
+    except Exception as exc:
+        errors.append(f"{rel}: corrupt DOCX container: {exc}")
+
 def _audit_zip_file(rel: str, p: Path):
     total_extracted = 0
     try:
@@ -2936,7 +3358,10 @@ def _audit_zip_file(rel: str, p: Path):
                 if total_extracted + info.file_size > 25 * 1024 * 1024:
                     break
                 total_extracted += info.file_size
+                norm_member = info.filename.replace("\\", "/").lstrip("./")
+                delivered_paths.add(norm_member.lower())
                 mrel = f"{rel}!{info.filename}"
+                delivered_paths.add(mrel.lower())
                 mext = Path(info.filename).suffix.lower()
                 raw_bytes = zf.read(info.filename)
                 if mext in ZERO_BYTE_EXTS and not raw_bytes:
@@ -2946,12 +3371,16 @@ def _audit_zip_file(rel: str, p: Path):
                     _audit_csv_text(mrel, raw_bytes.decode("utf-8-sig", errors="replace"))
                 elif mext in {".xlsx", ".xlsm"}:
                     _audit_xlsx_bytes(mrel, raw_bytes)
+                elif mext == ".docx":
+                    _audit_docx_bytes(mrel, raw_bytes)
+                elif mext == ".md" and Path(info.filename).name.lower() not in _SKIP_DOC_MD_NAMES:
+                    _audit_spec_text(mrel, raw_bytes.decode("utf-8", errors="replace"), is_docx=False)
                 elif mext == ".json" and Path(info.filename).name.lower() not in SKIP_JSON_NAMES:
                     _audit_json_text(mrel, raw_bytes.decode("utf-8", errors="replace"))
     except Exception as exc:
         errors.append(f"{rel}: corrupt ZIP archive: {exc}")
 
-AUDITABLE_EXTS = {".xlsx", ".xlsm", ".csv", ".tsv", ".ifc", ".json", ".zip"}
+AUDITABLE_EXTS = {".xlsx", ".xlsm", ".csv", ".tsv", ".ifc", ".json", ".zip", ".docx", ".md"}
 LARGE_AUDITABLE_EXTS = {".ifc", ".zip"}
 
 def _file_sha256(p: Path) -> str:
@@ -3020,11 +3449,46 @@ for p in files:
     if size > 25 * 1024 * 1024:
         continue
     if ext == ".csv":
+        delivered_paths.add(rel.lower())
         _audit_csv_text(rel, p.read_text(encoding="utf-8-sig", errors="replace"))
     elif ext in {".xlsx", ".xlsm"}:
+        delivered_paths.add(rel.lower())
         _audit_xlsx_bytes(rel, p.read_bytes())
+    elif ext == ".docx":
+        delivered_paths.add(rel.lower())
+        _audit_docx_bytes(rel, p.read_bytes())
+    elif ext == ".md" and p.name.lower() not in _SKIP_DOC_MD_NAMES:
+        delivered_paths.add(rel.lower())
+        _audit_spec_text(rel, p.read_text(encoding="utf-8", errors="replace"), is_docx=False)
     elif ext == ".json" and p.name.lower() not in SKIP_JSON_NAMES:
+        delivered_paths.add(rel.lower())
         _audit_json_text(rel, p.read_text(encoding="utf-8", errors="replace"))
+    elif ext in {".zip", ".ifc"}:
+        delivered_paths.add(rel.lower())
+
+if REQUIRED_SCOPE_EXCLUSIONS and combined_spec_texts:
+    _full_spec_low = "\n".join(combined_spec_texts).lower()
+    for _excl_phrase in REQUIRED_SCOPE_EXCLUSIONS:
+        _ep = str(_excl_phrase).strip()
+        if _ep and _ep.lower() not in _full_spec_low:
+            _record_pre_verifier_issue(f"deliverable specs: required scope exclusion missing: {_ep!r}")
+
+if TARGET_DELIVERABLES:
+    _all_workspace_rels = {_rel(fp).replace("\\", "/").lstrip("./").lower() for fp in files} | delivered_paths
+    for _td in TARGET_DELIVERABLES:
+        _td_low = str(_td).replace("\\", "/").lstrip("./").lower()
+        if not _td_low:
+            continue
+        _found_td = (
+            (_td_low in _all_workspace_rels)
+            or (f"output/{_td_low}" in _all_workspace_rels)
+            or any(dp.endswith("/" + _td_low) or dp.endswith("!" + _td_low) for dp in _all_workspace_rels)
+        )
+        if not _found_td:
+            _miss_msg = f"{_td}: missing required target deliverable on disk or in submission archive"
+            missing_deliverables.append(_miss_msg)
+            if ENFORCE_DELIVERABLES:
+                errors.append(_miss_msg)
 
 cross_warns = 0
 for i in range(len(table_id_sets)):
@@ -4049,6 +4513,8 @@ print(
         {
             "errors": errors[:30],
             "warnings": warnings[:30],
+            "pre_verifier_blockers": pre_verifier_blockers[:30],
+            "missing_deliverables": missing_deliverables[:20],
             "skipped_unmodified_xlsx": skipped_unmodified_xlsx[:30],
             "skipped_unmodified_inputs": skipped_unmodified_inputs[:50],
             "mep_summary": mep_summary,
@@ -4193,6 +4659,11 @@ def _build_programmatic_audit_script(
     baseline_files: Optional[Dict[str, Any]] = None,
     required_register_ids: Optional[Iterable[str]] = None,
     target_deliverables: Optional[Iterable[str]] = None,
+    forbidden_citations: Optional[Iterable[str]] = None,
+    allowed_sections: Optional[Iterable[str]] = None,
+    disallowed_sections: Optional[Iterable[str]] = None,
+    required_scope_exclusions: Optional[Iterable[str]] = None,
+    enforce_deliverables: bool = False,
 ) -> str:
     """Return a self-contained Python 3 audit script for task deliverables."""
     _ = task
@@ -4238,6 +4709,44 @@ def _build_programmatic_audit_script(
             f"TARGET_DELIVERABLES = json.loads({encoded_tdelivs})",
             1,
         )
+    clean_forb = _normalize_required_register_ids(forbidden_citations)
+    if clean_forb:
+        encoded_forb = json.dumps(json.dumps(clean_forb, separators=(",", ":")))
+        script = script.replace(
+            "FORBIDDEN_CITATIONS = []  # __PLE_FORBIDDEN_CITATIONS__",
+            f"FORBIDDEN_CITATIONS = json.loads({encoded_forb})",
+            1,
+        )
+    clean_asec = _normalize_required_register_ids(allowed_sections)
+    if clean_asec:
+        encoded_asec = json.dumps(json.dumps(clean_asec, separators=(",", ":")))
+        script = script.replace(
+            "ALLOWED_SECTIONS = []  # __PLE_ALLOWED_SECTIONS__",
+            f"ALLOWED_SECTIONS = json.loads({encoded_asec})",
+            1,
+        )
+    clean_dsec = _normalize_required_register_ids(disallowed_sections)
+    if clean_dsec:
+        encoded_dsec = json.dumps(json.dumps(clean_dsec, separators=(",", ":")))
+        script = script.replace(
+            "DISALLOWED_SECTIONS = []  # __PLE_DISALLOWED_SECTIONS__",
+            f"DISALLOWED_SECTIONS = json.loads({encoded_dsec})",
+            1,
+        )
+    clean_excl = _normalize_required_register_ids(required_scope_exclusions)
+    if clean_excl:
+        encoded_excl = json.dumps(json.dumps(clean_excl, separators=(",", ":")))
+        script = script.replace(
+            "REQUIRED_SCOPE_EXCLUSIONS = []  # __PLE_REQUIRED_SCOPE_EXCLUSIONS__",
+            f"REQUIRED_SCOPE_EXCLUSIONS = json.loads({encoded_excl})",
+            1,
+        )
+    if enforce_deliverables:
+        script = script.replace(
+            "ENFORCE_DELIVERABLES = False  # __PLE_ENFORCE_DELIVERABLES__",
+            "ENFORCE_DELIVERABLES = True",
+            1,
+        )
     return script
 
 
@@ -4249,11 +4758,17 @@ async def run_programmatic_audit(
     baseline_files: Optional[Dict[str, Any]] = None,
     required_register_ids: Optional[Iterable[str]] = None,
     target_deliverables: Optional[Iterable[str]] = None,
+    forbidden_citations: Optional[Iterable[str]] = None,
+    allowed_sections: Optional[Iterable[str]] = None,
+    disallowed_sections: Optional[Iterable[str]] = None,
+    required_scope_exclusions: Optional[Iterable[str]] = None,
+    enforce_deliverables: bool = True,
 ) -> Dict[str, Any]:
-    """Run deterministic CSV/XLSX/JSON/IFC checks in the task container before verification."""
+    """Run deterministic CSV/XLSX/JSON/DOCX/IFC checks in the task container before verification."""
     empty: Dict[str, Any] = {
         "errors": [],
         "warnings": [],
+        "pre_verifier_blockers": [],
         "skipped_unmodified_xlsx": [],
         "skipped_unmodified_inputs": [],
         "mep_summary": {},
@@ -4271,6 +4786,11 @@ async def run_programmatic_audit(
         baseline_files=baseline_files,
         required_register_ids=required_register_ids,
         target_deliverables=target_deliverables,
+        forbidden_citations=forbidden_citations,
+        allowed_sections=allowed_sections,
+        disallowed_sections=disallowed_sections,
+        required_scope_exclusions=required_scope_exclusions,
+        enforce_deliverables=enforce_deliverables,
     )
     cmd = (
         "PY_BIN=$(command -v python3 || command -v python || true)\n"
@@ -4304,6 +4824,9 @@ async def run_programmatic_audit(
                 return empty
             errors = [str(x) for x in (parsed.get("errors") or []) if str(x).strip()]
             warnings = [str(x) for x in (parsed.get("warnings") or []) if str(x).strip()]
+            pre_verifier_blockers = [
+                str(x) for x in (parsed.get("pre_verifier_blockers") or []) if str(x).strip()
+            ]
             skipped_xlsx = [
                 str(x) for x in (parsed.get("skipped_unmodified_xlsx") or []) if str(x).strip()
             ]
@@ -4346,6 +4869,7 @@ async def run_programmatic_audit(
             return {
                 "errors": errors,
                 "warnings": warnings,
+                "pre_verifier_blockers": pre_verifier_blockers,
                 "skipped_unmodified_xlsx": skipped_xlsx,
                 "skipped_unmodified_inputs": skipped_inputs,
                 "mep_summary": mep_summary,
@@ -4430,6 +4954,7 @@ async def solve(
             constraints_json,
             workdir=str(getattr(session, "workdir", "") or ""),
         )
+        excl_rules = extract_exclusion_rules(constraints_json, task, plan)
 
         baseline_files, baseline_ifc_gids = (
             await capture_workspace_baseline(session) if max_fix_rounds > 0 else ({}, [])
@@ -4471,11 +4996,16 @@ async def solve(
                 baseline_ifc_gids=baseline_ifc_gids,
                 required_register_ids=required_register_ids,
                 target_deliverables=target_deliverables,
+                forbidden_citations=excl_rules["forbidden_citations"],
+                allowed_sections=excl_rules["allowed_sections"],
+                disallowed_sections=excl_rules["disallowed_sections"],
+                required_scope_exclusions=excl_rules["required_scope_exclusions"],
             )
             if max_fix_rounds > 0
             else {
                 "errors": [],
                 "warnings": [],
+                "pre_verifier_blockers": [],
                 "skipped_unmodified_xlsx": [],
                 "skipped_unmodified_inputs": [],
                 "mep_summary": {},
@@ -4527,44 +5057,53 @@ async def solve(
                         + "\n".join(f"- {e}" for e in comment_prefilter_errors)
                     )
 
-            verify_state: Dict[str, Any] = {}
-            verdict = await agent(
-                session,
-                conversation(VERIFIER, session, review, mcp_note=mcp_note),
-                verifier_tools,
-                _until(CHECK_SHARE / 2),
-                client=active_client,
-                runtime_cfg=runtime_cfg,
-                mcp_registry=mcp_registry,
-                breaker=breaker,
-                max_turns=runtime_cfg.get("max_verify_turns", 25),
-                wrap_up_message=VERIFIER_WRAP_UP,
-                run_state=verify_state,
-            )
-            verifier_truncated = bool(verify_state.get("truncated"))
+            pre_blockers = list(audit.get("pre_verifier_blockers") or [])
             audit_errors = list(audit.get("errors") or [])
-
-            readback_errors = check_mcp_readback_errors(
-                active_mcp_writes,
-                [str(r) for r in (verify_state.get("mcp_reads") or [])],
-                mcp_registry,
-            )
-
-            all_gate_errors = audit_errors + comment_prefilter_errors + readback_errors
-            clean_pass = (
-                bool(verdict.strip())
-                and is_pass_verdict(verdict)
-                and not verifier_truncated
-                and not all_gate_errors
-            )
-            await session.log(
-                f"verifier: truncated={verifier_truncated} audit_errors={len(audit_errors)} "
-                f"prefilter_errors={len(comment_prefilter_errors)} readback_errors={len(readback_errors)} "
-                f"{verdict[:1000]}"
-            )
+            if pre_blockers:
+                await session.log(
+                    f"pre-verifier gate blocked: {len(pre_blockers)} deterministic blocker(s); skipping VERIFIER"
+                )
+                verdict = ""
+                verifier_truncated = False
+                readback_errors = []
+                clean_pass = False
+                all_gate_errors = list(dict.fromkeys(audit_errors + comment_prefilter_errors))
+            else:
+                verify_state: Dict[str, Any] = {}
+                verdict = await agent(
+                    session,
+                    conversation(VERIFIER, session, review, mcp_note=mcp_note),
+                    verifier_tools,
+                    _until(CHECK_SHARE / 2),
+                    client=active_client,
+                    runtime_cfg=runtime_cfg,
+                    mcp_registry=mcp_registry,
+                    breaker=breaker,
+                    max_turns=runtime_cfg.get("max_verify_turns", 25),
+                    wrap_up_message=VERIFIER_WRAP_UP,
+                    run_state=verify_state,
+                )
+                verifier_truncated = bool(verify_state.get("truncated"))
+                readback_errors = check_mcp_readback_errors(
+                    active_mcp_writes,
+                    [str(r) for r in (verify_state.get("mcp_reads") or [])],
+                    mcp_registry,
+                )
+                clean_pass, all_gate_errors = evaluate_pre_pass_gate(
+                    verdict,
+                    audit_errors=audit_errors,
+                    prefilter_errors=comment_prefilter_errors,
+                    readback_errors=readback_errors,
+                    verifier_truncated=verifier_truncated,
+                )
+                await session.log(
+                    f"verifier: truncated={verifier_truncated} audit_errors={len(audit_errors)} "
+                    f"prefilter_errors={len(comment_prefilter_errors)} readback_errors={len(readback_errors)} "
+                    f"{verdict[:1000]}"
+                )
             if clean_pass or not _time_for(WRAP_UP_SEC):
                 break
-            if not verdict.strip() and not verifier_truncated and not all_gate_errors:
+            if not pre_blockers and not verdict.strip() and not verifier_truncated and not all_gate_errors:
                 break
 
             gap_sections: List[str] = []
@@ -4642,6 +5181,10 @@ async def solve(
                 baseline_ifc_gids=baseline_ifc_gids,
                 required_register_ids=required_register_ids,
                 target_deliverables=target_deliverables,
+                forbidden_citations=excl_rules["forbidden_citations"],
+                allowed_sections=excl_rules["allowed_sections"],
+                disallowed_sections=excl_rules["disallowed_sections"],
+                required_scope_exclusions=excl_rules["required_scope_exclusions"],
             )
             err_tail = f" {'; '.join(audit['errors'][:5])}" if audit["errors"] else ""
             await session.log(
