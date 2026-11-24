@@ -14,6 +14,7 @@ import asyncio
 import base64
 import contextlib
 import copy
+import hashlib
 import json
 import logging
 import math
@@ -58,7 +59,7 @@ VERIFIER_WRAP_UP = {
 }
 RESULT_CHARS = 20_000
 MAX_IMAGE_BYTES = 5 << 20
-MAX_ACTIVE_IMAGES = 4
+MAX_ACTIVE_IMAGES = 10
 IMAGE_MAGIC: Tuple[Tuple[bytes, str], ...] = (
     (b"\x89PNG", "image/png"),
     (b"\xff\xd8\xff", "image/jpeg"),
@@ -504,10 +505,23 @@ def _prune_old_images(
                 else:
                     content[idx] = {
                         "type": "text",
-                        "text": "[Earlier image omitted to save context; call view_image again if needed]",
+                        "text": "[Earlier image omitted to preserve context; rely on notes/measurements already extracted instead of reloading]",
                     }
                     pruned += 1
     return pruned
+
+
+def _image_dedup_key(resolved: str, data: bytes) -> Tuple[Any, ...]:
+    """Build dedup key `(resolved_path, mtime_ns, size, sha16)` for active `view_image` tracking."""
+    sha = hashlib.sha256(data).hexdigest()[:16]
+    try:
+        st = os.stat(resolved)
+        mtime_ns: Optional[int] = int(st.st_mtime_ns)
+        fsize = int(st.st_size)
+    except OSError:
+        mtime_ns = None
+        fsize = len(data)
+    return (resolved, mtime_ns, fsize, sha)
 
 
 def _unique_name(name: str, taken: Any) -> str:
@@ -703,6 +717,7 @@ async def run_tool(
     fn: Dict[str, Any],
     mcp_registry: Optional[Dict[str, Tuple[MCPServer, Dict[str, Any]]]] = None,
     image_sink: Optional[List[Dict[str, Any]]] = None,
+    active_image_keys: Optional[set] = None,
 ) -> str:
     """Execute one model tool call inside the task container safely."""
     name = str(fn.get("name") or "").strip()
@@ -785,6 +800,12 @@ async def run_tool(
                 return (
                     f"error: {args['path']} is not a supported image (PNG, JPEG, GIF, or WEBP)"
                 )
+            img_key = _image_dedup_key(resolved, data)
+            if active_image_keys is not None and img_key in active_image_keys:
+                return (
+                    f"INFO: image {args['path']} ({mime}, {len(data)} bytes) is already loaded and "
+                    "active in context above; reuse the already-attached visual inspection."
+                )
             b64 = base64.b64encode(data).decode("ascii")
             if image_sink is not None:
                 image_sink.append(
@@ -793,8 +814,11 @@ async def run_tool(
                         "mime": mime,
                         "b64": b64,
                         "size": len(data),
+                        "key": img_key,
                     }
                 )
+            if active_image_keys is not None:
+                active_image_keys.add(img_key)
             return (
                 f"loaded image {args['path']} ({mime}, {len(data)} bytes); "
                 "attached visually below"
@@ -933,6 +957,12 @@ _MCP_COMMENT_WRITE_RE = re.compile(
 )
 _MCP_COMMENT_READ_RE = re.compile(
     r"(?:comment|journal|activit|note|history|replies)",
+    re.I,
+)
+_MCP_ACTION_SPLIT_RE = re.compile(
+    r"_(?:create|add|update|edit|write|post|put|upload|set|delete|remove|close|"
+    r"assign|send|reply|append|patch|upsert|get|list|read|fetch|search|find|"
+    r"query|view|show|inspect|download|manage)(?:_|$)",
     re.I,
 )
 _META_STATUS_LINE_RE = re.compile(
@@ -1137,6 +1167,82 @@ def _extract_comment_texts_from_args(args: Any) -> List[str]:
     return texts
 
 
+def _mcp_service_prefix(tool_name: str) -> str:
+    """Extract logical MCP service prefix (e.g. `apps__openproject_mcp_`) for scoped checks."""
+    raw = str(tool_name or "").strip()
+    if not raw:
+        return ""
+    m = re.match(r"^(.+?_mcp_)", raw, re.I)
+    if m:
+        return m.group(1)
+    am = _MCP_ACTION_SPLIT_RE.search(raw)
+    if am and am.start() > 0:
+        return raw[: am.start() + 1]
+    if "__" in raw:
+        return raw.split("__", 1)[0] + "__"
+    if "_" in raw:
+        return raw.split("_", 1)[0] + "_"
+    return raw
+
+
+_MCP_WRITE_VERB_RE = re.compile(
+    r"(?:^|_)(?:create|add|update|edit|write|post|put|upload|set|delete|remove|close|assign|send|reply|append|patch|upsert)(?:_|$)",
+    re.I,
+)
+
+
+def _mcp_is_comment_reader(tool_name: str) -> bool:
+    """Return True only if `tool_name` is a read/list MCP tool for comments or journals."""
+    return bool(
+        _MCP_READ_RE.search(tool_name)
+        and _MCP_COMMENT_READ_RE.search(tool_name)
+        and not _MCP_WRITE_VERB_RE.search(tool_name)
+    )
+
+
+def check_mcp_readback_errors(
+    active_mcp_writes: Dict[Any, Dict[str, Any]],
+    verify_reads: Sequence[str],
+    mcp_registry: Optional[Dict[str, Any]],
+) -> List[str]:
+    """Check per-service MCP readback coverage after WORKER/FIX writes external stores."""
+    if not active_mcp_writes:
+        return []
+    reads = [str(r) for r in (verify_reads or []) if str(r).strip()]
+    if not reads:
+        return ["External MCP stores were modified, but VERIFIER performed no MCP readback."]
+
+    written_svcs: set = set()
+    comment_svcs: set = set()
+    for wr in active_mcp_writes.values():
+        tname = str((wr or {}).get("tool") or "")
+        if not tname:
+            continue
+        svc = _mcp_service_prefix(tname)
+        written_svcs.add(svc)
+        if _MCP_COMMENT_WRITE_RE.search(tname):
+            comment_svcs.add(svc)
+
+    reg_keys = [str(k) for k in (mcp_registry or {})]
+    errors: List[str] = []
+    for svc in sorted(written_svcs):
+        svc_reg = [k for k in reg_keys if _mcp_service_prefix(k) == svc]
+        svc_reads = [r for r in reads if _mcp_service_prefix(r) == svc]
+        svc_has_comment_reader = any(_mcp_is_comment_reader(k) for k in svc_reg)
+        svc_has_any_reader = any(_MCP_READ_RE.search(k) and not _MCP_WRITE_VERB_RE.search(k) for k in svc_reg)
+        if svc in comment_svcs and svc_has_comment_reader:
+            if not any(_mcp_is_comment_reader(r) for r in svc_reads):
+                errors.append(
+                    f"External comments/journals were updated on '{svc}', but VERIFIER did not "
+                    "call an MCP comment/journal readback tool for that service."
+                )
+        elif svc_has_any_reader and not svc_reads:
+            errors.append(
+                f"External MCP store '{svc}' was modified, but VERIFIER performed no get/list readback on that service."
+            )
+    return errors
+
+
 def conversation(
     system: str,
     session: taskbridge.Session,
@@ -1197,6 +1303,7 @@ async def agent(
 
     waits_seq = RETRY_WAITS if retry_waits is None else retry_waits
     nudges, head, waits, turns = 0, "", iter(waits_seq), 0
+    image_key_by_part_id: Dict[int, Tuple[Any, ...]] = {}
     while True:
         if session.cancelled.is_set():
             return session.final_message or head
@@ -1372,6 +1479,18 @@ async def agent(
         serialized_calls = normalized_calls
         tripped = False
         pending_images: List[Dict[str, Any]] = []
+        live_img_parts = [
+            part
+            for msg in messages
+            if msg.get("role") == "user" and isinstance(msg.get("content"), list)
+            for part in msg["content"]
+            if isinstance(part, dict) and part.get("type") == "image_url"
+        ]
+        live_part_ids = {id(p) for p in live_img_parts}
+        image_key_by_part_id = {
+            pid: key for pid, key in image_key_by_part_id.items() if pid in live_part_ids
+        }
+        active_image_keys: set = set(image_key_by_part_id.values())
         for idx, call in enumerate(serialized_calls):
             call_id = call["id"]
             fn = _extract_fn(call)
@@ -1383,6 +1502,7 @@ async def agent(
                 fn,
                 mcp_registry=mcp_registry,
                 image_sink=pending_images,
+                active_image_keys=active_image_keys,
             )
             if content.startswith("error:"):
                 if tool_breaker.record_failure():
@@ -1484,14 +1604,25 @@ async def agent(
                         ),
                     }
                 )
-                parts.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:{img['mime']};base64,{img['b64']}"},
-                    }
-                )
+                img_part = {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{img['mime']};base64,{img['b64']}"},
+                }
+                if img.get("key") is not None:
+                    image_key_by_part_id[id(img_part)] = img["key"]
+                parts.append(img_part)
             messages.append({"role": "user", "content": parts})
             _prune_old_images(messages, max_images=MAX_ACTIVE_IMAGES)
+            live_after = {
+                id(part)
+                for msg in messages
+                if msg.get("role") == "user" and isinstance(msg.get("content"), list)
+                for part in msg["content"]
+                if isinstance(part, dict) and part.get("type") == "image_url"
+            }
+            image_key_by_part_id = {
+                pid: key for pid, key in image_key_by_part_id.items() if pid in live_after
+            }
 
         if tripped and tool_breaker.failure_count > 0:
             await session.log(
@@ -1706,11 +1837,13 @@ class _DryRunCompletionsNamespace:
 
 AUDIT_MARKER = "__PLE_AUDIT_JSON__:"
 XLSX_BASELINE_MARKER = "__PLE_XLSX_BASELINE_JSON__:"
+IFC_BASELINE_MARKER = "__PLE_IFC_BASELINE_JSON__:"
 
 _XLSX_BASELINE_SCRIPT = r'''
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 
 SKIP_DIRS = {
@@ -1738,26 +1871,67 @@ for cur, dirs, names in os.walk(root):
         p = Path(cur) / name
         if p.is_file():
             files.append(p)
-        if len(files) >= 600:
+        if len(files) >= 2000:
             break
-    if len(files) >= 600:
+    if len(files) >= 2000:
         break
 
 baseline = {}
+ifc_gids = set()
+_IFC_STEP_GID_RE = re.compile(
+    r"#[0-9]+\s*=\s*IFC[A-Z0-9_]+\s*\(\s*'([0-9A-Za-z_$]{1,64})'",
+    re.I,
+)
+try:
+    import ifcopenshell as _ifc_base_mod
+except Exception:
+    _ifc_base_mod = None
+
 for p in files:
-    if p.suffix.lower() not in {".xlsx", ".xlsm"}:
-        continue
-    try:
-        size = p.stat().st_size
-        if size > 25 * 1024 * 1024:
+    suf = p.suffix.lower()
+    if suf in {".xlsx", ".xlsm"}:
+        try:
+            size = p.stat().st_size
+            if size > 25 * 1024 * 1024:
+                continue
+            raw = p.read_bytes()
+            rel = p.relative_to(root).as_posix()
+            baseline[rel] = [size, hashlib.sha256(raw).hexdigest()]
+        except OSError:
             continue
-        raw = p.read_bytes()
-        rel = p.relative_to(root).as_posix()
-        baseline[rel] = [size, hashlib.sha256(raw).hexdigest()]
-    except OSError:
-        continue
+    elif suf == ".ifc":
+        try:
+            size = p.stat().st_size
+            if size > 50 * 1024 * 1024:
+                continue
+            if _ifc_base_mod is not None:
+                try:
+                    _m = _ifc_base_mod.open(str(p))
+                    _file_gids = []
+                    for _prod in _m.by_type("IfcProduct"):
+                        _gid = str(getattr(_prod, "GlobalId", None) or "").strip()
+                        if _gid:
+                            _file_gids.append(_gid)
+                    if _file_gids:
+                        ifc_gids.update(_file_gids)
+                        continue
+                except Exception:
+                    pass
+            _txt = p.read_text(encoding="utf-8", errors="ignore")
+            for _gm in _IFC_STEP_GID_RE.finditer(_txt):
+                ifc_gids.add(_gm.group(1))
+            if "/* SCENE_JSON:" in _txt:
+                _s = _txt.split("/* SCENE_JSON:", 1)[1].split("*/", 1)[0]
+                _scene = json.loads(_s)
+                for _el in (_scene.get("elements") or []):
+                    _gid = str(_el.get("gid") or "").strip()
+                    if _gid:
+                        ifc_gids.add(_gid)
+        except Exception:
+            continue
 
 print("__PLE_XLSX_BASELINE_JSON__:" + json.dumps(baseline))
+print("__PLE_IFC_BASELINE_JSON__:" + json.dumps(sorted(ifc_gids)[:50000]))
 '''
 
 _PROGRAMMATIC_AUDIT_SCRIPT = r'''
@@ -1783,6 +1957,16 @@ if not BASELINE_XLSX and os.environ.get("PLE_AUDIT_BASELINE_XLSX_JSON"):
             BASELINE_XLSX = _env_base
     except Exception:
         BASELINE_XLSX = {}
+BASELINE_IFC_GIDS = set()  # __PLE_BASELINE_IFC_GIDS__
+if not BASELINE_IFC_GIDS and os.environ.get("PLE_AUDIT_BASELINE_IFC_GIDS_JSON"):
+    try:
+        _env_ifc = json.loads(os.environ["PLE_AUDIT_BASELINE_IFC_GIDS_JSON"])
+        if isinstance(_env_ifc, list):
+            BASELINE_IFC_GIDS = {str(x) for x in _env_ifc if str(x).strip()}
+    except Exception:
+        BASELINE_IFC_GIDS = set()
+else:
+    BASELINE_IFC_GIDS = {str(x) for x in BASELINE_IFC_GIDS if str(x).strip()}
 SKIP_DIRS = {
     ".git",
     "__pycache__",
@@ -2462,6 +2646,8 @@ def _audit_zip_file(rel: str, p: Path):
 
 ifc_files = []
 skipped_unmodified_xlsx = []
+mep_summary = {}
+clear_height = {"routed_mep": [], "terminals": []}
 for p in files:
     rel = _rel(p)
     ext = p.suffix.lower()
@@ -3453,19 +3639,70 @@ if ifc_files:
                     f"min_gap={min_gap_m * 1000:.1f}mm; detached={detached_labels})"
                 )
 
-        # Overhead clear-height check (>= 2600mm AFF for suspended MEP / sprinkler items)
-        clear_warns = 0
+        # Per-service MEP length & elevation telemetry summary
+        svc_elems_all = {}
         for e in all_elems:
-            if clear_warns >= 10:
-                break
-            if _is_mep(e) or SPRINKLER_RE.search(e["text"]):
+            svc = _mep_service_bucket(e)
+            if svc is not None:
+                svc_elems_all.setdefault(svc, []).append(e)
+        for svc, svc_list in sorted(svc_elems_all.items()):
+            seg_lens = [
+                max(
+                    e["aabb"][3] - e["aabb"][0],
+                    e["aabb"][4] - e["aabb"][1],
+                    e["aabb"][5] - e["aabb"][2],
+                )
+                for e in svc_list
+            ]
+            total_len = round(sum(seg_lens), 3)
+            seg_cnt = len(svc_list)
+            mep_summary[svc] = {
+                "length_m": total_len,
+                "segment_count": seg_cnt,
+                "avg_segment_m": round(total_len / seg_cnt, 3) if seg_cnt else 0.0,
+                "z_min": round(min(e["aabb"][2] for e in svc_list), 4),
+                "z_max": round(max(e["aabb"][5] for e in svc_list), 4),
+            }
+
+        # Overhead clear-height check (>= 2600mm AFF), separated by category & baseline origin
+        TERMINAL_CLASSES = {
+            "IfcFireSuppressionTerminal",
+            "IfcAirTerminal",
+            "IfcSanitaryTerminal",
+            "IfcLightFixture",
+            "IfcAudioVisualAppliance",
+            "IfcCommunicationsAppliance",
+            "IfcElectricAppliance",
+            "IfcFlowTerminal",
+        }
+
+        def _is_terminal(e):
+            return e["cls"] in TERMINAL_CLASSES or bool(SPRINKLER_RE.search(e["text"]))
+
+        cat_warns = {"routed_mep": 0, "terminals": 0}
+        for e in all_elems:
+            is_term = _is_terminal(e)
+            if _is_mep(e) or is_term:
                 z_bot = e["aabb"][2]
                 if 1.20 <= z_bot < 2.599:
-                    clear_warns += 1
-                    warnings.append(
-                        f"overhead clear height {z_bot * 1000:.1f}mm < 2600mm "
-                        f"(check TIA-942 clear-height rule): {e['label']} ({e['file']})"
-                    )
+                    cat = "terminals" if is_term else "routed_mep"
+                    origin_tag = "[BASELINE_INPUT]" if e["gid"] in BASELINE_IFC_GIDS else "[MODIFIED/NEW]"
+                    if len(clear_height[cat]) < 15:
+                        clear_height[cat].append(
+                            {
+                                "label": e["label"],
+                                "gid": e["gid"],
+                                "file": e["file"],
+                                "z_bot_mm": round(z_bot * 1000.0, 1),
+                                "origin": origin_tag,
+                            }
+                        )
+                    if cat_warns[cat] < 10:
+                        cat_warns[cat] += 1
+                        warnings.append(
+                            f"[{cat}] {origin_tag} overhead clear height {z_bot * 1000:.1f}mm < 2600mm "
+                            f"(check TIA-942 clear-height rule): {e['label']} ({e['file']})"
+                        )
 
 print(
     "__PLE_AUDIT_JSON__:"
@@ -3474,6 +3711,8 @@ print(
             "errors": errors[:30],
             "warnings": warnings[:30],
             "skipped_unmodified_xlsx": skipped_unmodified_xlsx[:30],
+            "mep_summary": mep_summary,
+            "clear_height": clear_height,
         }
     )
 )
@@ -3494,12 +3733,28 @@ def _normalize_xlsx_baseline(baseline_xlsx: Optional[Dict[str, Any]]) -> Dict[st
     return clean
 
 
-async def capture_xlsx_baseline(session: taskbridge.Session) -> Dict[str, List[Any]]:
-    """Capture a baseline snapshot of pre-existing XLSX/XLSM files in the task workspace."""
+def _normalize_ifc_baseline(baseline_ifc_gids: Optional[Iterable[str]]) -> List[str]:
+    """Validate and deduplicate pre-existing IFC GlobalId values."""
+    if not baseline_ifc_gids or isinstance(baseline_ifc_gids, (str, bytes)):
+        return []
+    seen: set = set()
+    clean: List[str] = []
+    for gid in baseline_ifc_gids:
+        s = str(gid or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            clean.append(s)
+    return sorted(clean)[:50000]
+
+
+async def capture_workspace_baseline(
+    session: taskbridge.Session,
+) -> Tuple[Dict[str, List[Any]], List[str]]:
+    """Capture pre-existing XLSX hashes and IFC GlobalIds before WORKER runs."""
     if getattr(session, "cancelled", None) and session.cancelled.is_set():
-        return {}
+        return {}, []
     if not hasattr(session, "exec"):
-        return {}
+        return {}, []
     cmd = (
         "PY_BIN=$(command -v python3 || command -v python || true)\n"
         'if [ -n "$PY_BIN" ]; then\n'
@@ -3516,56 +3771,89 @@ async def capture_xlsx_baseline(session: taskbridge.Session) -> Dict[str, List[A
         )
         res = await session.exec(cmd, timeout_sec=min(20, cap))
     except (taskbridge.TaskError, KeyError, TypeError, ValueError, RuntimeError, OSError):
-        return {}
+        return {}, []
     if getattr(session, "cancelled", None) and session.cancelled.is_set():
-        return {}
+        return {}, []
 
     output = str((res or {}).get("output") or "")
+    xlsx_base: Dict[str, List[Any]] = {}
+    ifc_base: List[str] = []
     for line in reversed(output.splitlines()):
-        if line.startswith(XLSX_BASELINE_MARKER):
+        if not xlsx_base and line.startswith(XLSX_BASELINE_MARKER):
             raw = line[len(XLSX_BASELINE_MARKER):].strip()
             try:
                 parsed = json.loads(raw)
+                xlsx_base = _normalize_xlsx_baseline(parsed)
             except json.JSONDecodeError:
-                return {}
-            return _normalize_xlsx_baseline(parsed)
-    return {}
+                xlsx_base = {}
+        elif not ifc_base and line.startswith(IFC_BASELINE_MARKER):
+            raw = line[len(IFC_BASELINE_MARKER):].strip()
+            try:
+                parsed_ifc = json.loads(raw)
+                if isinstance(parsed_ifc, list):
+                    ifc_base = _normalize_ifc_baseline(parsed_ifc)
+            except json.JSONDecodeError:
+                ifc_base = []
+    return xlsx_base, ifc_base
+
+
+async def capture_xlsx_baseline(session: taskbridge.Session) -> Dict[str, List[Any]]:
+    """Capture a baseline snapshot of pre-existing XLSX/XLSM files in the task workspace."""
+    xlsx_base, _ = await capture_workspace_baseline(session)
+    return xlsx_base
 
 
 def _build_programmatic_audit_script(
     task: str = "",
     baseline_xlsx: Optional[Dict[str, Any]] = None,
+    baseline_ifc_gids: Optional[Iterable[str]] = None,
 ) -> str:
     """Return a self-contained Python 3 audit script for task deliverables."""
     _ = task
+    script = _PROGRAMMATIC_AUDIT_SCRIPT
     clean = _normalize_xlsx_baseline(baseline_xlsx)
-    if not clean:
-        return _PROGRAMMATIC_AUDIT_SCRIPT
-    encoded = json.dumps(json.dumps(clean, separators=(",", ":")))
-    return _PROGRAMMATIC_AUDIT_SCRIPT.replace(
-        "BASELINE_XLSX = {}  # __PLE_BASELINE_XLSX__",
-        f"BASELINE_XLSX = json.loads({encoded})",
-        1,
-    )
+    if clean:
+        encoded = json.dumps(json.dumps(clean, separators=(",", ":")))
+        script = script.replace(
+            "BASELINE_XLSX = {}  # __PLE_BASELINE_XLSX__",
+            f"BASELINE_XLSX = json.loads({encoded})",
+            1,
+        )
+    clean_gids = _normalize_ifc_baseline(baseline_ifc_gids)
+    if clean_gids:
+        encoded_gids = json.dumps(json.dumps(clean_gids, separators=(",", ":")))
+        script = script.replace(
+            "BASELINE_IFC_GIDS = set()  # __PLE_BASELINE_IFC_GIDS__",
+            f"BASELINE_IFC_GIDS = set(json.loads({encoded_gids}))",
+            1,
+        )
+    return script
 
 
 async def run_programmatic_audit(
     session: taskbridge.Session,
     task: str = "",
     baseline_xlsx: Optional[Dict[str, Any]] = None,
+    baseline_ifc_gids: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """Run deterministic CSV/XLSX/JSON/IFC checks in the task container before verification."""
     empty: Dict[str, Any] = {
         "errors": [],
         "warnings": [],
         "skipped_unmodified_xlsx": [],
+        "mep_summary": {},
+        "clear_height": {"routed_mep": [], "terminals": []},
         "summary": "",
     }
     if getattr(session, "cancelled", None) and session.cancelled.is_set():
         return empty
     if not hasattr(session, "exec"):
         return empty
-    script = _build_programmatic_audit_script(task, baseline_xlsx=baseline_xlsx)
+    script = _build_programmatic_audit_script(
+        task,
+        baseline_xlsx=baseline_xlsx,
+        baseline_ifc_gids=baseline_ifc_gids,
+    )
     cmd = (
         "PY_BIN=$(command -v python3 || command -v python || true)\n"
         'if [ -n "$PY_BIN" ]; then\n'
@@ -3601,6 +3889,20 @@ async def run_programmatic_audit(
             skipped_xlsx = [
                 str(x) for x in (parsed.get("skipped_unmodified_xlsx") or []) if str(x).strip()
             ]
+            mep_summary = (
+                parsed.get("mep_summary")
+                if isinstance(parsed.get("mep_summary"), dict)
+                else {}
+            )
+            raw_ch = parsed.get("clear_height")
+            clear_height = (
+                {
+                    "routed_mep": list(raw_ch.get("routed_mep") or []),
+                    "terminals": list(raw_ch.get("terminals") or []),
+                }
+                if isinstance(raw_ch, dict)
+                else {"routed_mep": [], "terminals": []}
+            )
             lines: List[str] = []
             if errors:
                 lines.append("ERRORS (must be fixed; cannot PASS while non-empty):")
@@ -3608,10 +3910,22 @@ async def run_programmatic_audit(
             if warnings:
                 lines.append("WARNINGS (inspect carefully):")
                 lines.extend(f"- {w}" for w in warnings[:15])
+            if mep_summary:
+                lines.append("MEP SUMMARY (keep routes compact; compare length vs. baseline):")
+                for svc, stats in sorted(mep_summary.items()):
+                    if isinstance(stats, dict):
+                        lines.append(
+                            f"- {svc}: length={stats.get('length_m', 0.0):.3f}m, "
+                            f"segments={stats.get('segment_count', 0)}, "
+                            f"avg_segment={stats.get('avg_segment_m', 0.0):.3f}m, "
+                            f"z=[{stats.get('z_min', 0.0):.3f}, {stats.get('z_max', 0.0):.3f}]m"
+                        )
             return {
                 "errors": errors,
                 "warnings": warnings,
                 "skipped_unmodified_xlsx": skipped_xlsx,
+                "mep_summary": mep_summary,
+                "clear_height": clear_height,
                 "summary": "\n".join(lines),
             }
     return empty
@@ -3688,7 +4002,9 @@ async def solve(
             constraints_json = json.dumps(_regex_extract_constraints(task, plan), indent=2, ensure_ascii=False)
         await session.log(f"constraints: {constraints_json[:1000]}")
 
-        baseline_xlsx = await capture_xlsx_baseline(session) if max_fix_rounds > 0 else {}
+        baseline_xlsx, baseline_ifc_gids = (
+            await capture_workspace_baseline(session) if max_fix_rounds > 0 else ({}, [])
+        )
         work = conversation(
             WORKER,
             session,
@@ -3719,12 +4035,19 @@ async def solve(
             active_mcp_writes[_mcp_write_target_key(tname, wargs)] = {"tool": tname, "arguments": wargs}
 
         audit = (
-            await run_programmatic_audit(session, task, baseline_xlsx=baseline_xlsx)
+            await run_programmatic_audit(
+                session,
+                task,
+                baseline_xlsx=baseline_xlsx,
+                baseline_ifc_gids=baseline_ifc_gids,
+            )
             if max_fix_rounds > 0
             else {
                 "errors": [],
                 "warnings": [],
                 "skipped_unmodified_xlsx": [],
+                "mep_summary": {},
+                "clear_height": {"routed_mep": [], "terminals": []},
                 "summary": "",
             }
         )
@@ -3789,27 +4112,11 @@ async def solve(
             verifier_truncated = bool(verify_state.get("truncated"))
             audit_errors = list(audit.get("errors") or [])
 
-            readback_errors: List[str] = []
-            if active_mcp_writes:
-                v_reads = [str(r) for r in (verify_state.get("mcp_reads") or [])]
-                if not v_reads:
-                    readback_errors.append(
-                        "External MCP stores were modified, but VERIFIER performed no MCP readback."
-                    )
-                else:
-                    wrote_comment = any(
-                        _MCP_COMMENT_WRITE_RE.search(str(w.get("tool") or ""))
-                        for w in active_mcp_writes.values()
-                    )
-                    reg_has_comment_reader = any(
-                        _MCP_COMMENT_READ_RE.search(k) for k in (mcp_registry or {})
-                    )
-                    if wrote_comment and reg_has_comment_reader and not any(
-                        _MCP_COMMENT_READ_RE.search(r) for r in v_reads
-                    ):
-                        readback_errors.append(
-                            "External comments/journals were updated, but VERIFIER did not call an MCP comment/journal readback tool."
-                        )
+            readback_errors = check_mcp_readback_errors(
+                active_mcp_writes,
+                [str(r) for r in (verify_state.get("mcp_reads") or [])],
+                mcp_registry,
+            )
 
             all_gate_errors = audit_errors + comment_prefilter_errors + readback_errors
             clean_pass = (
@@ -3896,7 +4203,12 @@ async def solve(
                 active_mcp_writes[_mcp_write_target_key(tname, wargs)] = {"tool": tname, "arguments": wargs}
             summary = updated or summary
             work_state = fix_state
-            audit = await run_programmatic_audit(session, task, baseline_xlsx=baseline_xlsx)
+            audit = await run_programmatic_audit(
+                session,
+                task,
+                baseline_xlsx=baseline_xlsx,
+                baseline_ifc_gids=baseline_ifc_gids,
+            )
             err_tail = f" {'; '.join(audit['errors'][:5])}" if audit["errors"] else ""
             await session.log(
                 f"audit(post-fix): errors={len(audit['errors'])} warnings={len(audit['warnings'])}{err_tail}"

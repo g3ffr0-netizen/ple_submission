@@ -15,7 +15,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 from unittest.mock import patch
 from xml.sax.saxutils import escape as xml_escape
 
@@ -32,11 +32,15 @@ def _run_audit(
     workdir: Path,
     env: Optional[Dict[str, str]] = None,
     baseline_xlsx: Optional[Dict[str, Any]] = None,
+    baseline_ifc_gids: Optional[Iterable[str]] = None,
 ) -> Dict[str, Any]:
     """Run serve._PROGRAMMATIC_AUDIT_SCRIPT in a temp workdir and parse its JSON report."""
     proc = subprocess.run(
         [sys.executable, "-"],
-        input=serve._build_programmatic_audit_script(baseline_xlsx=baseline_xlsx),
+        input=serve._build_programmatic_audit_script(
+            baseline_xlsx=baseline_xlsx,
+            baseline_ifc_gids=baseline_ifc_gids,
+        ),
         cwd=workdir,
         env=env,
         capture_output=True,
@@ -2035,6 +2039,298 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
             finally:
                 if ro_b.exists():
                     os.chmod(ro_b, stat.S_IREAD | stat.S_IWRITE)
+
+
+class TestLayer3HardeningPRA(unittest.TestCase):
+    def test_view_image_dedup_and_mtime_invalidation(self):
+        self.assertEqual(serve.MAX_ACTIVE_IMAGES, 10)
+        png_a = b"\x89PNG\r\n\x1a\n" + b"frame-alpha-001"
+        png_b = b"\x89PNG\r\n\x1a\n" + b"frame-bravo-002"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            chart = workdir / "chart.png"
+            chart.write_bytes(png_a)
+            sess = _LocalReplaySession(workdir, "Inspect chart.png cleanly.")
+
+            class _DedupVisionClient:
+                def __init__(self) -> None:
+                    self.calls = 0
+                    self.tool_contents: List[str] = []
+                    self.final_messages: List[Dict[str, Any]] = []
+                    self.chat = self
+                    self.completions = self
+
+                async def create(self, **kwargs: Any) -> serve._DryRunObject:
+                    self.calls += 1
+                    msgs = kwargs["messages"]
+                    sys_msg = str(msgs[0].get("content") or "")
+                    if sys_msg.startswith("You plan an engineering task"):
+                        return serve._DryRunObject(
+                            {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Plan: inspect chart.png."}}]}
+                        )
+                    if sys_msg.startswith("You extract strict engineering constraints"):
+                        return serve._DryRunObject(
+                            {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": json.dumps({"deliverables": []})}}]}
+                        )
+                    if sys_msg.startswith("You check an engineer's work"):
+                        return serve._DryRunObject(
+                            {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "PASS"}}]}
+                        )
+
+                    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+                    self.tool_contents = [str(m.get("content") or "") for m in tool_msgs]
+                    if len(tool_msgs) == 0:
+                        req_id = "vi_1"
+                    elif len(tool_msgs) == 1:
+                        req_id = "vi_2"
+                    elif len(tool_msgs) == 2:
+                        # Bump mtime_ns even with identical bytes -> must invalidate dedup cache
+                        st = chart.stat()
+                        os.utime(chart, ns=(st.st_atime_ns, st.st_mtime_ns + 2_000_000_000))
+                        req_id = "vi_3"
+                    elif len(tool_msgs) == 3:
+                        # Overwrite file with new PNG content -> must reload fresh
+                        chart.write_bytes(png_b)
+                        req_id = "vi_4"
+                    else:
+                        self.final_messages = copy.deepcopy(msgs)
+                        return serve._DryRunObject(
+                            {"choices": [{"finish_reason": "stop", "message": {"role": "assistant", "content": "Chart inspected."}}]}
+                        )
+                    return serve._DryRunObject(
+                        {
+                            "choices": [
+                                {
+                                    "finish_reason": "tool_calls",
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": None,
+                                        "tool_calls": [
+                                            {
+                                                "id": req_id,
+                                                "type": "function",
+                                                "function": {"name": "view_image", "arguments": json.dumps({"path": "chart.png"})},
+                                            }
+                                        ],
+                                    },
+                                }
+                            ]
+                        }
+                    )
+
+            client = _DedupVisionClient()
+            ans = asyncio.run(
+                serve.solve(
+                    sess,  # type: ignore[arg-type]
+                    client=client,
+                    config_path=str(REPO_ROOT / "submission.yaml"),
+                )
+            )
+            self.assertEqual(ans, "Chart inspected.")
+            self.assertEqual(len(client.tool_contents), 4)
+            self.assertIn("loaded image chart.png", client.tool_contents[0])
+            self.assertTrue(client.tool_contents[1].startswith("INFO:"))
+            self.assertIn("already loaded", client.tool_contents[1])
+            self.assertIn("loaded image chart.png", client.tool_contents[2])
+            self.assertIn("loaded image chart.png", client.tool_contents[3])
+
+            attached = [
+                part["image_url"]["url"]
+                for m in client.final_messages
+                if m.get("role") == "user" and isinstance(m.get("content"), list)
+                for part in m["content"]
+                if isinstance(part, dict) and part.get("type") == "image_url"
+            ]
+            # Call 1 (png_a), Call 2 (deduped!), Call 3 (mtime bump -> png_a), Call 4 (new bytes -> png_b)
+            self.assertEqual(len(attached), 3)
+            self.assertNotEqual(attached[1], attached[2])
+
+    def test_scoped_mcp_comment_readback_per_service(self):
+        # Unit checks on check_mcp_readback_errors
+        registry = {
+            "apps__openproject_mcp_add_comment": (None, {}),
+            "apps__openproject_mcp_get_work_package": (None, {}),
+            "apps__wiki_js_mcp_create_comment": (None, {}),
+            "apps__wiki_js_mcp_list_pages": (None, {}),
+            "apps__wiki_js_mcp_list_comments": (None, {}),
+        }
+        # OpenProject has NO comment reader; get_work_package satisfies OpenProject readback (0 errors)
+        self.assertEqual(
+            serve.check_mcp_readback_errors(
+                {("comment", "wp=45"): {"tool": "apps__openproject_mcp_add_comment", "arguments": {}}},
+                ["apps__openproject_mcp_get_work_package"],
+                registry,
+            ),
+            [],
+        )
+        # Writing OpenProject but only reading Wiki.js fails OpenProject readback
+        op_miss = serve.check_mcp_readback_errors(
+            {("comment", "wp=45"): {"tool": "apps__openproject_mcp_add_comment", "arguments": {}}},
+            ["apps__wiki_js_mcp_list_comments"],
+            registry,
+        )
+        self.assertEqual(len(op_miss), 1)
+        self.assertIn("openproject", op_miss[0].lower())
+
+        # Wiki.js HAS list_comments; reading only list_pages flags genuine missing comment readback
+        wiki_miss = serve.check_mcp_readback_errors(
+            {("comment", "page=10"): {"tool": "apps__wiki_js_mcp_create_comment", "arguments": {}}},
+            ["apps__wiki_js_mcp_list_pages"],
+            registry,
+        )
+        self.assertEqual(len(wiki_miss), 1)
+        self.assertIn("did not call an MCP comment/journal readback tool", wiki_miss[0])
+
+        # Full solve() Scenario A: OpenProject write + OpenProject get_work_package -> clean 1-round PASS
+        # Full solve() Scenario B: Wiki.js write + skipping list_comments -> FIX gate -> Round 2 list_comments -> PASS
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+
+            class _MultiServiceMCP:
+                name = "apps"
+
+                async def call(self, tname: str, args: Dict[str, Any]) -> str:
+                    return json.dumps({"ok": True, "tool": tname, "args": args})
+
+            fake_srv = _MultiServiceMCP()
+            fake_reg = {k: (fake_srv, {"name": k.split("apps__", 1)[1], "inputSchema": {"type": "object"}}) for k in registry}
+            fake_defs = [
+                {"type": "function", "function": {"name": k, "description": k, "parameters": {"type": "object"}}}
+                for k in fake_reg
+            ]
+
+            async def _fake_connect_mcp(_session: Any):
+                return fake_reg, fake_defs, "\nMCP tools exposed."
+
+            class _ScopedClient:
+                def __init__(self, target_service: str) -> None:
+                    self.target_service = target_service
+                    self.verify_round = 0
+                    self.fix_prompts: List[str] = []
+                    self.chat = self
+                    self.completions = self
+
+                async def create(self, **kwargs: Any) -> serve._DryRunObject:
+                    msgs = kwargs["messages"]
+                    sys_msg = str(msgs[0].get("content") or "")
+                    user_msgs = [str(m.get("content") or "") for m in msgs if m.get("role") == "user"]
+                    tool_msgs = [m for m in msgs if m.get("role") == "tool"]
+
+                    def _reply(txt: Optional[str], calls: Optional[List[Dict[str, Any]]] = None) -> serve._DryRunObject:
+                        msg: Dict[str, Any] = {"role": "assistant", "content": txt}
+                        if calls:
+                            msg["tool_calls"] = calls
+                        return serve._DryRunObject({"choices": [{"finish_reason": "tool_calls" if calls else "stop", "message": msg}]})
+
+                    if sys_msg.startswith("You plan an engineering task"):
+                        return _reply("Plan: update MCP comment.")
+                    if sys_msg.startswith("You extract strict engineering constraints"):
+                        return _reply(json.dumps({"deliverables": []}))
+                    if sys_msg.startswith("You check an engineer's work"):
+                        if not tool_msgs:
+                            self.verify_round += 1
+                            if self.target_service == "openproject":
+                                rtool = "apps__openproject_mcp_get_work_package"
+                            else:
+                                rtool = "apps__wiki_js_mcp_list_pages" if self.verify_round == 1 else "apps__wiki_js_mcp_list_comments"
+                            return _reply(
+                                None,
+                                [{"id": f"vr_{self.verify_round}", "type": "function", "function": {"name": rtool, "arguments": json.dumps({"request": {"id": 1}})}}],
+                            )
+                        return _reply("PASS")
+                    if any("found these gaps" in u for u in user_msgs):
+                        self.fix_prompts.append(user_msgs[-1])
+                        return _reply("Verified Wiki.js records.")
+                    if not tool_msgs:
+                        wtool = "apps__openproject_mcp_add_comment" if self.target_service == "openproject" else "apps__wiki_js_mcp_create_comment"
+                        return _reply(
+                            None,
+                            [{"id": "wr_1", "type": "function", "function": {"name": wtool, "arguments": json.dumps({"request": {"id": 45, "comment": "Cravenwood: CARRIED"}})}}],
+                        )
+                    return _reply("Updated MCP comment.")
+
+            with patch.object(serve, "connect_mcp", side_effect=_fake_connect_mcp):
+                sess_op = _LocalReplaySession(workdir, "Update WP #45 status.")
+                client_op = _ScopedClient("openproject")
+                ans_op = asyncio.run(serve.solve(sess_op, client=client_op, config_path=str(REPO_ROOT / "submission.yaml")))  # type: ignore[arg-type]
+                self.assertEqual(ans_op, "Updated MCP comment.")
+                self.assertEqual(client_op.verify_round, 1)
+                self.assertEqual(client_op.fix_prompts, [])
+                self.assertTrue(any("readback_errors=0 PASS" in ln for ln in sess_op.logs))
+
+                sess_wk = _LocalReplaySession(workdir, "Update Wiki.js array comment.")
+                client_wk = _ScopedClient("wiki_js")
+                ans_wk = asyncio.run(serve.solve(sess_wk, client=client_wk, config_path=str(REPO_ROOT / "submission.yaml")))  # type: ignore[arg-type]
+                self.assertEqual(ans_wk, "Verified Wiki.js records.")
+                self.assertEqual(client_wk.verify_round, 2)
+                self.assertEqual(len(client_wk.fix_prompts), 1)
+                self.assertIn("did not call an MCP comment/journal readback tool", client_wk.fix_prompts[0])
+
+    def test_mep_summary_and_baseline_diffed_clear_height_telemetry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            env = _write_mock_ifcopenshell_pkg(tmp_path / "pkgs")
+
+            # Capture workspace baseline on input IFC before WORKER generates modified model
+            case_dir = tmp_path / "case"
+            (case_dir / "input").mkdir(parents=True)
+            base_scene = {
+                "elements": [
+                    {"id": 1, "cls": "IfcFireSuppressionTerminal", "gid": "BASE_SPK_01", "name": "SPK-A01", "obj_type": "Sprinkler", "box": [2.0, 2.2, 4.0, 4.2, 1.89, 1.94]},
+                ]
+            }
+            (case_dir / "input" / "baseline.ifc").write_text(
+                f"ISO-10303-21;\n#10=IFCBUILDINGELEMENTPROXY('BASE_STEP_02',$,'EXIST-EQ',$,$,$,$,$,$);\n/* SCENE_JSON: {json.dumps(base_scene)} */\nEND-ISO-10303-21;",
+                encoding="utf-8",
+            )
+            sess = _LocalReplaySession(case_dir, "Route MEP cleanly.")
+            xlsx_base, ifc_gids = asyncio.run(serve.capture_workspace_baseline(sess))  # type: ignore[arg-type]
+            self.assertEqual(xlsx_base, {})
+            self.assertIn("BASE_SPK_01", ifc_gids)
+            self.assertIn("BASE_STEP_02", ifc_gids)
+
+            # Now write deliverable output/model.ifc mixing baseline sprinkler + new routed MEP + new sprinkler
+            (case_dir / "output").mkdir(parents=True)
+            deliverable_scene = {
+                "elements": [
+                    {"id": 1, "cls": "IfcFireSuppressionTerminal", "gid": "BASE_SPK_01", "name": "SPK-A01", "obj_type": "Sprinkler", "box": [2.0, 2.2, 4.0, 4.2, 1.89, 1.94]},
+                    {"id": 2, "cls": "IfcFireSuppressionTerminal", "gid": "NEW_SPK_02", "name": "SPK-NEW-02", "obj_type": "Sprinkler", "box": [4.0, 4.2, 4.0, 4.2, 1.95, 2.00]},
+                    {"id": 3, "cls": "IfcCableCarrierSegment", "gid": "NEW_TRAY_1", "name": "CT-1-SEG-01", "box": [0.0, 6.0, 1.0, 1.6, -0.18, -0.05]},
+                    {"id": 4, "cls": "IfcCableCarrierSegment", "gid": "NEW_TRAY_2", "name": "CT-1-SEG-02", "box": [6.005, 10.005, 1.0, 1.6, -0.18, -0.05]},
+                    {"id": 5, "cls": "IfcDuctSegment", "gid": "NEW_DUCT_LOW", "name": "DUCT-LOW", "box": [12.0, 14.0, 1.0, 1.6, 2.35, 2.48]},
+                    {"id": 6, "cls": "IfcCableCarrierSegment", "gid": "NEW_BUS_1", "name": "BW-1-SEG-01", "obj_type": "Busway", "box": [0.0, 8.0, 8.0, 8.2, -0.20, -0.06]},
+                    {"id": 7, "cls": "IfcPipeSegment", "gid": "NEW_CHW_1", "name": "CHW-1-SEG-01", "box": [0.0, 12.0, 12.0, 12.2, -0.68, -0.51]},
+                ]
+            }
+            (case_dir / "output" / "model.ifc").write_text(
+                f"ISO-10303-21;\n/* SCENE_JSON: {json.dumps(deliverable_scene)} */\nEND-ISO-10303-21;",
+                encoding="utf-8",
+            )
+            out_only = case_dir / "output"
+            report = _run_audit(out_only, env=env, baseline_ifc_gids=ifc_gids)
+            self.assertEqual(report["errors"], [])
+
+            summary = report["mep_summary"]
+            self.assertEqual(summary["busway"], {"length_m": 8.0, "segment_count": 1, "avg_segment_m": 8.0, "z_min": -0.2, "z_max": -0.06})
+            self.assertEqual(summary["chw_pipe"], {"length_m": 12.0, "segment_count": 1, "avg_segment_m": 12.0, "z_min": -0.68, "z_max": -0.51})
+            self.assertEqual(summary["cable_tray"]["segment_count"], 2)
+            self.assertEqual(summary["cable_tray"]["length_m"], 10.0)
+            self.assertEqual(summary["cable_tray"]["avg_segment_m"], 5.0)
+            self.assertEqual(summary["cable_tray"]["z_min"], -0.18)
+            self.assertEqual(summary["cable_tray"]["z_max"], -0.05)
+
+            ch = report["clear_height"]
+            term_by_gid = {item["gid"]: item for item in ch["terminals"]}
+            mep_by_gid = {item["gid"]: item for item in ch["routed_mep"]}
+            self.assertEqual(term_by_gid["BASE_SPK_01"]["origin"], "[BASELINE_INPUT]")
+            self.assertEqual(term_by_gid["NEW_SPK_02"]["origin"], "[MODIFIED/NEW]")
+            self.assertEqual(mep_by_gid["NEW_DUCT_LOW"]["origin"], "[MODIFIED/NEW]")
+
+            warns = "\n".join(report["warnings"])
+            self.assertIn("[terminals] [BASELINE_INPUT] overhead clear height 1890.0mm < 2600mm", warns)
+            self.assertIn("[terminals] [MODIFIED/NEW] overhead clear height 1950.0mm < 2600mm", warns)
+            self.assertIn("[routed_mep] [MODIFIED/NEW] overhead clear height 2350.0mm < 2600mm", warns)
 
 
 if __name__ == "__main__":

@@ -775,11 +775,7 @@ class TestPLEAlignmentUnitContracts(unittest.TestCase):
 
             def __init__(self) -> None:
                 self.files: Dict[str, bytes] = {
-                    "/app/sheet1.png": png_bytes,
-                    "/app/sheet2.png": png_bytes,
-                    "/app/sheet3.png": png_bytes,
-                    "/app/sheet4.png": png_bytes,
-                    "/app/sheet5.png": png_bytes,
+                    **{f"/app/sheet{i}.png": png_bytes for i in range(1, serve.MAX_ACTIVE_IMAGES + 2)},
                     "/app/blob.bin": b"\x00not-an-image",
                     "/app/huge.png": b"\x89PNG" + (b"x" * (serve.MAX_IMAGE_BYTES + 1)),
                 }
@@ -811,7 +807,7 @@ class TestPLEAlignmentUnitContracts(unittest.TestCase):
             async def create(self, **kwargs: Any) -> Any:
                 self.calls += 1
                 self.seen_messages.append(copy_msgs(kwargs["messages"]))
-                if self.calls <= 5:
+                if self.calls <= serve.MAX_ACTIVE_IMAGES + 1:
                     path = f"sheet{self.calls}.png"
                     return serve._DryRunObject(
                         {
@@ -893,12 +889,12 @@ class TestPLEAlignmentUnitContracts(unittest.TestCase):
                 60.0,
                 client=client,
                 runtime_cfg=runtime_cfg,
-                max_turns=8,
+                max_turns=serve.MAX_ACTIVE_IMAGES + 4,
             )
             self.assertEqual(answer, "Inspected all sheets cleanly.")
             # Every tool result remains plain text and user image messages use data:image/png;base64,...
             tool_msgs = [m for m in client.seen_messages[-1] if m.get("role") == "tool"]
-            self.assertEqual(len(tool_msgs), 5)
+            self.assertEqual(len(tool_msgs), serve.MAX_ACTIVE_IMAGES + 1)
             self.assertTrue(all(isinstance(m.get("content"), str) for m in tool_msgs))
 
             active_urls = [
@@ -920,6 +916,7 @@ class TestPLEAlignmentUnitContracts(unittest.TestCase):
                 if isinstance(p, dict) and p.get("type") == "text"
             ]
             self.assertTrue(any("Earlier image omitted" in t for t in omitted_texts))
+            self.assertFalse(any("call view_image again" in t for t in omitted_texts))
 
             # shorten() frees old images cleanly when recovering from context overflow
             pruned = await serve.shorten(sess, messages)  # type: ignore[arg-type]
