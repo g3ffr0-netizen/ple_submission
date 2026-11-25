@@ -201,6 +201,132 @@ jobs:
           asyncio.run(drive())
           "
 
+      - name: Run official kit check --no-smoke --cancel-test (zero-cost local mock proxy)
+        run: |
+          python3 -u - <<'PY' >"$RUNNER_TEMP/mock_openai.log" 2>&1 &
+          import json
+          import time
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          class MockOpenAIHandler(BaseHTTPRequestHandler):
+              def _send_json(self, code: int, payload: dict) -> None:
+                  raw = json.dumps(payload).encode("utf-8")
+                  try:
+                      self.send_response(code)
+                      self.send_header("Content-Type", "application/json")
+                      self.send_header("Content-Length", str(len(raw)))
+                      self.end_headers()
+                      self.wfile.write(raw)
+                  except (BrokenPipeError, ConnectionResetError):
+                      pass
+
+              def do_GET(self) -> None:
+                  if self.path.rstrip("/").endswith("/models"):
+                      self._send_json(
+                          200,
+                          {
+                              "object": "list",
+                              "data": [{"id": "gemini-4-argon", "object": "model"}],
+                          },
+                      )
+                  else:
+                      self._send_json(404, {"error": "not found"})
+
+              def do_POST(self) -> None:
+                  length = int(self.headers.get("Content-Length") or 0)
+                  raw_body = self.rfile.read(length) if length > 0 else b"{}"
+                  try:
+                      body = json.loads(raw_body.decode("utf-8", errors="replace"))
+                  except Exception:
+                      body = {}
+                  msgs_str = json.dumps(body.get("messages") or [])
+                  if "Reply with the word OK." in msgs_str:
+                      self._send_json(
+                          200,
+                          {
+                              "id": "chatcmpl-ci-probe",
+                              "object": "chat.completion",
+                              "created": 1700000000,
+                              "model": body.get("model") or "gemini-4-argon",
+                              "choices": [
+                                  {
+                                      "index": 0,
+                                      "message": {"role": "assistant", "content": "OK"},
+                                      "finish_reason": "stop",
+                                  }
+                              ],
+                              "usage": {
+                                  "prompt_tokens": 8,
+                                  "completion_tokens": 1,
+                                  "total_tokens": 9,
+                              },
+                          },
+                      )
+                      return
+                  # Hold non-probe requests mid-turn past cancel_after=45s so --cancel-test
+                  # exercises real in-flight cancellation without spending any LLM credits.
+                  for _ in range(110):
+                      time.sleep(0.5)
+                  self._send_json(
+                      200,
+                      {
+                          "id": "chatcmpl-ci-cancel",
+                          "object": "chat.completion",
+                          "created": 1700000000,
+                          "model": body.get("model") or "gemini-4-argon",
+                          "choices": [
+                              {
+                                  "index": 0,
+                                  "message": {"role": "assistant", "content": "Working..."},
+                                  "finish_reason": "stop",
+                              }
+                          ],
+                          "usage": {
+                              "prompt_tokens": 16,
+                              "completion_tokens": 2,
+                              "total_tokens": 18,
+                          },
+                      },
+                  )
+
+              def log_message(self, fmt: str, *args) -> None:
+                  print(fmt % args, flush=True)
+
+          server = ThreadingHTTPServer(("0.0.0.0", 4000), MockOpenAIHandler)
+          print("MOCK_OPENAI_READY", flush=True)
+          server.serve_forever()
+          PY
+          MOCK_PID=$!
+          trap 'kill "$MOCK_PID" 2>/dev/null || true; rm -f "$RUNNER_TEMP/mock_proxy.env"' EXIT
+
+          for _ in $(seq 1 30); do
+            if grep -q "MOCK_OPENAI_READY" "$RUNNER_TEMP/mock_openai.log" 2>/dev/null; then
+              break
+            fi
+            sleep 0.2
+          done
+
+          umask 077
+          cat > "$RUNNER_TEMP/mock_proxy.env" <<'EOF'
+          MODEL_PROXY_URL=http://localhost:4000
+          MODEL_PROXY_KEY=ci-zero-cost-mock-proxy
+          EOF
+
+          cd "$RUNNER_TEMP/ple_kit"
+          uv run python -m kit check "$GITHUB_WORKSPACE" --no-smoke --cancel-test --env-file "$RUNNER_TEMP/mock_proxy.env"
+
+      - name: Run kit artifacts on submission (strict once artifacts/ exists)
+        run: |
+          cd "$RUNNER_TEMP/ple_kit"
+          set +e
+          uv run python -m kit artifacts "$GITHUB_WORKSPACE"
+          RC=$?
+          set -e
+          if [ -d "$GITHUB_WORKSPACE/artifacts" ]; then
+            exit "$RC"
+          fi
+          echo "::notice::artifacts/ does not exist yet (kit artifacts exited with $RC); keeping check non-blocking until dev artifacts are populated."
+
       - name: Clean up containers and print logs on failure
         if: always()
         run: |

@@ -14,7 +14,7 @@ on:
         default: "3"
         type: string
       commit_artifacts:
-        description: "Commit merged artifacts/ back to origin/main when all selected tasks succeed"
+        description: "Commit merged artifacts/ back to origin/main for any completed/measured tasks"
         required: false
         default: false
         type: boolean
@@ -336,7 +336,7 @@ jobs:
   eval-task:
     needs: plan-and-check
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       max-parallel: ${{ fromJson(needs.plan-and-check.outputs.max_parallel) }}
@@ -348,19 +348,6 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Reclaim runner disk space for container images
-        run: |
-          FREE_GB=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
-          echo "Available root disk before reclaim: ${FREE_GB:-0} GB"
-          if [ "${FREE_GB:-0}" -lt 35 ]; then
-            sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/boost /usr/local/share/chromium /usr/local/lib/node_modules || true
-            sudo docker system prune -af --volumes || true
-            sudo apt-get clean || true
-          else
-            echo "Skipping disk reclaim (>= 35 GB free)"
-          fi
-          df -h
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -424,6 +411,22 @@ jobs:
               fh.write(f"builder_tag={btag}\n")
           print(f"Resolved task={task_id} grading={grading} hf_rev={rev[:12]} builder_tag={btag}")
           PY
+
+      - name: Reclaim runner disk space for container images
+        env:
+          TASK_GRADING: ${{ steps.task_meta.outputs.grading }}
+        run: |
+          FREE_GB=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
+          echo "Available root disk before reclaim: ${FREE_GB:-0} GB (grading=${TASK_GRADING:-unknown})"
+          if [ "${TASK_GRADING:-}" = "rubric" ] || [ "${FREE_GB:-0}" -lt 35 ]; then
+            echo "Running disk reclaim (unconditional for rubric tasks or < 35 GB free) ..."
+            sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/boost /usr/local/share/chromium /usr/local/lib/node_modules || true
+            sudo docker system prune -af --volumes || true
+            sudo apt-get clean || true
+          else
+            echo "Skipping disk reclaim (grading=${TASK_GRADING:-unknown}, >= 35 GB free)"
+          fi
+          df -h
 
       - name: Cache Hugging Face task files (~45-150 MB per task)
         uses: actions/cache@v4
@@ -1068,8 +1071,12 @@ jobs:
                   fh.write(report_text)
 
           all_measured = str(measured_count == total_tasks and total_tasks > 0).lower()
+          manifest_data = export.read_manifest(workspace / "artifacts") or {}
+          has_imported = bool(manifest_data.get("tasks")) and measured_count > 0
+          any_measured = str(has_imported).lower()
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
               fh.write(f"all_measured={all_measured}\n")
+              fh.write(f"any_measured={any_measured}\n")
           PY
 
       - name: Upload combined evaluation bundle
@@ -1082,7 +1089,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Commit merged artifacts back to origin/main when requested
-        if: ${{ inputs.commit_artifacts && needs.eval-task.result == 'success' && steps.summary.outputs.all_measured == 'true' }}
+        if: ${{ always() && inputs.commit_artifacts && steps.summary.outputs.any_measured == 'true' }}
         env:
           RUN_ID: ${{ github.run_id }}
         run: |
@@ -1098,6 +1105,7 @@ jobs:
             exit 0
           fi
           git commit -m "Update PLE dev artifacts (run $RUN_ID)"
+          git pull --rebase origin main
           git push origin HEAD:main
 
       - name: Fail aggregate job if any task did not complete

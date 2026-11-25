@@ -23,3 +23,5 @@ eval/results.json
 .pytest_cache/
 .eval_cache/
 eval_results/
+tools/*_report.*
+tools/golden_replays/
