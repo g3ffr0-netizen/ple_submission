@@ -1,0 +1,179 @@
+{
+  "format": 1,
+  "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+  "created": "2026-11-25T23:25:40Z",
+  "harness": {
+    "name": "ple-submission",
+    "model_api": "google-cloud/gemini-4-argon",
+    "tree": "de46f52d802e81f44648e9300b74586bb741ad82b89dfc34ae535abcf6e1f193",
+    "files": {
+      ".devcontainer/devcontainer.json": "100644 19ff7d1d65c3a10438b77d0248e2e7a38c34318c",
+      ".gitattributes": "100644 a6369682b02ec3774333e56f3fc8b461e0e9d899",
+      ".github/workflows/codeql.yml": "100644 1edf38c830908bf753b00cd62f42a4212bc0401e",
+      ".github/workflows/ple-dev-eval.yml": "100644 7a96b08b15dcc718827492511425e7cbd48e837e",
+      ".github/workflows/ple-kit-check.yml": "100644 5cb15c9277a1fcbb044cfde5a7493ba9597c784f",
+      ".github/workflows/tests.yml": "100644 9f8246e54bf9cfb039a619a44a7e0542a6e24de7",
+      ".gitignore": "100644 0706b48c86420ee2722539589e437c06557ea1e4",
+      ".streamlit/secrets.toml.example": "100644 7440fa2289f30eaf921b04fcb1fe1ffff1deef72",
+      "HANDOFF.md": "100644 a754ad9d2b2f04e847b91128a56fb458ec29bb80",
+      "LICENSE": "100644 ca96ffe592c75260293292e57f44697e2ea9ad72",
+      "README.md": "100644 4a651d6539cf6fa06b130af07fc6f32f52f1996f",
+      "SECURITY.md": "100644 034e848032092eaf8ef96eac731b6ed5961987f3",
+      "app.py": "100644 982fe29e9e6062e99839fc81ae785e251638f1c4",
+      "eval/dev_tasks.json": "100644 bd2231e4b9941d50eb1102a131f1d78dfd4f15cc",
+      "eval/run.py": "100644 926575fe47a5d43bb53570b04038e53df9682318",
+      "harness.py": "100644 ae9886e4ec8d109c0884e96a921bfbf5b14007b7",
+      "pipeline.py": "100644 93e666371d78eda7cc55c4c78f76b72ea9925ff9",
+      "requirements-serve.txt": "100644 b25202469c405ac068fb76b78270eaaa12bd2e63",
+      "requirements.txt": "100644 f4f0fa490ce2e03a6f7fc2bc7a87e180eec5a84d",
+      "serve.py": "100644 5f36391cc588311fa0d307920c67d8f3473fd380",
+      "submission.yaml": "100644 dfea19e83d4f466a1834f8ec9106bf627220008b",
+      "taskbridge.py": "100644 26cc3d6cf8dbcaed859731ce9a6881f4ca8bfe40",
+      "tests/test_analyze_eval.py": "100644 f64553bd80dc6cb08f95977067a3f1f1ffbca56b",
+      "tests/test_app.py": "100644 99e1d13a78dbd83c7ac06b609431dff2190c78dd",
+      "tests/test_eval_and_polish.py": "100644 01d7174e55ff6bb426f34f32a2e99ea198d0920e",
+      "tests/test_fallback_and_lockout.py": "100644 54469e74752504537f1e6085adc12a5ada6e059f",
+      "tests/test_handoff_sync.py": "100644 91f85a59f08f6e83f722aa2258d62dbdade8a1bb",
+      "tests/test_serve_live.py": "100644 cee51e3a0cce5019ada4196f0c00402c591b8947",
+      "tests/test_sim_stress.py": "100644 7ca6c387a6dab7ff71dc8fd46afae421089eb544",
+      "tests/test_stress.py": "100644 33b607cae5ded997e7d7ff1071fe8821ccc090cb",
+      "tests/test_tuneup.py": "100644 40951b3684aa8a99540cdba8319ae32a805ccb9e",
+      "tests/test_tuneup_patches.py": "100644 9761876d7fa380f160be47e07c389a23412ecb50",
+      "tests/test_verification_and_harness.py": "100644 fc235e06a1118580cb40b50f6c31ed2dcfa05ec3",
+      "tests/verification.py": "100644 c3725ea12f1cef5ffa0728b83989b1560c28c8da",
+      "tools/analyze_eval.py": "100644 602cd47789e846e1816f4fca5957494691dad22a",
+      "tools/handoff_sync.py": "100644 f2352d5000c8cdd99cbddd3ebbfb570cfd8f0a9b",
+      "tools/tuneup.py": "100644 5b6add390f694594c8c912632c942c180d1cc3d4"
+    },
+    "commit": "3715b51b94c47111f2ff3b2325c87bc4158a08b4",
+    "dirty": false
+  },
+  "tasks": {
+    "cooling-water-flush-plan": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "cooling-water-flush-plan__vXzzohb",
+      "ended": "ok",
+      "reward": 0.336111,
+      "tree": "de46f52d802e81f44648e9300b74586bb741ad82b89dfc34ae535abcf6e1f193",
+      "files": {
+        "filesystem/final_batch4__mechanical_task5_pcw_flush_mop__blind/output/submission.zip": "8b6ec961b73db6599dc9f2c69f04f0e174d77af4"
+      },
+      "final_message": "03ac10a630b6c5f98da221f93d41afc4d3f2c04e",
+      "deleted": [],
+      "skipped": []
+    },
+    "data-hall-device-takeoff": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "data-hall-device-takeoff__vfW8KWW",
+      "ended": "ok",
+      "reward": 0.208696,
+      "tree": "de46f52d802e81f44648e9300b74586bb741ad82b89dfc34ae535abcf6e1f193",
+      "files": {
+        "filesystem/final_batch4__electrical_task17_ec_0205_d100__blind/output/submission.zip": "d0e6a43879a6987619490d2ae56e8321c5617264"
+      },
+      "final_message": "35f103b5b9f0b70f1f76d4669e8535c11b844731",
+      "deleted": [],
+      "skipped": []
+    },
+    "division-26-specifications": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "division-26-specifications__BidnVqw",
+      "ended": "ok",
+      "reward": 0.237532,
+      "tree": "de46f52d802e81f44648e9300b74586bb741ad82b89dfc34ae535abcf6e1f193",
+      "files": {
+        "filesystem/final_batch4__electrical_task8_electrical_specs__blind/output/submission.zip": "195779eeacfb9ab9d5ab3118fc6a86da8ff7c733"
+      },
+      "final_message": "434c47a7944d44c11359c38695dae97fb67a0e27",
+      "deleted": [],
+      "skipped": []
+    },
+    "frame-extension-method": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "frame-extension-method__H3Ra5mR",
+      "ended": "ok",
+      "reward": 0.4393,
+      "tree": "de46f52d802e81f44648e9300b74586bb741ad82b89dfc34ae535abcf6e1f193",
+      "files": {
+        "filesystem/field_eng__constructability_4d__blind/output/submission.zip": "99ff3bf1e4112288cee7b5fd620e31ecf98874ce"
+      },
+      "final_message": "8d3f6f979f962477156a34c81487eaf70ae6072a",
+      "deleted": [],
+      "skipped": []
+    },
+    "heat-rejection-life-cycle-cost": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "heat-rejection-life-cycle-cost__T9yuu66",
+      "ended": "ok",
+      "reward": 0.678571,
+      "tree": "de46f52d802e81f44648e9300b74586bb741ad82b89dfc34ae535abcf6e1f193",
+      "files": {
+        "filesystem/final_batch4__mechanical_task3_ct_heat_lcc__blind/output/submission.zip": "a3ad7522747dc88771b0fba29244dd2f440ad58f"
+      },
+      "final_message": "d026b8355e1122ade874aebb76c84b08073b3ece",
+      "deleted": [],
+      "skipped": []
+    },
+    "mv-conveyance-study": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "mv-conveyance-study__HHA8FXk",
+      "ended": "ok",
+      "reward": 0.365964,
+      "tree": "de46f52d802e81f44648e9300b74586bb741ad82b89dfc34ae535abcf6e1f193",
+      "files": {
+        "filesystem/final_batch4__electrical_task12_conveyance_study__blind/output/submission.zip": "b4048d2d85a5e85015cd279351b34f5987d7e312"
+      },
+      "final_message": "a1d874a00b48e4717e141a1763dea382fb5b8e05",
+      "deleted": [],
+      "skipped": []
+    },
+    "roof-deck-design": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "roof-deck-design__2Vhngbi",
+      "ended": "ok",
+      "reward": 0.271429,
+      "tree": "de46f52d802e81f44648e9300b74586bb741ad82b89dfc34ae535abcf6e1f193",
+      "files": {
+        "filesystem/final_batch4__structural_task7_roof_deck_design__blind/output/submission.zip": "554f6de938d00f11a2d55a59f3c615724f272b7c"
+      },
+      "final_message": "c849cf3831c0c9ac187db23fc0f9e0795759678b",
+      "deleted": [],
+      "skipped": []
+    },
+    "seismic-diaphragm-shear": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "seismic-diaphragm-shear__GPfyPkf",
+      "ended": "ok",
+      "reward": 0.295798,
+      "tree": "de46f52d802e81f44648e9300b74586bb741ad82b89dfc34ae535abcf6e1f193",
+      "files": {
+        "filesystem/final_batch4__structural_task6_seismic_diaphragm_shear__blind/output/submission.zip": "9da5a9f26a9d2e2844068a72422ce6bee9883fa8"
+      },
+      "final_message": "1c41efb21eebbe1a3fa87b25c64776596e561992",
+      "deleted": [],
+      "skipped": []
+    },
+    "wind-diaphragm-shear": {
+      "run": "eval_run",
+      "trial": "wind-diaphragm-shear__Qkjsaqj",
+      "ended": "ok",
+      "reward": 0.261905,
+      "tree": "de46f52d802e81f44648e9300b74586bb741ad82b89dfc34ae535abcf6e1f193",
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "files": {
+        "filesystem/final_batch4__structural_task5_wind_diaphragm_shear__blind/output/submission.zip": "8bc6b1b0f9acd5af4b0f57a23ac90c3500022f2e"
+      },
+      "final_message": "0f5324e2fc903b47ac606658da523105b4e56549",
+      "deleted": [],
+      "skipped": []
+    }
+  }
+}
