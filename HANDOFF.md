@@ -10,10 +10,11 @@
 
 ## Section 1: Active Status & Context
 
+- **ple_submission CI & MEP Gate (`1e59c39`):** `[TASK-004]` DONE — GitHub Actions `Unit Tests` workflow is **GREEN** (`45574878813`, 96/96 unit tests + 10/10 pipeline + 15/15 replays pass). Drawing-extracted MEP service-entry gate & prompts ready for Run #33 once Vertex AI spend cap is cleared.
 - **PLE Dev Eval Run #32 (`45548736344`, commit `ac26ef8`):** completed with `failure` (aggregate gate). Scoreboard vs Run #31 = **HOLD**.
   - Workflow URL: https://github.com/g3ffr0-netizen/ple_submission/actions/runs/45548736344
   - **BLOCKER:** Vertex AI **spend cap breached** (`403 PERMISSION_DENIED`, project `161304254129`) mid-run. No further eval runs are possible until the cap is raised/reset.
-- **rusty_caddy (`C:\Users\Owner\Desktop\rusty_caddy`, local git `e50834f`):** TASK-003a delivered, 44/44 tests pass.
+- **rusty_caddy (`C:\Users\Owner\Desktop\rusty_caddy`, private GitHub `g3ffr0-netizen/rusty-caddy` @ `e383f46`):** TASK-003a delivered & pushed, 44/44 tests pass.
 - **Santa 2026 (`v10a`):**
   - `practice_puzzles.csv` (`200/200` valid, `0` errors): **`38,504`** (`-332` vs `v9`'s `38,836`, `worse=0`; `-723` vs `v8`'s `39,227`, `272.14s`)
   - `puzzles.csv` (`1,000/1,000` valid, `0` errors): **`189,946`** (`mean=189.95`, `steps/target=7.06`, **`-4,017` / `-2.07%`** vs `v8`'s `193,963`)
@@ -34,7 +35,10 @@ Once PLE Dev Eval Run #31 (`45477741941`) finishes in GitHub Actions:
 STATUS: DONE | COMPLETED_AT: 2026-11-25 07:00 UTC | Result: Run #32 = HOLD (see Section 3); v10b not promoted.
 
 ### [TASK-003a] rusty_caddy foundation + Social Club Mode + free weather/lightning stack
-STATUS: DONE | COMPLETED_AT: 2026-11-25 07:00 UTC | Local git `e50834f`, 44/44 tests pass (see Section 3).
+STATUS: DONE | COMPLETED_AT: 2026-11-25 07:00 UTC | Pushed to private GitHub `g3ffr0-netizen/rusty-caddy` (`e383f46`), 44/44 tests pass (see Section 3).
+
+### [TASK-004] Fix GitHub Actions Unit Tests (#63-#69) + drawing-extracted MEP service-entry gate
+STATUS: DONE | COMPLETED_AT: 2026-11-25 08:18 UTC | Commits `c2b5483` + `1e59c39`, Unit Tests CI `45574878813` GREEN (96/96 tests pass). Run #33 NOT triggered (waiting on Vertex AI spend cap).
 
 ---
 
@@ -118,3 +122,14 @@ Caveats:
 - BOM feeds are personal/non-commercial use only.
 - Not a safety device.
 - Streamlit cannot push alerts while the phone screen is locked (needs the PWA step).
+
+### [2026-11-25 08:19:33 UTC] [TASK-004] CI Unit Tests GREEN (45574878813) + Drawing-Extracted MEP Service-Entry Gate (commits c2b5483, 1e59c39)
+
+Commits: c2b5483 + 1e59c39 on origin/main. GitHub Actions Unit Tests workflow is GREEN: run 45574878813 (conclusion=success, 96/96 unit tests; 10/10 pipeline.py contract checks; 15/15 golden replays). PLE Dev Eval Run #33 NOT triggered (awaiting Vertex AI spend cap reset).
+1. CI Unit Tests Root Cause & Fix (#63-#69):
+- In Ubuntu Python 3.12 CI, pip installed openai v2.x where openai.APIStatusError.__init__ calls _error_request(response.request) (checking request.headers) and _error_response(response, self.request) (checking response.history and response.next_request).
+- _mock_http_response() in tests/test_sim_stress.py and tests/test_stress.py previously returned SimpleNamespace objects missing request.headers and response.history, raising AttributeError in 3 resilience tests.
+- Fixed _mock_http_response() to construct a real httpx.Response(..., request=httpx.Request(...)) (with full SimpleNamespace fallback) and added regression test test_openai_api_status_error_mock_request_has_headers_for_sdk_v2.
+2. Drawing-Extracted MEP Service-Entry Gate & Prompt Fixes (serve.py):
+- Root causes found in Run #32 data-hall-mep-routing-offset logs: (a) Worker cropped E-101.png starting at x=233 (West wall is at x=271), slicing off left-margin callout text for the offset busway entry (200, 4910) and conflating BW-1 with CT-1/CHW-1 at (0, 12470); (b) port_elems matched segment BW-ENTRY-N against itself (0 mm self-distance); (c) non-pathway Sprinklers (ClearanceToTrayMm) and CRAHs (ServicePipeSize) were misclassified as MEP pathway segments via Pset key names; (d) PLANNER lacked a wrap_up_message (returning empty plan on turn cap), EXTRACTOR/audit ignored plan + CONSTRAINTS.json service entries, and slab-bounded halls without IfcWall produced empty perimeter_endpoints_mm.
+- Fixes: added PLANNER_WRAP_UP; updated PLANNER/EXTRACTOR/WORKER/VERIFIER prompts to crop full outer margins (x=0..0.45*W, y=0..H), extract BW/CT/CHW entries independently from governing sheets E-101/M-101, and record service_entries_mm in CONSTRAINTS.json and output/reconciliation.json; upgraded extract_mep_service_entry_hints() and _PROGRAMMATIC_AUDIT_SCRIPT to parse nested JSON/notes/solution.py constants, block PASS when E-101/M-101 exist without recorded service_entries_mm or when any service is >2500 mm XY from its entry, exclude routed segments from port_elems self-matching, isolate non-pathway equipment/terminals from _mep_service_bucket(), compute slab perimeter endpoints when IfcWall is absent, and warn Verifier on Planner-vs-Worker entry conflicts (>2500 mm) or suspicious BW/CT entry co-location (<=600 mm). Covered by test_drawing_extracted_service_entries_and_non_pathway_pset_isolation.
