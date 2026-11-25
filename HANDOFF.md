@@ -10,10 +10,12 @@
 
 ## Section 1: Active Status & Context
 
-- **ple_submission CI & MEP Gate (`1e59c39`):** `[TASK-004]` DONE — GitHub Actions `Unit Tests` workflow is **GREEN** (`45574878813`, 96/96 unit tests + 10/10 pipeline + 15/15 replays pass). Drawing-extracted MEP service-entry gate & prompts ready for Run #33 once Vertex AI spend cap is cleared.
-- **PLE Dev Eval Run #32 (`45548736344`, commit `ac26ef8`):** completed with `failure` (aggregate gate). Scoreboard vs Run #31 = **HOLD**.
-  - Workflow URL: https://github.com/g3ffr0-netizen/ple_submission/actions/runs/45548736344
-  - **BLOCKER:** Vertex AI **spend cap breached** (`403 PERMISSION_DENIED`, project `161304254129`) mid-run. No further eval runs are possible until the cap is raised/reset.
+- **PLE Submission Candidate LOCKED (`e52c6b2` / harness `1e59c39`):** **Dev evals complete — `0.9180` mean score (`3/3 PASS`, total harness cost `~$10.44`) on PLE Dev Eval Run #33 (`45615053441`, GATE: `PROMOTE`).**
+  - Workflow URL: https://github.com/g3ffr0-netizen/ple_submission/actions/runs/45615053441
+  - `data-center-site-model`: **`1.0000`** (`~$2.63`)
+  - `data-hall-mep-routing`: **`0.9250`** (`~$4.76`)
+  - `data-hall-mep-routing-offset`: **`0.8290`** (`~$3.06`) — `[TASK-004]` MEP service-entry gate & full-margin crop fixes resolved the `(200, 4910)` offset miss (`0.0000 -> 0.8290`, `0` clashes, Gate 2 connectivity passed, `-64.7%` input tokens).
+  - GitHub Actions `Unit Tests` workflow **GREEN** (`96/96` unit tests + `10/10` `pipeline.py` + `15/15` golden replays).
 - **rusty_caddy (`C:\Users\Owner\Desktop\rusty_caddy`, private GitHub `g3ffr0-netizen/rusty-caddy` @ `e383f46`):** TASK-003a delivered & pushed, 44/44 tests pass.
 - **Santa 2026 (`v10a`):**
   - `practice_puzzles.csv` (`200/200` valid, `0` errors): **`38,504`** (`-332` vs `v9`'s `38,836`, `worse=0`; `-723` vs `v8`'s `39,227`, `272.14s`)
@@ -39,6 +41,9 @@ STATUS: DONE | COMPLETED_AT: 2026-11-25 07:00 UTC | Pushed to private GitHub `g3
 
 ### [TASK-004] Fix GitHub Actions Unit Tests (#63-#69) + drawing-extracted MEP service-entry gate
 STATUS: DONE | COMPLETED_AT: 2026-11-25 08:18 UTC | Commits `c2b5483` + `1e59c39`, Unit Tests CI `45574878813` GREEN (96/96 tests pass). Run #33 NOT triggered (waiting on Vertex AI spend cap).
+
+### [TASK-006] PLE Dev Eval Run #33 (`45615053441`) — Verify Spend Cap Lifted, MEP Offset Fix, and Lock Submission Candidate
+STATUS: DONE | COMPLETED_AT: 2026-11-25 15:26 UTC | Result: **GATE: PROMOTE — Overall Mean `0.9180` (`3/3 PASS`, `~$10.44` total harness cost)** (`data-center-site-model`: `1.000`, `data-hall-mep-routing`: `0.925`, `data-hall-mep-routing-offset`: `0.829`). Dev evals complete; commit `e52c6b2` (harness `1e59c39`) locked in as submission candidate.
 
 ---
 
@@ -133,3 +138,18 @@ Commits: c2b5483 + 1e59c39 on origin/main. GitHub Actions Unit Tests workflow is
 2. Drawing-Extracted MEP Service-Entry Gate & Prompt Fixes (serve.py):
 - Root causes found in Run #32 data-hall-mep-routing-offset logs: (a) Worker cropped E-101.png starting at x=233 (West wall is at x=271), slicing off left-margin callout text for the offset busway entry (200, 4910) and conflating BW-1 with CT-1/CHW-1 at (0, 12470); (b) port_elems matched segment BW-ENTRY-N against itself (0 mm self-distance); (c) non-pathway Sprinklers (ClearanceToTrayMm) and CRAHs (ServicePipeSize) were misclassified as MEP pathway segments via Pset key names; (d) PLANNER lacked a wrap_up_message (returning empty plan on turn cap), EXTRACTOR/audit ignored plan + CONSTRAINTS.json service entries, and slab-bounded halls without IfcWall produced empty perimeter_endpoints_mm.
 - Fixes: added PLANNER_WRAP_UP; updated PLANNER/EXTRACTOR/WORKER/VERIFIER prompts to crop full outer margins (x=0..0.45*W, y=0..H), extract BW/CT/CHW entries independently from governing sheets E-101/M-101, and record service_entries_mm in CONSTRAINTS.json and output/reconciliation.json; upgraded extract_mep_service_entry_hints() and _PROGRAMMATIC_AUDIT_SCRIPT to parse nested JSON/notes/solution.py constants, block PASS when E-101/M-101 exist without recorded service_entries_mm or when any service is >2500 mm XY from its entry, exclude routed segments from port_elems self-matching, isolate non-pathway equipment/terminals from _mep_service_bucket(), compute slab perimeter endpoints when IfcWall is absent, and warn Verifier on Planner-vs-Worker entry conflicts (>2500 mm) or suspicious BW/CT entry co-location (<=600 mm). Covered by test_drawing_extracted_service_entries_and_non_pathway_pset_isolation.
+
+### [2026-11-25 15:27:38 UTC] [TASK-006] PLE Dev Eval Run #33 (45615053441) — 0.9180 Mean (3/3 PASS, ~.44) — Submission Candidate e52c6b2 LOCKED
+
+GATE: PROMOTE — PLE Dev Eval Run #33 (45615053441, origin/main @ e52c6b2 / harness 1e59c39) completed 5/5 jobs with conclusion=success!
+Status: Dev evals complete; commit e52c6b2 locked in as submission candidate.
+Headline Results (Run #33 [45615053441]):
+- Overall Mean Score: 0.9180 (3/3 PASS — up +0.5847 vs Run #32's 0.3333, +0.3634 vs Run #31's 0.5546, and +0.5850 vs Run #30's 0.3330)
+- Total Harness Cost: ~$10.44 ($3.48 / task avg; down -14.3% vs Run #32 and -36.5% vs Run #31)
+- Input Tokens / Task: 3,668,216 (-16.4% vs Run #32's 4,390,297; -38.1% vs Run #31's 5,928,051; -81.9% vs Run #30's 20,259,645)
+- Vertex AI Spend Cap (project 161304254129): Confirmed lifted — zero 403 errors across plan-and-check and all 3 eval tasks.
+Per-Task Breakdown (Run #32 -> Run #33):
+- data-center-site-model: 1.0000 -> 1.0000 (PASS | 2,542,462 input tokens | 85.5m | ~$2.63)
+- data-hall-mep-routing: 0.0000 -> 0.9250 (PASS | +0.2612 vs Run #31's 0.6638 | 5,564,212 input tokens | 136.9m | ~$4.76)
+- data-hall-mep-routing-offset: 0.0000 -> 0.8290 (PASS | 2,897,975 input tokens [-64.7% vs Run #32] | 65.3m [-26.3m] | ~$3.06) — confirms [TASK-004] MEP service-entry gate and full-margin crop fixes resolved the (200, 4910) offset miss (gate_1_no_hard_clash=true, gate_2_connectivity.passed=true, 0 clashes, 97.3%-100% row coverage, routed length 198.65m vs l_opt 190.92m).
+Artifacts cached locally at .eval_cache/run_45615053441; compare_report.md, gap_report.md (0 failed rubric items), and profile_report.json updated. No further dev eval runs needed.
