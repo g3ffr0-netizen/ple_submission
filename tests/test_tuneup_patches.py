@@ -494,6 +494,227 @@ class TestTuneupPatches(unittest.TestCase):
 
             asyncio.run(_run())
 
+    def test_read_file_dedup_cache_returns_stub_when_unchanged_and_reloads_on_edit_or_prune(self):
+        class _ReadCacheSession:
+            workdir = "/app"
+            limits = {"exec_timeout_sec": 60}
+            final_message = ""
+            cancelled = asyncio.Event()
+
+            def __init__(self):
+                self.logs: list[str] = []
+                self.files: dict[str, bytes] = {
+                    "/app/agent_view.json": b'{"id": "p6_002", "payload": "' + b"X" * 5000 + b'"}',
+                }
+
+            def time_left(self):
+                return 3600.0
+
+            async def read_file(self, path):
+                return self.files[path]
+
+            async def write_file(self, path, data, append=False):
+                raw = data.encode("utf-8") if isinstance(data, str) else bytes(data)
+                self.files[path] = (self.files.get(path, b"") + raw) if append else raw
+                return len(raw)
+
+            async def exec(self, command, timeout_sec=120):
+                return {"exit_code": 0, "output": "ok", "timed_out": False}
+
+            async def log(self, text):
+                self.logs.append(text)
+
+            async def usage(self, model, inp, out, cached=0):
+                pass
+
+        sess = _ReadCacheSession()
+
+        def _handler(step_idx, _kwargs):
+            if step_idx == 1:
+                return _msg_reply(
+                    tool_calls=[{"id": "r1", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "agent_view.json"}'}}]
+                )
+            if step_idx == 2:
+                # Identical unchanged re-read -> should hit dedup cache stub
+                return _msg_reply(
+                    tool_calls=[{"id": "r2", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "agent_view.json"}'}}]
+                )
+            if step_idx == 3:
+                # Overwrite file via write_file -> invalidates cache
+                return _msg_reply(
+                    tool_calls=[{"id": "w1", "type": "function", "function": {"name": "write_file", "arguments": '{"path": "agent_view.json", "content": "{\\"updated\\": true}"}'}}]
+                )
+            if step_idx == 4:
+                # Re-read after write -> must return fresh full content, NOT cache stub
+                return _msg_reply(
+                    tool_calls=[{"id": "r3", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "agent_view.json"}'}}]
+                )
+            if step_idx <= 14:
+                return _msg_reply(
+                    tool_calls=[{"id": f"b{step_idx}", "type": "function", "function": {"name": "bash", "arguments": '{"command": "echo tick"}'}}]
+                )
+            if step_idx == 15:
+                # After PRUNE_CHECKPOINT_EVERY=12 compacted the >4000 char initial read, reading again or after prune check
+                return _msg_reply(content="done")
+            return _msg_reply(content="done")
+
+        async def _run():
+            client = _ScriptedClient(_handler)
+            msgs = serve.conversation("sys {workdir}", sess, "task")
+            out = await serve.agent(
+                sess,
+                msgs,
+                serve.TOOLS,
+                0.0,
+                client=client,
+                runtime_cfg={"model": "test", "max_output_tokens": 256, "max_failures": 3},
+            )
+            self.assertEqual(out, "done")
+            # Call 3 saw tool r2's cache stub instead of repeating 5KB
+            r2_msg = next(m for m in client.calls[2]["messages"] if m.get("tool_call_id") == "r2")
+            self.assertIn("is unchanged since your earlier read", r2_msg["content"])
+            # Call 5 saw fresh content after write_file
+            r3_msg = next(m for m in client.calls[4]["messages"] if m.get("tool_call_id") == "r3")
+            self.assertIn('{"updated": true}', r3_msg["content"])
+
+        asyncio.run(_run())
+
+        # Also verify direct _evict behavior when r1 was compacted in prune_old_tool_outputs
+        async def _run_prune_evict():
+            cache: dict = {}
+            sess2 = _ReadCacheSession()
+            fn = {"name": "read_file", "arguments": '{"path": "agent_view.json"}'}
+            res1 = await serve.run_tool(sess2, dict(fn), read_file_cache=cache, current_call_id="call_read1")  # type: ignore[arg-type]
+            self.assertIn("payload", res1)
+            res2 = await serve.run_tool(sess2, dict(fn), read_file_cache=cache, current_call_id="call_read2")  # type: ignore[arg-type]
+            self.assertIn("is unchanged since your earlier read", res2)
+            # Simulate external modification (e.g. bash sed) without write_file tool
+            sess2.files["/app/agent_view.json"] = b'{"external": "edit"}'
+            res3 = await serve.run_tool(sess2, dict(fn), read_file_cache=cache, current_call_id="call_read3")  # type: ignore[arg-type]
+            self.assertEqual(res3, '{"external": "edit"}')
+
+        asyncio.run(_run_prune_evict())
+
+    def test_mep_connectivity_gate_blocks_unfed_and_disconnected_busway(self):
+        hints = serve.extract_mep_service_entry_hints(
+            "Route E-101 busway service entry at (200, 4910) mm and M-101 chilled water entry at (0, 12300) mm."
+        )
+        self.assertIn("busway", hints)
+        self.assertEqual(hints["busway"][0], [0.2, 4.91])
+        self.assertIn("chw_pipe", hints)
+        self.assertEqual(hints["chw_pipe"][0], [0.0, 12.3])
+
+        fake_ifc_pkg = '''
+class _FakeBox:
+    def __init__(self, x0, y0, z0, x1, y1, z1):
+        corners = [
+            (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+            (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1),
+        ]
+        self.verts = [c for pt in corners for c in pt]
+        self.faces = [0,1,2, 0,2,3, 4,5,6, 4,6,7, 0,1,5, 0,5,4, 2,3,7, 2,7,6]
+
+class _FakeShape:
+    def __init__(self, box):
+        self.geometry = box
+
+class _FakeProd:
+    def __init__(self, pid, cls, name, obj_type, pset_props, box):
+        self._id = pid
+        self._cls = cls
+        self.Name = name
+        self.ObjectType = obj_type
+        self.GlobalId = f"GID_{pid}"
+        self.Representation = True
+        self.IsDefinedBy = []
+        self._psets = {"Pset_Test": pset_props} if pset_props else {}
+        self._box = box
+    def id(self): return self._id
+    def is_a(self, target=None):
+        if target is None: return self._cls
+        return self._cls == target
+
+class _FakeModel:
+    def __init__(self, prods):
+        self._prods = prods
+    def by_type(self, t):
+        if t == "IfcProduct": return list(self._prods)
+        return []
+
+class _UtilElem:
+    @staticmethod
+    def get_psets(prod):
+        return prod._psets
+
+class _Util:
+    element = _UtilElem()
+
+class _Geom:
+    class settings:
+        USE_WORLD_COORDS = "use-world-coords"
+        def set(self, k, v): pass
+    @staticmethod
+    def create_shape(_settings, prod):
+        return _FakeShape(_FakeBox(*prod._box))
+
+import json, pathlib
+_CFG = json.loads(pathlib.Path("fake_scene.json").read_text())
+def open(_path):
+    return _FakeModel([_FakeProd(i+1, r["cls"], r["name"], r["obj"], r["pset"], r["box"]) for i, r in enumerate(_CFG["elems"])])
+geom = _Geom()
+util = _Util()
+'''
+
+        def _run_with_scene(elems_cfg: list[dict], recon: dict | None = None) -> dict:
+            with tempfile.TemporaryDirectory() as tmp:
+                wdir = Path(tmp)
+                pkg = wdir / "ifcopenshell"
+                pkg.mkdir()
+                (pkg / "__init__.py").write_text(fake_ifc_pkg, encoding="utf-8")
+                (pkg / "geom.py").write_text(
+                    "from ifcopenshell import _Geom as _G\n"
+                    "settings = _G.settings\n"
+                    "create_shape = _G.create_shape\n",
+                    encoding="utf-8",
+                )
+                (wdir / "fake_scene.json").write_text(json.dumps({"elems": elems_cfg}), encoding="utf-8")
+                out_dir = wdir / "output"
+                out_dir.mkdir()
+                (out_dir / "model.ifc").write_text("ISO-10303-21;\nEND-ISO-10303-21;\n", encoding="utf-8")
+                if recon is not None:
+                    (out_dir / "reconciliation.json").write_text(json.dumps(recon), encoding="utf-8")
+                return _run_audit_script(
+                    wdir,
+                    task="Route E-101 busway service entry at (200, 4910) mm and deliver output/model.ifc.",
+                )
+
+        # Case A: Unfed busway (far from (200, 4910)) + disconnected second busway segment + unserved Row B
+        bad_elems = [
+            {"cls": "IfcWall", "name": "WALL-W", "obj": "", "pset": {}, "box": (-0.2, 0.0, 0.0, 0.0, 20.0, 3.0)},
+            {"cls": "IfcCableCarrierSegment", "name": "BW-01", "obj": "Busway", "pset": {"Service": "POWER"}, "box": (0.05, 12.60, -0.20, 20.0, 12.73, -0.05)},
+            {"cls": "IfcCableCarrierSegment", "name": "BW-ISO", "obj": "Busway", "pset": {"Service": "POWER"}, "box": (15.0, 2.0, -0.20, 18.0, 2.13, -0.05)},
+            {"cls": "IfcFurniture", "name": "RACK-B01", "obj": "Rack", "pset": {"Row": "B"}, "box": (3.0, 5.5, 0.0, 3.6, 6.5, 2.0)},
+            {"cls": "IfcFurniture", "name": "RACK-B02", "obj": "Rack", "pset": {"Row": "B"}, "box": (4.0, 5.5, 0.0, 4.6, 6.5, 2.0)},
+        ]
+        bad_res = _run_with_scene(bad_elems)
+        blockers_txt = "\n".join(bad_res["pre_verifier_blockers"])
+        self.assertIn("disconnected MEP busway", blockers_txt)
+        self.assertIn("unfed", blockers_txt)
+        self.assertIn("4910", blockers_txt)
+        self.assertIn("Row B", blockers_txt)
+
+        # Case B: Single connected busway starting at (0.10, 4.91) within 2500mm of (0.20, 4.91) & covering Row B
+        good_elems = [
+            {"cls": "IfcWall", "name": "WALL-W", "obj": "", "pset": {}, "box": (-0.2, 0.0, 0.0, 0.0, 20.0, 3.0)},
+            {"cls": "IfcCableCarrierSegment", "name": "BW-01", "obj": "Busway", "pset": {"Service": "POWER"}, "box": (0.10, 4.85, -0.20, 12.0, 4.98, -0.05)},
+            {"cls": "IfcFurniture", "name": "RACK-B01", "obj": "Rack", "pset": {"Row": "B"}, "box": (3.0, 5.5, 0.0, 3.6, 6.5, 2.0)},
+            {"cls": "IfcFurniture", "name": "RACK-B02", "obj": "Rack", "pset": {"Row": "B"}, "box": (4.0, 5.5, 0.0, 4.6, 6.5, 2.0)},
+        ]
+        good_res = _run_with_scene(good_elems)
+        self.assertEqual(good_res["pre_verifier_blockers"], [])
+        self.assertEqual(good_res["errors"], [])
+        self.assertTrue(good_res["mep_summary"]["busway"]["perimeter_endpoints_mm"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

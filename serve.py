@@ -164,7 +164,12 @@ WORKER = (
     "alphanumeric IDs like R-ILLUM because unregistered IDs forfeit engineering credit, "
     "zero missing/shifted columns, zero NaN/N/A/TBD or unresolved '[_____]'/'*as indicated' "
     "artifacts, and on optimization/sizing tasks with hard resource caps run a discrete search "
-    "preserving positive margins with >= 0.5% buffer where feasible); (2) if creating or modifying .ifc BIM deliverables, run "
+    "preserving positive margins with >= 0.5% buffer where feasible); (2) if creating or modifying .ifc BIM deliverables, "
+    "(a) if drawing PNG sheets (E-101, M-101, A-101, F-101) specify service-entry locations, crop and zoom EACH service entry "
+    "callout individually with view_image (never assume busway, cable tray, and CHW pipe enter at the "
+    "same Y or X coordinate), and ensure every routed network starts within <= 2500 mm XY of its drawn "
+    "service entry, forms 1 connected component (<= 250 mm joint tolerance), reaches >= 80% of every rack "
+    "row (<= 2500 mm XY), and reaches every CRAH unit (<= 2500 mm XY for CHW); (b) run "
     "ifcopenshell.validate plus ifcopenshell.geom.tree BVH clash checks across "
     "ALL elements (including same-service MEP segments—never exempt "
     "IfcRelConnects* links or 0 mm touching butt-joints). Because BVH flags "
@@ -215,7 +220,10 @@ VERIFIER = (
     "For .ifc deliverables, run Python checks using ifcopenshell.geom.tree BVH "
     "across ALL elements without exempting IfcRelConnects* or 0 mm butt-joints "
     "(verify 5-10 mm non-touching gaps at L-corners/T-junctions/joints so BVH clash "
-    "count is 0 while each service forms 1 connected component <= 250 mm) plus 3D "
+    "count is 0 while each service forms 1 connected component <= 250 mm), verify "
+    "connectivity to drawn service entries (<= 2500 mm XY against cropped E-101/M-101 "
+    "entry arrows and MEP SUMMARY perimeter endpoints), rack-row coverage (>= 80% per "
+    "row <= 2500 mm), and CRAH reachability, plus 3D "
     "clearances (tray-to-busway >= 300 mm, tray-stack headroom >= 300 mm, overhead "
     "clear height >= 2600 mm AFF, sprinkler >= 457 mm, PDU clear zones, road vs. "
     "building non-intersection) and inspect every Programmatic Pre-Check warning "
@@ -884,6 +892,8 @@ async def run_tool(
     mcp_registry: Optional[Dict[str, Tuple[MCPServer, Dict[str, Any]]]] = None,
     image_sink: Optional[List[Dict[str, Any]]] = None,
     active_image_keys: Optional[set] = None,
+    read_file_cache: Optional[Dict[str, Tuple[str, int, str]]] = None,
+    current_call_id: str = "",
 ) -> str:
     """Execute one model tool call inside the task container safely."""
     name = str(fn.get("name") or "").strip()
@@ -950,7 +960,18 @@ async def run_tool(
                     f"{args['path']} is a binary file ({len(data)} bytes); "
                     "inspect it with bash"
                 )
-            return clip(data.decode("utf-8", "replace") or "(empty file)")
+            text_val = data.decode("utf-8", "replace") or "(empty file)"
+            digest = hashlib.sha256(data).hexdigest()[:16]
+            if read_file_cache is not None:
+                prev_entry = read_file_cache.get(resolved)
+                if prev_entry is not None and prev_entry[0] == digest:
+                    return (
+                        f"INFO: {args['path']} ({len(data)} bytes, sha256={digest}) is unchanged "
+                        "since your earlier read in this conversation; reuse its contents from "
+                        "context above."
+                    )
+                read_file_cache[resolved] = (digest, len(data), current_call_id)
+            return clip(text_val)
 
         if name == "view_image":
             resolved = _resolve_path(session, args["path"])
@@ -996,16 +1017,22 @@ async def run_tool(
             content = args["content"]
             append = bool(args.get("append", False))
             size = await session.write_file(resolved, content, append=append)
+            if read_file_cache is not None:
+                read_file_cache.pop(resolved, None)
             return f"wrote {size} bytes to {args['path']}"
 
         if name == "edit_file":
-            return await edit_file_in_session(
+            resolved = _resolve_path(session, args["path"])
+            edit_res = await edit_file_in_session(
                 session,
                 args["path"],
                 args["old_text"],
                 args["new_text"],
                 replace_all=bool(args.get("replace_all", False)),
             )
+            if read_file_cache is not None and not str(edit_res).startswith("error:"):
+                read_file_cache.pop(resolved, None)
+            return edit_res
 
         return f"error: there is no tool named {name}"
     except (taskbridge.TaskError, taskbridge.MCPError, KeyError, TypeError, ValueError, RuntimeError) as exc:
@@ -1733,7 +1760,23 @@ async def agent(
     waits_seq = RETRY_WAITS if retry_waits is None else retry_waits
     nudges, head, waits, turns = 0, "", iter(waits_seq), 0
     image_key_by_part_id: Dict[int, Tuple[Any, ...]] = {}
+    read_file_cache: Dict[str, Tuple[str, int, str]] = {}
     last_failed_bash_sig: Optional[str] = None
+
+    def _evict_pruned_read_cache() -> None:
+        if not read_file_cache:
+            return
+        unpruned_ids = {
+            str(m.get("tool_call_id") or "")
+            for m in messages
+            if m.get("role") == "tool"
+            and isinstance(m.get("content"), str)
+            and not m["content"].startswith("[pruned ")
+            and "\n[... cut to save context; run the tool again if needed]" not in m["content"]
+        }
+        for cached_path in [p for p, entry in read_file_cache.items() if entry[2] not in unpruned_ids]:
+            read_file_cache.pop(cached_path, None)
+
     while True:
         if session.cancelled.is_set():
             return session.final_message or head
@@ -1761,6 +1804,7 @@ async def agent(
         if turns > 0 and turns % PRUNE_CHECKPOINT_EVERY == 0:
             pruned_tools, saved_tool_chars = prune_old_tool_outputs(messages)
             if pruned_tools:
+                _evict_pruned_read_cache()
                 await session.log(
                     f"context pruner: pruned {pruned_tools} old tool output(s) ({saved_tool_chars:,} chars)"
                 )
@@ -1789,6 +1833,7 @@ async def agent(
             continue
         except openai.APIError as exc:
             if await recover(session, messages, exc, waits, until, call_opts):
+                _evict_pruned_read_cache()
                 continue
             raise
 
@@ -1957,6 +2002,8 @@ async def agent(
                     mcp_registry=mcp_registry,
                     image_sink=pending_images,
                     active_image_keys=active_image_keys,
+                    read_file_cache=read_file_cache,
+                    current_call_id=call_id,
                 )
 
             if fn_name_cur in ("write_file", "edit_file") and not content.startswith("error:"):
@@ -2513,6 +2560,7 @@ if not REQUIRED_SCOPE_EXCLUSIONS and os.environ.get("PLE_AUDIT_SCOPE_EXCLUSIONS_
 else:
     REQUIRED_SCOPE_EXCLUSIONS = [str(x).strip() for x in REQUIRED_SCOPE_EXCLUSIONS if str(x).strip()]
 ENFORCE_DELIVERABLES = False  # __PLE_ENFORCE_DELIVERABLES__
+SERVICE_ENTRY_HINTS = {}  # __PLE_SERVICE_ENTRY_HINTS__
 SKIP_DIRS = {
     ".git",
     "__pycache__",
@@ -4388,59 +4436,217 @@ if ifc_files:
             if clash_count > 15:
                 errors.append(f"... plus {clash_count - 15} additional MEP solid clash(es)")
 
-        # Per-file, per-service BFS connectivity check (<= 250.0 + 1e-3 mm) via spatial hash
+        # Per-file, per-service BFS connectivity (<= 250 mm), entry/wall feed, row coverage & CRAH reach (<= 2500 mm)
+        REACH_TOL_M = 2.500 + EPS_M
+        ROW_PSET_RE = re.compile(r"\bRow=([A-Z0-9]+)\b", re.I)
+        RACK_TAG_ROW_RE = re.compile(r"\bRACK-([A-Z])\d+\b", re.I)
+        SVC_PORT_KW_RE = {
+            "busway": re.compile(r"(busway|bus_?duct|\bbw[-_]?\d*|power)", re.I),
+            "cable_tray": re.compile(r"(cable[_ ]?tray|\bct[-_]?\d*|telecom)", re.I),
+            "chw_pipe": re.compile(r"(chilled|chw|pipe)", re.I),
+        }
+
+        def _xy_aabb_dist(a, b):
+            dx = max(0.0, max(a[0] - b[3], b[0] - a[3]))
+            dy = max(0.0, max(a[1] - b[4], b[1] - a[4]))
+            return math.hypot(dx, dy)
+
+        def _xy_pt_aabb_dist(px, py, a):
+            dx = max(0.0, a[0] - px, px - a[3])
+            dy = max(0.0, a[1] - py, py - a[4])
+            return math.hypot(dx, dy)
+
+        def _load_workspace_entry_hints():
+            merged = {
+                svc: [tuple(float(v) for v in pt[:2]) for pt in pts if isinstance(pt, (list, tuple)) and len(pt) >= 2]
+                for svc, pts in (SERVICE_ENTRY_HINTS or {}).items()
+                if isinstance(pts, list)
+            }
+            for fp in files:
+                if fp.suffix.lower() != ".json" or fp.stat().st_size > 2_000_000:
+                    continue
+                try:
+                    obj = json.loads(fp.read_text(encoding="utf-8", errors="ignore"))
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                for k in ("service_entries", "service_entry_mm", "entry_points", "feed_points"):
+                    sub = obj.get(k)
+                    if not isinstance(sub, dict):
+                        continue
+                    for raw_svc, val in sub.items():
+                        for svc_key, pat in SVC_PORT_KW_RE.items():
+                            if pat.search(str(raw_svc)):
+                                pts_raw = val if (isinstance(val, list) and val and isinstance(val[0], (list, tuple))) else [val]
+                                for pt in pts_raw:
+                                    if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                                        try:
+                                            px, py = float(pt[0]), float(pt[1])
+                                            if "mm" in k or max(abs(px), abs(py)) > 150.0:
+                                                px /= 1000.0
+                                                py /= 1000.0
+                                            merged.setdefault(svc_key, []).append((px, py))
+                                        except Exception:
+                                            pass
+            return merged
+
+        def _closest_wall_point_mm(seg_aabb, wall_elems):
+            best_d = float("inf")
+            best_pt = None
+            for w in wall_elems:
+                wa = w["aabb"]
+                d = _xy_aabb_dist(seg_aabb, wa)
+                if d < best_d:
+                    best_d = d
+                    wcx = (wa[0] + wa[3]) * 0.5
+                    wcy = (wa[1] + wa[4]) * 0.5
+                    px = min(max(wcx, seg_aabb[0]), seg_aabb[3])
+                    py = min(max(wcy, seg_aabb[1]), seg_aabb[4])
+                    best_pt = [int(round(px * 1000.0)), int(round(py * 1000.0))]
+            return best_d, best_pt
+
+        entry_hints_map = _load_workspace_entry_hints()
+        elems_by_file = {}
         svc_groups = {}
         for e in all_elems:
+            elems_by_file.setdefault(e["file"], []).append(e)
             svc = _mep_service_bucket(e)
             if svc is not None:
                 svc_groups.setdefault((e["file"], svc), []).append(e)
+
+        perim_endpoints_by_svc = {}
         for (rel_f, svc), svc_elems in sorted(svc_groups.items()):
-            if len(svc_elems) < 2:
-                continue
-            sgrid, soversized, sbounds = _build_spatial_hash(svc_elems, cell_size=GRID_CELL_M)
-            adj = {idx: set() for idx in range(len(svc_elems))}
-            for u in range(len(svc_elems)):
-                scands = _spatial_candidates(u, sgrid, soversized, sbounds, len(svc_elems))
-                for v in scands:
-                    if v <= u:
+            file_elems = elems_by_file.get(rel_f, [])
+            if len(svc_elems) >= 2:
+                sgrid, soversized, sbounds = _build_spatial_hash(svc_elems, cell_size=GRID_CELL_M)
+                adj = {idx: set() for idx in range(len(svc_elems))}
+                for u in range(len(svc_elems)):
+                    scands = _spatial_candidates(u, sgrid, soversized, sbounds, len(svc_elems))
+                    for v in scands:
+                        if v <= u:
+                            continue
+                        if (
+                            _aabb_dist(svc_elems[u]["aabb"], svc_elems[v]["aabb"]) <= CONNECTIVITY_TOL_M
+                            and _mesh_clearance(svc_elems[u], svc_elems[v], pad=0.255) <= CONNECTIVITY_TOL_M
+                        ):
+                            adj[u].add(v)
+                            adj[v].add(u)
+                visited = set()
+                comps = []
+                for start in range(len(svc_elems)):
+                    if start in visited:
                         continue
-                    if (
-                        _aabb_dist(svc_elems[u]["aabb"], svc_elems[v]["aabb"]) <= CONNECTIVITY_TOL_M
-                        and _mesh_clearance(svc_elems[u], svc_elems[v], pad=0.255) <= CONNECTIVITY_TOL_M
-                    ):
-                        adj[u].add(v)
-                        adj[v].add(u)
-            visited = set()
-            comps = []
-            for start in range(len(svc_elems)):
-                if start in visited:
+                    comp = []
+                    bfs_q = [start]
+                    visited.add(start)
+                    while bfs_q:
+                        cur_node = bfs_q.pop(0)
+                        comp.append(cur_node)
+                        for nxt in adj[cur_node]:
+                            if nxt not in visited:
+                                visited.add(nxt)
+                                bfs_q.append(nxt)
+                    comps.append(comp)
+                if len(comps) > 1:
+                    comps.sort(key=len, reverse=True)
+                    main_comp = comps[0]
+                    rest_nodes = [n for c in comps[1:] for n in c]
+                    min_gap_m = min(
+                        _aabb_dist(svc_elems[u]["aabb"], svc_elems[v]["aabb"])
+                        for u in main_comp
+                        for v in rest_nodes
+                    )
+                    detached_labels = [svc_elems[n]["label"] for n in rest_nodes[:4]]
+                    _record_pre_verifier_issue(
+                        f"{rel_f}: ERR_CONNECTIVITY disconnected MEP {svc} network ({len(comps)} separate components "
+                        f"across {len(svc_elems)} elements, largest={len(main_comp)}, tol=250mm, "
+                        f"min_gap={min_gap_m * 1000:.1f}mm; detached={detached_labels})"
+                    )
+
+            wall_elems = [
+                e for e in file_elems
+                if e["cls"] in {"IfcWall", "IfcWallStandardCase"} and not _is_mep(e)
+            ]
+            port_elems = [
+                e for e in file_elems
+                if (
+                    e["cls"] == "IfcDistributionPort"
+                    or "SERVICE_ENTRY" in e["text"].upper()
+                    or re.search(r"\bENTRY\b", e["text"], re.I)
+                )
+                and SVC_PORT_KW_RE[svc].search(e["text"])
+            ]
+            svc_entries = list(entry_hints_map.get(svc, []))
+            for pe in port_elems:
+                pa = pe["aabb"]
+                svc_entries.append(((pa[0] + pa[3]) * 0.5, (pa[1] + pa[4]) * 0.5))
+
+            for ex_m, ey_m in svc_entries:
+                min_d_m = min(_xy_pt_aabb_dist(ex_m, ey_m, seg["aabb"]) for seg in svc_elems)
+                if min_d_m > REACH_TOL_M:
+                    _record_pre_verifier_issue(
+                        f"{rel_f}: ERR_CONNECTIVITY {svc} unfed — nothing within 2500mm XY of service entry "
+                        f"({ex_m * 1000:.0f}, {ey_m * 1000:.0f}) mm (nearest segment {min_d_m * 1000:.0f}mm away)"
+                    )
+
+            if wall_elems:
+                near_wall_pts = []
+                min_wall_d = float("inf")
+                for seg in svc_elems:
+                    wd, wpt = _closest_wall_point_mm(seg["aabb"], wall_elems)
+                    if wd < min_wall_d:
+                        min_wall_d = wd
+                    if wd <= REACH_TOL_M and wpt is not None and wpt not in near_wall_pts:
+                        near_wall_pts.append(wpt)
+                if near_wall_pts:
+                    perim_endpoints_by_svc[svc] = sorted(near_wall_pts)[:6]
+                elif min_wall_d > REACH_TOL_M and not svc_entries:
+                    _record_pre_verifier_issue(
+                        f"{rel_f}: ERR_CONNECTIVITY {svc} unfed — no segment within 2500mm XY of any perimeter wall "
+                        f"or service entry (nearest wall {min_wall_d * 1000:.0f}mm away)"
+                    )
+
+            # Row coverage (>= 80% racks per row within <= 2500mm XY)
+            racks_by_row = {}
+            for re_elem in file_elems:
+                if _is_mep(re_elem):
                     continue
-                comp = []
-                bfs_q = [start]
-                visited.add(start)
-                while bfs_q:
-                    cur_node = bfs_q.pop(0)
-                    comp.append(cur_node)
-                    for nxt in adj[cur_node]:
-                        if nxt not in visited:
-                            visited.add(nxt)
-                            bfs_q.append(nxt)
-                comps.append(comp)
-            if len(comps) > 1:
-                comps.sort(key=len, reverse=True)
-                main_comp = comps[0]
-                rest_nodes = [n for c in comps[1:] for n in c]
-                min_gap_m = min(
-                    _aabb_dist(svc_elems[u]["aabb"], svc_elems[v]["aabb"])
-                    for u in main_comp
-                    for v in rest_nodes
+                if re_elem["cls"] != "IfcFurniture" and "RACK" not in re_elem["text"].upper():
+                    continue
+                rm = ROW_PSET_RE.search(re_elem.get("pset_text") or "") or RACK_TAG_ROW_RE.search(re_elem["name"])
+                if rm:
+                    racks_by_row.setdefault(rm.group(1).upper(), []).append(re_elem)
+            for row_id, r_list in sorted(racks_by_row.items()):
+                if len(r_list) < 2:
+                    continue
+                served = sum(
+                    1 for rack in r_list
+                    if min(_xy_aabb_dist(rack["aabb"], seg["aabb"]) for seg in svc_elems) <= REACH_TOL_M
                 )
-                detached_labels = [svc_elems[n]["label"] for n in rest_nodes[:4]]
-                errors.append(
-                    f"{rel_f}: disconnected MEP {svc} network ({len(comps)} separate components "
-                    f"across {len(svc_elems)} elements, largest={len(main_comp)}, tol=250mm, "
-                    f"min_gap={min_gap_m * 1000:.1f}mm; detached={detached_labels})"
-                )
+                cov = served / len(r_list)
+                if cov < 0.80 - 1e-6:
+                    _record_pre_verifier_issue(
+                        f"{rel_f}: ERR_CONNECTIVITY {svc} covers only {served}/{len(r_list)} ({cov:.1%}) of Row {row_id} "
+                        "within 2500mm XY (minimum 80.0% required)"
+                    )
+
+            # CRAH reachability (<= 2500mm XY for chilled-water pipe)
+            if svc == "chw_pipe":
+                crahs = [
+                    ce for ce in file_elems
+                    if not _is_mep(ce)
+                    and (ce["cls"] == "IfcUnitaryEquipment" or "CRAH" in ce["text"].upper())
+                ]
+                unreached = [
+                    ce["name"] for ce in crahs
+                    if min(_xy_aabb_dist(ce["aabb"], seg["aabb"]) for seg in svc_elems) > REACH_TOL_M
+                ]
+                if unreached:
+                    _record_pre_verifier_issue(
+                        f"{rel_f}: ERR_CONNECTIVITY chw_pipe does not reach {len(unreached)} CRAH unit(s) within 2500mm XY: "
+                        f"{unreached[:6]}"
+                    )
 
         # Per-service MEP length & elevation telemetry summary
         svc_elems_all = {}
@@ -4459,13 +4665,16 @@ if ifc_files:
             ]
             total_len = round(sum(seg_lens), 3)
             seg_cnt = len(svc_list)
-            mep_summary[svc] = {
+            mep_entry = {
                 "length_m": total_len,
                 "segment_count": seg_cnt,
                 "avg_segment_m": round(total_len / seg_cnt, 3) if seg_cnt else 0.0,
                 "z_min": round(min(e["aabb"][2] for e in svc_list), 4),
                 "z_max": round(max(e["aabb"][5] for e in svc_list), 4),
             }
+            if perim_endpoints_by_svc.get(svc):
+                mep_entry["perimeter_endpoints_mm"] = perim_endpoints_by_svc[svc]
+            mep_summary[svc] = mep_entry
 
         # Overhead clear-height check (>= 2600mm AFF), separated by category & baseline origin
         TERMINAL_CLASSES = {
@@ -4652,6 +4861,50 @@ def _normalize_target_deliverables(
     )
 
 
+def extract_mep_service_entry_hints(task: str = "") -> Dict[str, List[List[float]]]:
+    """Extract explicit MEP service-entry (x, y) coordinates in metres from task instructions."""
+    hints: Dict[str, List[List[float]]] = {}
+    if not task or not str(task).strip():
+        return hints
+    text = str(task)
+    entry_coord_re = re.compile(
+        r"(?:service\s+entry|entry|feed(?:er)?)(?:\s+(?:at|point|coord(?:inate)?s?|loc(?:ation)?))?\s*[:=]?\s*"
+        r"\(\s*(-?\d+(?:\.\d+)?)\s*(mm|m)?\s*,\s*(-?\d+(?:\.\d+)?)\s*(mm|m)?\s*\)",
+        re.I,
+    )
+    svc_kw_re = {
+        "busway": re.compile(r"\b(?:busway|bus\s*duct|bw[-_]?\d*|power\s+entry)\b", re.I),
+        "cable_tray": re.compile(r"\b(?:cable\s*tray|telecom|ct[-_]?\d*|tray)\b", re.I),
+        "chw_pipe": re.compile(r"\b(?:chw|chilled[\s_-]*water|pipe)\b", re.I),
+    }
+    prev_end = 0
+    for m in entry_coord_re.finditer(text):
+        xv = float(m.group(1))
+        xu = (m.group(2) or "").lower()
+        yv = float(m.group(3))
+        yu = (m.group(4) or "").lower()
+        unit = yu or xu
+        if unit == "mm" or (not unit and max(abs(xv), abs(yv)) > 150.0):
+            xv /= 1000.0
+            yv /= 1000.0
+        ctx_start = max(prev_end, m.start() - 75)
+        ctx = text[ctx_start : min(len(text), m.end() + 20)]
+        prev_end = m.end()
+        best_svc = None
+        best_pos = -1
+        for svc, pat in svc_kw_re.items():
+            for km in pat.finditer(ctx):
+                if km.start() > best_pos:
+                    best_pos = km.start()
+                    best_svc = svc
+        if best_svc is not None:
+            pt = [round(xv, 4), round(yv, 4)]
+            lst = hints.setdefault(best_svc, [])
+            if pt not in lst:
+                lst.append(pt)
+    return hints
+
+
 def _build_programmatic_audit_script(
     task: str = "",
     baseline_xlsx: Optional[Dict[str, Any]] = None,
@@ -4745,6 +4998,14 @@ def _build_programmatic_audit_script(
         script = script.replace(
             "ENFORCE_DELIVERABLES = False  # __PLE_ENFORCE_DELIVERABLES__",
             "ENFORCE_DELIVERABLES = True",
+            1,
+        )
+    entry_hints = extract_mep_service_entry_hints(task)
+    if entry_hints:
+        encoded_hints = json.dumps(json.dumps(entry_hints, separators=(",", ":")))
+        script = script.replace(
+            "SERVICE_ENTRY_HINTS = {}  # __PLE_SERVICE_ENTRY_HINTS__",
+            f"SERVICE_ENTRY_HINTS = json.loads({encoded_hints})",
             1,
         )
     return script
@@ -4860,11 +5121,13 @@ async def run_programmatic_audit(
                 lines.append("MEP SUMMARY (keep routes compact; compare length vs. baseline):")
                 for svc, stats in sorted(mep_summary.items()):
                     if isinstance(stats, dict):
+                        ep = stats.get("perimeter_endpoints_mm") or []
+                        ep_note = f", feed_endpoints_mm={ep}" if ep else ""
                         lines.append(
                             f"- {svc}: length={stats.get('length_m', 0.0):.3f}m, "
                             f"segments={stats.get('segment_count', 0)}, "
                             f"avg_segment={stats.get('avg_segment_m', 0.0):.3f}m, "
-                            f"z=[{stats.get('z_min', 0.0):.3f}, {stats.get('z_max', 0.0):.3f}]m"
+                            f"z=[{stats.get('z_min', 0.0):.3f}, {stats.get('z_max', 0.0):.3f}]m{ep_note}"
                         )
             return {
                 "errors": errors,
