@@ -10,12 +10,10 @@
 
 ## Section 1: Active Status & Context
 
-- **PLE Dev Eval Run #31 (`45477741941`, commit `5ece22c`):**
-  - Workflow URL: https://github.com/g3ffr0-netizen/ple_submission/actions/runs/45477741941
-  - `plan-and-check`: `completed` (`success`)
-  - `eval-task (data-center-site-model)`: `completed` (`success`)
-  - `eval-task (data-hall-mep-routing)`: `in_progress`
-  - `eval-task (data-hall-mep-routing-offset)`: `in_progress`
+- **PLE Dev Eval Run #32 (`45548736344`, commit `ac26ef8`):** completed with `failure` (aggregate gate). Scoreboard vs Run #31 = **HOLD**.
+  - Workflow URL: https://github.com/g3ffr0-netizen/ple_submission/actions/runs/45548736344
+  - **BLOCKER:** Vertex AI **spend cap breached** (`403 PERMISSION_DENIED`, project `161304254129`) mid-run. No further eval runs are possible until the cap is raised/reset.
+- **rusty_caddy (`C:\Users\Owner\Desktop\rusty_caddy`, local git `e50834f`):** TASK-003a delivered, 44/44 tests pass.
 - **Santa 2026 (`v10a`):**
   - `practice_puzzles.csv` (`200/200` valid, `0` errors): **`38,504`** (`-332` vs `v9`'s `38,836`, `worse=0`; `-723` vs `v8`'s `39,227`, `272.14s`)
   - `puzzles.csv` (`1,000/1,000` valid, `0` errors): **`189,946`** (`mean=189.95`, `steps/target=7.06`, **`-4,017` / `-2.07%`** vs `v8`'s `193,963`)
@@ -31,6 +29,12 @@ Once PLE Dev Eval Run #31 (`45477741941`) finishes in GitHub Actions:
 - Download Run #31 artifacts to `.eval_cache/run_45477741941`.
 - Run `py -3.14 tools/tuneup.py all --run-id 45477741941 --baseline-id 45400927619`.
 - Post the full A/B scoreboard (`compare_report.md`), token/loop profile summary, and `PROMOTE`/`HOLD` gate to Section 3 and push to `origin/main`.
+
+### [TASK-002] PLE Run #32 tune-up patches + Santa v10b prototype
+STATUS: DONE | COMPLETED_AT: 2026-11-25 07:00 UTC | Result: Run #32 = HOLD (see Section 3); v10b not promoted.
+
+### [TASK-003a] rusty_caddy foundation + Social Club Mode + free weather/lightning stack
+STATUS: DONE | COMPLETED_AT: 2026-11-25 07:00 UTC | Local git `e50834f`, 44/44 tests pass (see Section 3).
 
 ---
 
@@ -67,3 +71,50 @@ Key Blockers & Findings for Run #32:
 1. data-hall-mep-routing-offset hard Gate 2 failure: busway disconnected ("nothing within 2500mm of the service entry at (200, 4910) — the network is not fed"), despite passing Gate 0/1 with low violation_rate (3.03%) and near-optimal length (192,518 mm vs 190,921 mm). Fix: run oracle/local connectivity check in worker verify script before PASS on MEP routing tasks.
 2. Read loops still present (63 total unchanged re-reads across Run #31, e.g., agent_view.json / ifc_contract.md / example.ifc repeated 3-4x); good next target for read-cache/dedup.
 3. All Run #31 artifacts saved locally to .eval_cache/run_45477741941; reports updated in tools/compare_report.md, tools/profile_report.json, tools/gap_report.md.
+
+### [2026-11-25 07:00:22 UTC] [TASK-002] PLE Run #32 vs Run #31 A/B Scoreboard (GATE: HOLD) + Santa v10b practice results
+
+GATE: HOLD. Mean score regressed 0.5546 -> 0.3333 (-0.2213). Run #32 (45548736344, commit ac26ef8) ended in workflow failure.
+BLOCKER: the Vertex AI spend cap was breached mid-run (403 PERMISSION_DENIED "Spend cap breached for project 161304254129"). data-hall-mep-routing died at 06:28 UTC with ERR_NO_SUBMISSION. That is a billing stop, not a code regression. No Run #33 is possible until the cap is raised or reset.
+A/B (Run #31 -> Run #32, 3 shared tasks):
+- Mean score: 0.5546 -> 0.3333
+- Input tokens / task: 5,928,051 -> 4,390,297 (-25.9%)
+- Wall-clock / task: 78.96m -> 76.93m
+- Est. cost / task: $5.48 -> $4.06
+Per task:
+- data-center-site-model: 1.0000 -> 1.0000 (PASS)
+- data-hall-mep-routing: 0.6638 -> 0.0000 (killed by spend cap: ERR_NO_SUBMISSION, stub never replaced)
+- data-hall-mep-routing-offset: 0.0000 -> 0.0000 (ERR_CONNECTIVITY Gate 2 again: busway "nothing within 2500mm of the service entry at (200, 4910)")
+Patch check:
+- Read-loop dedup cache works: unchanged re-reads 63 (Run #31) -> 26 (Run #32). Retries 16, retry waste 996,256 tokens ($0.91).
+- MEP connectivity gate fired once on the offset task (2 blockers routed back to Worker) but missed the real failure. The service entry (200, 4910) appears only in the E-101 drawing, never in the prompt text, so the gate had no coordinate to check. The Worker fed the busway from a north entry at 316 mm instead.
+- Next fix (when budget allows): have the Worker write the service-entry coordinates it reads from E-101/M-101 into reconciliation.json, and make the gate check the network against them plus an independent drawing-derived value.
+Santa 2026 v10b (practice_puzzles.csv, 200/200 valid, 0 errors on all runs) vs v10a 38,504:
+- Run 1: 38,487 (better 9 / worse 1, 269.6s)
+- Run 2: 38,491 (better 9 / worse 3, 298.1s)
+- Run 3 (lighter budget): 38,496 (better 7 / worse 3, 326.9s)
+- Not promoted: misses the worse=0 gate. The regressions move between runs, which looks like timing noise from time-budgeted local search under heavy Chrome CPU load. solver.py restored to v10a logic; prototype kept as solver_v10b_candidate.py.
+
+### [2026-11-25 07:00:31 UTC] [TASK-003a] rusty_caddy: foundation, Social Club Mode, Fines & 19th settlement, free weather/lightning stack
+
+rusty_caddy TASK-003a done: C:\Users\Owner\Desktop\rusty_caddy, local git main @ e50834f (no GitHub remote yet). Tests: 44/44 pass (py -3.14 -m unittest discover -s tests -t .), including a headless Streamlit AppTest.
+Foundation:
+- git init, README, requirements, .gitignore.
+- Every tap is saved atomically to data/current_round.json with a .bak fallback, so a refresh or sleeping phone keeps the round (tested via AppTest reload).
+- Bogey bug fixed: real stroke entry with -/+/P-U/clear. The round stops at hole 18 and offers Finish + archive.
+- Distance now drives club choice through an editable carry table, with plays-like adjustments for headwind/tailwind/cross and elevation, plus a lay-up plan when the green is out of reach.
+Social Club Mode (pure-Python engine, integer cents, zero-sum):
+- Stableford, Ambrose/Scramble (team handicap = combined / (2 x team size), divisor override), Skins (net/gross, carry-overs), 2-Ball Best Ball (85% allowance default), Wolf (rotation, partner or Lone Wolf x2), Nassau (front/back/overall + auto-press at 2 down).
+Fines & Shouts:
+- Editable catalog. Defaults: Thrown club/tantrum = Shout the round, Obscenity $2, Air swing $2, Didn't pass front tees $2, 3-putt $1.
+- One-tap logging with undo. Fine money goes to the Kitty (bar tab) or is split among the other players.
+- 19th-hole settlement uses an exact fewest-payments solver, plus a copyable group-chat summary.
+Weather (100% free):
+- Open-Meteo thunderstorm codes / CAPE / UV / feels-like / gust alerts. BOM state warning RSS, with an optional district keyword to sharpen relevance (verified live, all 7 feeds return 200).
+- Heard Thunder button starts a 30-minute all-clear countdown that resets on every tap and survives reloads.
+- One-tap Call / SMS Pro Shop, pre-filled with "Lightning/thunder spotted near Hole X — requesting course check".
+Caveats:
+- Open-Meteo lightning_potential is null for Australia, so storm risk uses weather codes + CAPE.
+- BOM feeds are personal/non-commercial use only.
+- Not a safety device.
+- Streamlit cannot push alerts while the phone screen is locked (needs the PWA step).
