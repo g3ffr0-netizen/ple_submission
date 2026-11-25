@@ -715,6 +715,217 @@ util = _Util()
         self.assertEqual(good_res["errors"], [])
         self.assertTrue(good_res["mep_summary"]["busway"]["perimeter_endpoints_mm"])
 
+    def test_drawing_extracted_service_entries_and_non_pathway_pset_isolation(self) -> None:
+        """Drawing-extracted entries (E-101/M-101, CONSTRAINTS.json, reconciliation.json, solution.py) are captured and gated."""
+        # 1. Multi-source extraction from plan + CONSTRAINTS.json (when task prompt itself has no coordinates)
+        ext = serve.extract_mep_service_entry_hints(
+            "Build Data Hall 1 coordination model and route overhead MEP from the 7-sheet drawing set.",
+            plan="- BW-1 busway (E-101): West wall service entry at X = 200 mm, Y = 4910 mm.\n- CT-1 telecom cable tray enters at [0, 12470] mm.",
+            constraints_json=json.dumps(
+                {
+                    "deliverables": ["output/solution.py", "output/model.ifc"],
+                    "service_entries_mm": {
+                        "busway": [200, 4910],
+                        "cable_tray": {"x_mm": 0, "y_mm": 12470},
+                        "chw_pipe": [0, 12470],
+                    },
+                }
+            ),
+        )
+        self.assertEqual(ext["busway"], [[0.2, 4.91]])
+        self.assertEqual(ext["cable_tray"], [[0.0, 12.47]])
+        self.assertEqual(ext["chw_pipe"], [[0.0, 12.47]])
+
+        fake_ifc_pkg = '''
+class _FakeBox:
+    def __init__(self, x0, y0, z0, x1, y1, z1):
+        corners = [
+            (x0, y0, z0), (x1, y0, z0), (x1, y1, z0), (x0, y1, z0),
+            (x0, y0, z1), (x1, y0, z1), (x1, y1, z1), (x0, y1, z1),
+        ]
+        self.verts = [c for pt in corners for c in pt]
+        self.faces = [0,1,2, 0,2,3, 4,5,6, 4,6,7, 0,1,5, 0,5,4, 2,3,7, 2,7,6]
+
+class _FakeShape:
+    def __init__(self, box):
+        self.geometry = box
+
+class _FakeProd:
+    def __init__(self, pid, cls, name, obj_type, pset_props, box):
+        self._id = pid
+        self._cls = cls
+        self.Name = name
+        self.ObjectType = obj_type
+        self.GlobalId = f"GID_{pid}"
+        self.Representation = True
+        self.IsDefinedBy = []
+        self._psets = {"Pset_Test": pset_props} if pset_props else {}
+        self._box = box
+    def id(self): return self._id
+    def is_a(self, target=None):
+        if target is None: return self._cls
+        return self._cls == target
+
+class _FakeModel:
+    def __init__(self, prods):
+        self._prods = prods
+    def by_type(self, t):
+        if t == "IfcProduct": return list(self._prods)
+        return []
+
+class _UtilElem:
+    @staticmethod
+    def get_psets(prod):
+        return prod._psets
+
+class _Util:
+    element = _UtilElem()
+
+class _Geom:
+    class settings:
+        USE_WORLD_COORDS = "use-world-coords"
+        def set(self, k, v): pass
+    @staticmethod
+    def create_shape(_settings, prod):
+        return _FakeShape(_FakeBox(*prod._box))
+
+import json, pathlib
+_CFG = json.loads(pathlib.Path("fake_scene.json").read_text())
+def open(_path):
+    return _FakeModel([_FakeProd(i+1, r["cls"], r["name"], r["obj"], r["pset"], r["box"]) for i, r in enumerate(_CFG["elems"])])
+geom = _Geom()
+util = _Util()
+'''
+
+        def _run_offset_case(
+            elems_cfg: list[dict],
+            *,
+            recon: dict | None = None,
+            solution_py: str | None = None,
+            plan: str = "",
+            constraints_json: str = "",
+            with_sheets: bool = True,
+        ) -> dict:
+            with tempfile.TemporaryDirectory() as tmp:
+                wdir = Path(tmp)
+                pkg = wdir / "ifcopenshell"
+                pkg.mkdir()
+                (pkg / "__init__.py").write_text(fake_ifc_pkg, encoding="utf-8")
+                (pkg / "geom.py").write_text(
+                    "from ifcopenshell import _Geom as _G\n"
+                    "settings = _G.settings\n"
+                    "create_shape = _G.create_shape\n",
+                    encoding="utf-8",
+                )
+                (wdir / "fake_scene.json").write_text(json.dumps({"elems": elems_cfg}), encoding="utf-8")
+                if with_sheets:
+                    inp_dir = wdir / "input"
+                    inp_dir.mkdir()
+                    (inp_dir / "E-101.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                    (inp_dir / "M-101.png").write_bytes(b"\x89PNG\r\n\x1a\n")
+                out_dir = wdir / "output"
+                out_dir.mkdir()
+                (out_dir / "model.ifc").write_text("ISO-10303-21;\nEND-ISO-10303-21;\n", encoding="utf-8")
+                if recon is not None:
+                    (out_dir / "reconciliation.json").write_text(json.dumps(recon), encoding="utf-8")
+                if solution_py is not None:
+                    (out_dir / "solution.py").write_text(solution_py, encoding="utf-8")
+                return _run_audit_script(
+                    wdir,
+                    task="Build Data Hall 1 coordination model and route MEP from input drawings.",
+                    plan=plan,
+                    constraints_json=constraints_json,
+                )
+
+        # Slab-bounded hall (no IfcWall!), plus Sprinklers with ClearanceToTrayMm & CRAHs with ServicePipeSize
+        # AND a segment named BW-ENTRY-N at Y=12.47m (wrongly placed near top-west instead of (0.20, 4.91)m!)
+        wrong_offset_elems = [
+            {"cls": "IfcSlab", "name": "FLOOR-1", "obj": "AccessFloor", "pset": {}, "box": (0.0, 0.0, -0.4, 21.6, 14.4, 0.0)},
+            {"cls": "IfcFireSuppressionTerminal", "name": "SPK-A01", "obj": "Sprinkler", "pset": {"ClearanceToTrayMm": 520}, "box": (5.0, 5.0, 3.2, 5.1, 5.1, 3.3)},
+            {"cls": "IfcFireSuppressionTerminal", "name": "SPK-A02", "obj": "Sprinkler", "pset": {"ClearanceToTrayMm": 520}, "box": (9.0, 5.0, 3.2, 9.1, 5.1, 3.3)},
+            {"cls": "IfcUnitaryEquipment", "name": "CRAH-01", "obj": "CRAH", "pset": {"ServicePipeSize": "DN80"}, "box": (1.0, 11.5, 0.0, 2.0, 12.5, 2.2)},
+            {"cls": "IfcCableCarrierSegment", "name": "CT-ENTRY", "obj": "CableTray", "pset": {"Service": "TELECOM"}, "box": (0.05, 12.40, 2.62, 10.0, 12.55, 2.74)},
+            {"cls": "IfcCableCarrierSegment", "name": "BW-ENTRY-N", "obj": "Busway", "pset": {"Service": "POWER"}, "box": (0.10, 12.40, 3.15, 10.0, 12.55, 3.30)},
+            {"cls": "IfcPipeSegment", "name": "CHW-ENTRY", "obj": "ChilledWater", "pset": {"Service": "CHILLED_WATER"}, "box": (0.05, 11.80, 2.80, 10.0, 11.95, 2.95)},
+        ]
+
+        # 2a. E-101/M-101 exist, Worker wrote NO service_entries_mm anywhere -> blocked!
+        res_missing = _run_offset_case(wrong_offset_elems, recon={"project": "Meridian"})
+        miss_txt = "\n".join(res_missing["pre_verifier_blockers"])
+        self.assertIn("no drawing-extracted service entry coordinate", miss_txt)
+        self.assertNotIn("disconnected MEP cable_tray", miss_txt)  # Sprinklers NOT misclassified as cable_tray!
+        self.assertNotIn("disconnected MEP chw_pipe", miss_txt)  # CRAHs NOT misclassified as chw_pipe!
+
+        # 2b. CONSTRAINTS.json (or reconciliation.json) extracted busway (200, 4910) from E-101,
+        # while BW-ENTRY-N was routed to (100, 12470) -> blocked as unfed at (200, 4910) (BW-ENTRY-N does NOT self-satisfy port_elems!)
+        c_json = json.dumps(
+            {
+                "service_entries_mm": {
+                    "busway": [200, 4910],
+                    "cable_tray": [0, 12470],
+                    "chw_pipe": [0, 12000],
+                }
+            }
+        )
+        res_unfed = _run_offset_case(wrong_offset_elems, constraints_json=c_json)
+        unfed_txt = "\n".join(res_unfed["pre_verifier_blockers"])
+        self.assertIn("busway unfed", unfed_txt)
+        self.assertIn("(200, 4910)", unfed_txt)
+
+        # 2c. Worker falsely wrote (0, 12470) in reconciliation.json while Planner/CONSTRAINTS extracted (200, 4910):
+        # emits both conflict warning AND co-location warning for Verifier!
+        res_conflict = _run_offset_case(
+            wrong_offset_elems,
+            recon={
+                "service_entries_mm": {
+                    "BW-1": {"xy_mm": [0, 12470]},
+                    "CT-1": [0, 12470],
+                    "CHW-1": [0, 12000],
+                }
+            },
+            constraints_json=c_json,
+        )
+        warn_txt = "\n".join(res_conflict["warnings"])
+        self.assertIn("service-entry coordinate conflict for busway", warn_txt)
+        self.assertIn("share nearly identical declared service-entry coordinates", warn_txt)
+
+        # 2d. Fixed routing: BW-ENTRY routed to (200, 4910) & recorded in reconciliation.json -> 0 blockers, slab perimeter endpoints reported!
+        fixed_elems = list(wrong_offset_elems[:-2]) + [
+            {"cls": "IfcCableCarrierSegment", "name": "BW-ENTRY", "obj": "Busway", "pset": {"Service": "POWER"}, "box": (0.20, 4.85, 3.15, 10.0, 4.98, 3.30)},
+            {"cls": "IfcPipeSegment", "name": "CHW-ENTRY", "obj": "ChilledWater", "pset": {"Service": "CHILLED_WATER"}, "box": (0.05, 11.80, 2.80, 10.0, 11.95, 2.95)},
+        ]
+        res_fixed = _run_offset_case(
+            fixed_elems,
+            recon={
+                "reconciled": {
+                    "service_entries_mm": {
+                        "busway": [200, 4910],
+                        "cable_tray": [0, 12470],
+                        "chw_pipe": [0, 12000],
+                    }
+                }
+            },
+            constraints_json=c_json,
+        )
+        self.assertEqual(res_fixed["pre_verifier_blockers"], [])
+        self.assertEqual(res_fixed["errors"], [])
+        self.assertTrue(res_fixed["mep_summary"]["busway"]["perimeter_endpoints_mm"])
+
+    def test_openai_api_status_error_mock_request_has_headers_for_sdk_v2(self) -> None:
+        """Regression test for GitHub Actions Unit Tests (#63-#69) with openai v2 _error_request(request.headers)."""
+        import openai
+
+        try:
+            import httpx
+
+            req: object = httpx.Request("POST", "https://api.example/v1/chat/completions")
+        except ImportError:
+            req = SimpleNamespace(method="POST", url="https://api.example/v1/chat/completions", headers={})
+        resp = SimpleNamespace(status_code=429, headers={"Retry-After": "2"}, request=req)
+        err = openai.APIStatusError("quota 429", response=resp, body=None)  # type: ignore[arg-type]
+        self.assertTrue(hasattr(err.request, "headers"))
+        self.assertFalse(any(k in err.request.headers for k in ("authorization", "api-key")))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

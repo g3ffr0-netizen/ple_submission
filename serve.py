@@ -98,6 +98,12 @@ CHECK_SHARE = 0.25
 MIN_STEP_SEC = 120
 DIRECT_MCP_CHARS = 40_000
 MAX_TOOLS = 128
+PLANNER_WRAP_UP = {
+    "role": "user",
+    "content": (
+        "Emit your complete step-by-step engineering plan now without calling another tool."
+    ),
+}
 EXTRACTOR_WRAP_UP = {
     "role": "user",
     "content": (
@@ -110,14 +116,20 @@ PLANNER = (
     "Linux container with no internet access. Inspect the task's files with "
     "your tools (bash starts in {workdir}), but do not create or change any "
     "file. For PNG/JPEG/GIF/WEBP engineering drawings, schedules, or diagrams, "
-    "call view_image instead of writing pixel/ASCII OCR scripts. Keep your "
+    "call view_image instead of writing pixel/ASCII OCR scripts (if cropping dense "
+    "sheets to /tmp PNGs, note PIL may be absent so use matplotlib.image or zlib/struct, "
+    "and ALWAYS include full outer margins x=0..W / y=0..H around perimeter walls so "
+    "left/outer-margin callouts left of the West wall are never clipped; on MEP sheets "
+    "E-101 and M-101 inspect busway BW-*, cable tray CT-*, and CHW-* service-entry "
+    "callouts along the entire perimeter independently—never assume BW and CT share one "
+    "entry coordinate—and record each service's exact (X, Y) mm service entry). Keep your "
     "inspection concise so you stay well within your turn budget, then reply "
     "with the plan: each deliverable with its exact path and format, every hard "
-    "constraint / threshold / register or tag ID format, the data and method "
+    "constraint / threshold / register or tag ID format / per-service (X, Y) mm entry, the data and method "
     "to use, and concrete self-verification checks (for spreadsheets/CSVs: schema, "
     "header/row alignment, non-null IDs, totals; for IFC/BIM models: schema "
     "validation, ifcopenshell.geom.tree BVH clash checks across all elements with "
-    "5-10 mm non-touching joint gaps, coordinate clearances, and boundary checks)."
+    "5-10 mm non-touching joint gaps, per-service <= 2500 mm service-entry reach, coordinate clearances, and boundary checks)."
 )
 
 EXTRACTOR = (
@@ -128,6 +140,8 @@ EXTRACTOR = (
     "containing keys: deliverables (exact file paths and external MCP targets), "
     "required_register_ids (every requirement, finding, hazard, or scenario ID such as "
     "R01..R99, R-xxxxxx-xx, R-ILLUM, H01.., S01.. referenced in the task, plan, or spec), "
+    "service_entries_mm (dict mapping 'busway', 'cable_tray', 'chw_pipe' to [x_mm, y_mm] "
+    "whenever MEP service-entry coordinates are stated in the task, plan, or drawings), "
     "forbidden_citations (any standards/codes explicitly excluded by the task such as UFC), "
     "allowed_sections (explicitly listed allowed spec/manual section numbers, if specified), "
     "disallowed_sections (explicitly excluded section numbers, if any), "
@@ -165,11 +179,15 @@ WORKER = (
     "zero missing/shifted columns, zero NaN/N/A/TBD or unresolved '[_____]'/'*as indicated' "
     "artifacts, and on optimization/sizing tasks with hard resource caps run a discrete search "
     "preserving positive margins with >= 0.5% buffer where feasible); (2) if creating or modifying .ifc BIM deliverables, "
-    "(a) if drawing PNG sheets (E-101, M-101, A-101, F-101) specify service-entry locations, crop and zoom EACH service entry "
-    "callout individually with view_image (never assume busway, cable tray, and CHW pipe enter at the "
-    "same Y or X coordinate), and ensure every routed network starts within <= 2500 mm XY of its drawn "
-    "service entry, forms 1 connected component (<= 250 mm joint tolerance), reaches >= 80% of every rack "
-    "row (<= 2500 mm XY), and reaches every CRAH unit (<= 2500 mm XY for CHW); (b) run "
+    "(a) if drawing PNG sheets (E-101, M-101, A-101, F-101) specify service-entry locations, crop full-margin perimeter "
+    "strips (for West wall include x=0..0.45*W across full height y=0..H so callout text in the left margin is NEVER clipped; "
+    "remember PNG y=0 is North Y_max and y=H is South Y=0, so lower-West offset entries like (200, 4910) appear at y~0.45*H..0.75*H "
+    "separate from upper-West entries near (0, 12470)), inspect BW-* busway and CT-* cable tray on E-101 and CHW-* on M-101 "
+    "individually with view_image (governing discipline sheets E-101/M-101 override generic notes when inter-sheet offsets exist; "
+    "never assume busway, cable tray, and CHW share one entry coordinate), record exact `\"service_entries_mm\": {{\"busway\": [x, y], "
+    "\"cable_tray\": [x, y], \"chw_pipe\": [x, y]}}` in `output/reconciliation.json` (or `output/service_entries.json`), and ensure "
+    "every routed network starts within <= 2500 mm XY of its own drawn service entry, forms 1 connected component (<= 250 mm joint "
+    "tolerance), reaches >= 80% of every rack row (<= 2500 mm XY), and reaches every CRAH unit (<= 2500 mm XY for CHW); (b) run "
     "ifcopenshell.validate plus ifcopenshell.geom.tree BVH clash checks across "
     "ALL elements (including same-service MEP segments—never exempt "
     "IfcRelConnects* links or 0 mm touching butt-joints). Because BVH flags "
@@ -220,10 +238,11 @@ VERIFIER = (
     "For .ifc deliverables, run Python checks using ifcopenshell.geom.tree BVH "
     "across ALL elements without exempting IfcRelConnects* or 0 mm butt-joints "
     "(verify 5-10 mm non-touching gaps at L-corners/T-junctions/joints so BVH clash "
-    "count is 0 while each service forms 1 connected component <= 250 mm), verify "
-    "connectivity to drawn service entries (<= 2500 mm XY against cropped E-101/M-101 "
-    "entry arrows and MEP SUMMARY perimeter endpoints), rack-row coverage (>= 80% per "
-    "row <= 2500 mm), and CRAH reachability, plus 3D "
+    "count is 0 while each service forms 1 connected component <= 250 mm), crop full-margin "
+    "perimeter strips (x=0..0.45*W, y=0..H plus other borders—never rely on uncropped full-sheet views) "
+    "of E-101.png and M-101.png to verify separate BW-*, CT-*, and CHW-* service-entry (X, Y) coordinates "
+    "against reconciliation.json['service_entries_mm'] and MEP SUMMARY feed_endpoints_mm (<= 2500 mm XY), "
+    "verify rack-row coverage (>= 80% per row <= 2500 mm), and CRAH reachability, plus 3D "
     "clearances (tray-to-busway >= 300 mm, tray-stack headroom >= 300 mm, overhead "
     "clear height >= 2600 mm AFF, sprinkler >= 457 mm, PDU clear zones, road vs. "
     "building non-intersection) and inspect every Programmatic Pre-Check warning "
@@ -1338,6 +1357,7 @@ def _regex_extract_constraints(task: str, plan: str = "") -> Dict[str, Any]:
         if line and _EMPTY_TRIGGER_LINE_RE.search(line):
             triggers.append(line[:220])
     empty_set_triggers = _dedupe_strs(triggers, limit=20)
+    svc_entry_hints = extract_mep_service_entry_hints(task, plan=plan)
     out: Dict[str, Any] = {
         "source": "regex_fallback",
         "file_paths": file_paths,
@@ -1348,6 +1368,11 @@ def _regex_extract_constraints(task: str, plan: str = "") -> Dict[str, Any]:
         "entities": entities,
         "empty_set_triggers": empty_set_triggers,
     }
+    if svc_entry_hints:
+        out["service_entries_mm"] = {
+            svc: [[int(round(pt[0] * 1000.0)), int(round(pt[1] * 1000.0))] for pt in pts]
+            for svc, pts in svc_entry_hints.items()
+        }
     if not (
         file_paths
         or required_register_ids
@@ -1356,6 +1381,7 @@ def _regex_extract_constraints(task: str, plan: str = "") -> Dict[str, Any]:
         or iso_dates
         or entities
         or empty_set_triggers
+        or svc_entry_hints
     ):
         out["note"] = "no_constraints_found"
     return out
@@ -2561,6 +2587,7 @@ else:
     REQUIRED_SCOPE_EXCLUSIONS = [str(x).strip() for x in REQUIRED_SCOPE_EXCLUSIONS if str(x).strip()]
 ENFORCE_DELIVERABLES = False  # __PLE_ENFORCE_DELIVERABLES__
 SERVICE_ENTRY_HINTS = {}  # __PLE_SERVICE_ENTRY_HINTS__
+EXTRACTED_ENTRY_HINTS = {}  # __PLE_EXTRACTED_ENTRY_HINTS__
 SKIP_DIRS = {
     ".git",
     "__pycache__",
@@ -3990,13 +4017,60 @@ if ifc_files:
                 pass
             return " ".join(parts)
 
+        NON_PATHWAY_CLASSES = {
+            "IfcFireSuppressionTerminal",
+            "IfcAirTerminal",
+            "IfcSanitaryTerminal",
+            "IfcLightFixture",
+            "IfcAudioVisualAppliance",
+            "IfcCommunicationsAppliance",
+            "IfcElectricAppliance",
+            "IfcFlowTerminal",
+            "IfcUnitaryEquipment",
+            "IfcElectricDistributionBoard",
+            "IfcSwitchingDevice",
+            "IfcTransformer",
+            "IfcProtectiveDevice",
+            "IfcFurniture",
+            "IfcSystemFurnitureElement",
+            "IfcColumn",
+            "IfcBeam",
+            "IfcSlab",
+            "IfcWall",
+            "IfcWallStandardCase",
+            "IfcCovering",
+            "IfcRoof",
+            "IfcFooting",
+            "IfcDiscreteAccessory",
+            "IfcMechanicalFastener",
+            "IfcDistributionPort",
+        }
+        NON_PATHWAY_HEAD_RE = re.compile(
+            r"(?:SupportHanger|Containment|(?:^|[^a-z0-9])(?:hgr|cac|spk|spr|crah|pdu|rack)[-_]?\d+)",
+            re.I,
+        )
+        SVC_PSET_VAL_RE = re.compile(
+            r"\b(?:Service|System|SystemType|SystemTag|ServiceTag|RouteTag|Tag|Network|PathwayType)=([^\s]+)",
+            re.I,
+        )
+
         def _mep_service_bucket(e):
-            txt = e["text"]
-            if BUSWAY_RE.search(txt):
+            if e["cls"] in NON_PATHWAY_CLASSES:
+                return None
+            head_txt = f"{e['cls']} {e['name']} {e.get('obj_type', '')}"
+            if NON_PATHWAY_HEAD_RE.search(head_txt):
+                return None
+            svc_pset_vals = " ".join(SVC_PSET_VAL_RE.findall(e.get("pset_text") or ""))
+            match_txt = f"{head_txt} {svc_pset_vals}".strip()
+            if BUSWAY_RE.search(match_txt):
                 return "busway"
-            if e["cls"] in {"IfcCableCarrierSegment", "IfcCableCarrierFitting"} or TRAY_RE.search(txt) or TRAY_TAG_RE.search(txt):
+            if (
+                e["cls"] in {"IfcCableCarrierSegment", "IfcCableCarrierFitting"}
+                or TRAY_RE.search(match_txt)
+                or TRAY_TAG_RE.search(match_txt)
+            ):
                 return "cable_tray"
-            if e["cls"] in {"IfcPipeSegment", "IfcPipeFitting"} or CHW_PIPE_RE.search(txt):
+            if e["cls"] in {"IfcPipeSegment", "IfcPipeFitting"} or CHW_PIPE_RE.search(match_txt):
                 return "chw_pipe"
             return None
 
@@ -4232,6 +4306,7 @@ if ifc_files:
                     "gid": gid,
                     "pid": prod.id(),
                     "name": name or gid,
+                    "obj_type": obj_t,
                     "label": f"{cls} {name or gid}",
                     "pset_text": pset_t,
                     "text": f"{cls} {name} {obj_t} {pset_t}",
@@ -4456,40 +4531,192 @@ if ifc_files:
             dy = max(0.0, a[1] - py, py - a[4])
             return math.hypot(dx, dy)
 
+        def _parse_xy_pair(val, assume_mm=False):
+            pts_out = []
+            if isinstance(val, dict):
+                for ck in ("xy_mm", "coord_mm", "coords_mm", "entry_mm", "point_mm", "location_mm", "xy", "coord", "coords", "entry", "point", "location"):
+                    if ck in val:
+                        pts_out.extend(_parse_xy_pair(val[ck], assume_mm=assume_mm or ("mm" in ck)))
+                if not pts_out:
+                    xk = "x_mm" if "x_mm" in val else ("x" if "x" in val else ("X" if "X" in val else None))
+                    yk = "y_mm" if "y_mm" in val else ("y" if "y" in val else ("Y" if "Y" in val else None))
+                    if xk is not None and yk is not None:
+                        try:
+                            px, py = float(val[xk]), float(val[yk])
+                            if assume_mm or "mm" in xk.lower() or "mm" in yk.lower() or max(abs(px), abs(py)) > 150.0:
+                                px /= 1000.0
+                                py /= 1000.0
+                            pts_out.append((round(px, 4), round(py, 4)))
+                        except Exception:
+                            pass
+                return pts_out
+            if isinstance(val, str):
+                m_xy = re.search(
+                    r"[\(\[]\s*(-?\d+(?:\.\d+)?)\s*(mm|m)?\s*,\s*(-?\d+(?:\.\d+)?)\s*(mm|m)?\s*[\)\]]",
+                    val,
+                    re.I,
+                )
+                if m_xy:
+                    px, py = float(m_xy.group(1)), float(m_xy.group(3))
+                    u = (m_xy.group(4) or m_xy.group(2) or "").lower()
+                    if assume_mm or u == "mm" or (not u and max(abs(px), abs(py)) > 150.0):
+                        px /= 1000.0
+                        py /= 1000.0
+                    pts_out.append((round(px, 4), round(py, 4)))
+                return pts_out
+            if isinstance(val, (list, tuple)) and val:
+                if isinstance(val[0], (list, tuple, dict)):
+                    for item in val:
+                        pts_out.extend(_parse_xy_pair(item, assume_mm=assume_mm))
+                    return pts_out
+                if len(val) >= 2 and isinstance(val[0], (int, float)) and isinstance(val[1], (int, float)):
+                    px, py = float(val[0]), float(val[1])
+                    if assume_mm or max(abs(px), abs(py)) > 150.0:
+                        px /= 1000.0
+                        py /= 1000.0
+                    pts_out.append((round(px, 4), round(py, 4)))
+            return pts_out
+
+        ENTRY_CONTAINER_KEYS = {
+            "service_entries",
+            "service_entries_mm",
+            "service_entry",
+            "service_entry_mm",
+            "entry_points",
+            "entry_points_mm",
+            "feed_points",
+            "feed_points_mm",
+            "mep_entries",
+            "mep_entries_mm",
+            "mep_service_entries",
+            "mep_service_entries_mm",
+        }
+        PER_SVC_ENTRY_KEYS = {
+            "service_entry",
+            "service_entry_mm",
+            "entry_mm",
+            "entry_xy_mm",
+            "entry_point",
+            "entry_point_mm",
+            "feed_point",
+            "feed_point_mm",
+        }
+        NOTE_ENTRY_COORD_RE = re.compile(
+            r"(?:service\s+entry|entry\s+(?:point|callout|arrow|at)|enters?(?:\s+\w+)?\s+at|feed(?:er)?\s+(?:entry|point))"
+            r"[^\(\[\n]{0,50}[\(\[]\s*(-?\d+(?:\.\d+)?)\s*(mm|m)?\s*,\s*(-?\d+(?:\.\d+)?)\s*(mm|m)?\s*[\)\]]",
+            re.I,
+        )
+        PY_SVC_ENTRY_ASSIGN_RE = re.compile(
+            r"\b([A-Za-z0-9_]*(?:BUSWAY|BW|TRAY|CT|TELECOM|CHW|CHILLED)[A-Za-z0-9_]*(?:SERVICE_ENTRY|ENTRY_MM|ENTRY_XY|ENTRY_PT|ENTRY_COORD)[A-Za-z0-9_]*|"
+            r"(?:SERVICE_ENTRY|ENTRY_MM|ENTRY_XY|ENTRY_PT|ENTRY_COORD)[A-Za-z0-9_]*(?:BUSWAY|BW|TRAY|CT|TELECOM|CHW|CHILLED)[A-Za-z0-9_]*)\s*=\s*"
+            r"[\(\[]\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*[\)\]]",
+            re.I,
+        )
+
+        def _add_unique_pt(dst, svc_key, pt):
+            lst = dst.setdefault(svc_key, [])
+            if pt not in lst:
+                lst.append(pt)
+
+        def _match_svc_key(raw_label):
+            s_lbl = str(raw_label or "")
+            for sk, pat in SVC_PORT_KW_RE.items():
+                if pat.search(s_lbl):
+                    return sk
+            return None
+
         def _load_workspace_entry_hints():
-            merged = {
-                svc: [tuple(float(v) for v in pt[:2]) for pt in pts if isinstance(pt, (list, tuple)) and len(pt) >= 2]
-                for svc, pts in (SERVICE_ENTRY_HINTS or {}).items()
-                if isinstance(pts, list)
-            }
+            task_map = {}
+            for svc, pts in (SERVICE_ENTRY_HINTS or {}).items():
+                if isinstance(pts, list):
+                    for pt in pts:
+                        if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                            _add_unique_pt(task_map, svc, (round(float(pt[0]), 4), round(float(pt[1]), 4)))
+            ext_map = {}
+            for svc, pts in (EXTRACTED_ENTRY_HINTS or {}).items():
+                if isinstance(pts, list):
+                    for pt in pts:
+                        if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                            _add_unique_pt(ext_map, svc, (round(float(pt[0]), 4), round(float(pt[1]), 4)))
+            ws_map = {}
             for fp in files:
-                if fp.suffix.lower() != ".json" or fp.stat().st_size > 2_000_000:
-                    continue
-                try:
-                    obj = json.loads(fp.read_text(encoding="utf-8", errors="ignore"))
-                except Exception:
-                    continue
-                if not isinstance(obj, dict):
-                    continue
-                for k in ("service_entries", "service_entry_mm", "entry_points", "feed_points"):
-                    sub = obj.get(k)
-                    if not isinstance(sub, dict):
+                low_ext = fp.suffix.lower()
+                if low_ext == ".json" and fp.stat().st_size <= 2_000_000:
+                    try:
+                        obj = json.loads(fp.read_text(encoding="utf-8", errors="ignore"))
+                    except Exception:
                         continue
-                    for raw_svc, val in sub.items():
-                        for svc_key, pat in SVC_PORT_KW_RE.items():
-                            if pat.search(str(raw_svc)):
-                                pts_raw = val if (isinstance(val, list) and val and isinstance(val[0], (list, tuple))) else [val]
-                                for pt in pts_raw:
-                                    if isinstance(pt, (list, tuple)) and len(pt) >= 2:
-                                        try:
-                                            px, py = float(pt[0]), float(pt[1])
-                                            if "mm" in k or max(abs(px), abs(py)) > 150.0:
+                    stack = [(None, obj)]
+                    visited_n = 0
+                    while stack and visited_n < 5000:
+                        parent_k, cur = stack.pop()
+                        visited_n += 1
+                        if isinstance(cur, dict):
+                            p_svc = _match_svc_key(parent_k) if parent_k else None
+                            for ck, cv in cur.items():
+                                ck_low = str(ck).strip().lower()
+                                if ck_low in ENTRY_CONTAINER_KEYS and isinstance(cv, dict):
+                                    is_mm = "mm" in ck_low
+                                    for raw_svc, sub_v in cv.items():
+                                        sk = _match_svc_key(raw_svc)
+                                        if sk:
+                                            for pt in _parse_xy_pair(sub_v, assume_mm=is_mm):
+                                                _add_unique_pt(ws_map, sk, pt)
+                                elif p_svc and ck_low in PER_SVC_ENTRY_KEYS:
+                                    for pt in _parse_xy_pair(cv, assume_mm=("mm" in ck_low)):
+                                        _add_unique_pt(ws_map, p_svc, pt)
+                                elif isinstance(cv, (dict, list)):
+                                    stack.append((ck, cv))
+                                elif isinstance(cv, str) and len(cv) <= 1000:
+                                    for nm in NOTE_ENTRY_COORD_RE.finditer(cv):
+                                        ctx = cv[max(0, nm.start() - 75) : min(len(cv), nm.end() + 25)]
+                                        sk = _match_svc_key(ctx) or p_svc
+                                        if sk:
+                                            px, py = float(nm.group(1)), float(nm.group(3))
+                                            u = (nm.group(4) or nm.group(2) or "").lower()
+                                            if u == "mm" or (not u and max(abs(px), abs(py)) > 150.0):
                                                 px /= 1000.0
                                                 py /= 1000.0
-                                            merged.setdefault(svc_key, []).append((px, py))
-                                        except Exception:
-                                            pass
-            return merged
+                                            _add_unique_pt(ws_map, sk, (round(px, 4), round(py, 4)))
+                        elif isinstance(cur, list):
+                            for item in cur:
+                                if isinstance(item, (dict, list)):
+                                    stack.append((parent_k, item))
+                                elif isinstance(item, str) and len(item) <= 1000:
+                                    for nm in NOTE_ENTRY_COORD_RE.finditer(item):
+                                        ctx = item[max(0, nm.start() - 75) : min(len(item), nm.end() + 25)]
+                                        sk = _match_svc_key(ctx)
+                                        if sk:
+                                            px, py = float(nm.group(1)), float(nm.group(3))
+                                            u = (nm.group(4) or nm.group(2) or "").lower()
+                                            if u == "mm" or (not u and max(abs(px), abs(py)) > 150.0):
+                                                px /= 1000.0
+                                                py /= 1000.0
+                                            _add_unique_pt(ws_map, sk, (round(px, 4), round(py, 4)))
+                elif low_ext == ".py" and fp.stat().st_size <= 500_000:
+                    try:
+                        py_txt = fp.read_text(encoding="utf-8", errors="ignore")
+                    except Exception:
+                        continue
+                    for pm in PY_SVC_ENTRY_ASSIGN_RE.finditer(py_txt):
+                        sk = _match_svc_key(pm.group(1))
+                        if sk:
+                            px, py = float(pm.group(2)), float(pm.group(3))
+                            if "mm" in pm.group(1).lower() or max(abs(px), abs(py)) > 150.0:
+                                px /= 1000.0
+                                py /= 1000.0
+                            _add_unique_pt(ws_map, sk, (round(px, 4), round(py, 4)))
+            effective = {}
+            for svc_k in ("busway", "cable_tray", "chw_pipe"):
+                for pt in task_map.get(svc_k, []):
+                    _add_unique_pt(effective, svc_k, pt)
+                if ws_map.get(svc_k):
+                    for pt in ws_map[svc_k]:
+                        _add_unique_pt(effective, svc_k, pt)
+                else:
+                    for pt in ext_map.get(svc_k, []):
+                        _add_unique_pt(effective, svc_k, pt)
+            return effective, ws_map, ext_map, task_map
 
         def _closest_wall_point_mm(seg_aabb, wall_elems):
             best_d = float("inf")
@@ -4506,7 +4733,36 @@ if ifc_files:
                     best_pt = [int(round(px * 1000.0)), int(round(py * 1000.0))]
             return best_d, best_pt
 
-        entry_hints_map = _load_workspace_entry_hints()
+        def _closest_slab_perim_point_mm(seg_aabb, bounds_xy):
+            bx0, by0, bx1, by1 = bounds_xy
+            sx0, sy0, sx1, sy1 = seg_aabb[0], seg_aabb[1], seg_aabb[3], seg_aabb[4]
+            candidates = [
+                (min(abs(sx0 - bx0), abs(sx1 - bx0)) if not (sx0 <= bx0 <= sx1) else 0.0, bx0, (sy0 + sy1) * 0.5),
+                (min(abs(sx0 - bx1), abs(sx1 - bx1)) if not (sx0 <= bx1 <= sx1) else 0.0, bx1, (sy0 + sy1) * 0.5),
+                (min(abs(sy0 - by0), abs(sy1 - by0)) if not (sy0 <= by0 <= sy1) else 0.0, (sx0 + sx1) * 0.5, by0),
+                (min(abs(sy0 - by1), abs(sy1 - by1)) if not (sy0 <= by1 <= sy1) else 0.0, (sx0 + sx1) * 0.5, by1),
+            ]
+            best_d, px, py = min(candidates, key=lambda c: c[0])
+            px_c = min(max(px, sx0), sx1)
+            py_c = min(max(py, sy0), sy1)
+            return best_d, [int(round(px_c * 1000.0)), int(round(py_c * 1000.0))]
+
+        has_e101_sheet = any(re.match(r"^e[-_]?101\.(?:png|jpe?g|webp|pdf)$", fp.name, re.I) for fp in files)
+        has_m101_sheet = any(re.match(r"^m[-_]?101\.(?:png|jpe?g|webp|pdf)$", fp.name, re.I) for fp in files)
+        entry_hints_map, ws_entry_map, ext_entry_map, task_entry_map = _load_workspace_entry_hints()
+        for svc_chk in ("busway", "cable_tray", "chw_pipe"):
+            if ws_entry_map.get(svc_chk) and ext_entry_map.get(svc_chk):
+                for ex_pt in ext_entry_map[svc_chk]:
+                    min_cross_m = min(
+                        math.hypot(ex_pt[0] - wp[0], ex_pt[1] - wp[1]) for wp in ws_entry_map[svc_chk]
+                    )
+                    if min_cross_m > REACH_TOL_M:
+                        warnings.append(
+                            f"service-entry coordinate conflict for {svc_chk}: Planner/CONSTRAINTS extracted "
+                            f"({ex_pt[0] * 1000:.0f}, {ex_pt[1] * 1000:.0f}) mm vs workspace reconciliation "
+                            f"{[(int(round(w[0] * 1000)), int(round(w[1] * 1000))) for w in ws_entry_map[svc_chk]]} mm "
+                            f"(diff={min_cross_m * 1000:.0f}mm > 2500mm) — crop full margins (x=0..0.45*W, y=0..H) of E-101/M-101 to verify"
+                        )
         elems_by_file = {}
         svc_groups = {}
         for e in all_elems:
@@ -4568,12 +4824,29 @@ if ifc_files:
                 e for e in file_elems
                 if e["cls"] in {"IfcWall", "IfcWallStandardCase"} and not _is_mep(e)
             ]
+            slab_bounds_xy = None
+            if not wall_elems:
+                slabs = [
+                    e["aabb"] for e in file_elems
+                    if e["cls"] == "IfcSlab"
+                    and not _is_mep(e)
+                    and (e["aabb"][3] - e["aabb"][0]) >= 5.0
+                    and (e["aabb"][4] - e["aabb"][1]) >= 5.0
+                ]
+                if slabs:
+                    slab_bounds_xy = (
+                        min(b[0] for b in slabs),
+                        min(b[1] for b in slabs),
+                        max(b[3] for b in slabs),
+                        max(b[4] for b in slabs),
+                    )
+            svc_elem_gids = {se["gid"] for se in svc_elems}
             port_elems = [
                 e for e in file_elems
-                if (
+                if e["gid"] not in svc_elem_gids
+                and (
                     e["cls"] == "IfcDistributionPort"
                     or "SERVICE_ENTRY" in e["text"].upper()
-                    or re.search(r"\bENTRY\b", e["text"], re.I)
                 )
                 and SVC_PORT_KW_RE[svc].search(e["text"])
             ]
@@ -4581,6 +4854,17 @@ if ifc_files:
             for pe in port_elems:
                 pa = pe["aabb"]
                 svc_entries.append(((pa[0] + pa[3]) * 0.5, (pa[1] + pa[4]) * 0.5))
+
+            governing_sheet = (
+                "E-101" if (svc in {"busway", "cable_tray"} and has_e101_sheet)
+                else ("M-101" if (svc == "chw_pipe" and has_m101_sheet) else None)
+            )
+            if governing_sheet and not svc_entries:
+                _record_pre_verifier_issue(
+                    f"{rel_f}: ERR_CONNECTIVITY {svc} has no drawing-extracted service entry coordinate recorded "
+                    f"in output/reconciliation.json ('service_entries_mm') despite {governing_sheet} sheet in workspace "
+                    f"— crop full margins (x=0..0.45*W, y=0..H) of {governing_sheet}, record service_entries_mm, and verify <= 2500mm XY reach"
+                )
 
             for ex_m, ey_m in svc_entries:
                 min_d_m = min(_xy_pt_aabb_dist(ex_m, ey_m, seg["aabb"]) for seg in svc_elems)
@@ -4606,6 +4890,22 @@ if ifc_files:
                         f"{rel_f}: ERR_CONNECTIVITY {svc} unfed — no segment within 2500mm XY of any perimeter wall "
                         f"or service entry (nearest wall {min_wall_d * 1000:.0f}mm away)"
                     )
+            elif slab_bounds_xy is not None:
+                near_perim_pts = []
+                min_perim_d = float("inf")
+                for seg in svc_elems:
+                    pd, ppt = _closest_slab_perim_point_mm(seg["aabb"], slab_bounds_xy)
+                    if pd < min_perim_d:
+                        min_perim_d = pd
+                    if pd <= 0.600 and ppt is not None and ppt not in near_perim_pts:
+                        near_perim_pts.append(ppt)
+                if not near_perim_pts:
+                    for seg in svc_elems:
+                        pd, ppt = _closest_slab_perim_point_mm(seg["aabb"], slab_bounds_xy)
+                        if pd <= REACH_TOL_M and ppt is not None and ppt not in near_perim_pts:
+                            near_perim_pts.append(ppt)
+                if near_perim_pts:
+                    perim_endpoints_by_svc[svc] = sorted(near_perim_pts)[:6]
 
             # Row coverage (>= 80% racks per row within <= 2500mm XY)
             racks_by_row = {}
@@ -4675,6 +4975,22 @@ if ifc_files:
             if perim_endpoints_by_svc.get(svc):
                 mep_entry["perimeter_endpoints_mm"] = perim_endpoints_by_svc[svc]
             mep_summary[svc] = mep_entry
+
+        if (has_e101_sheet or has_m101_sheet) and "busway" in entry_hints_map and "cable_tray" in entry_hints_map:
+            bw_pts = entry_hints_map["busway"]
+            ct_pts = entry_hints_map["cable_tray"]
+            if bw_pts and ct_pts:
+                min_bw_ct_m = min(
+                    math.hypot(bp[0] - cp[0], bp[1] - cp[1]) for bp in bw_pts for cp in ct_pts
+                )
+                if min_bw_ct_m <= 0.600:
+                    warnings.append(
+                        f"busway and cable_tray share nearly identical declared service-entry coordinates "
+                        f"(busway={[ [int(round(p[0] * 1000)), int(round(p[1] * 1000))] for p in bw_pts ]}, "
+                        f"cable_tray={[ [int(round(p[0] * 1000)), int(round(p[1] * 1000))] for p in ct_pts ]}) "
+                        "— crop full margins (x=0..0.45*W, y=0..H) of E-101.png to confirm BW-* does not have "
+                        "a separate offset service-entry callout (e.g. lower-West vs upper-West)"
+                    )
 
         # Overhead clear-height check (>= 2600mm AFF), separated by category & baseline origin
         TERMINAL_CLASSES = {
@@ -4861,47 +5177,215 @@ def _normalize_target_deliverables(
     )
 
 
-def extract_mep_service_entry_hints(task: str = "") -> Dict[str, List[List[float]]]:
-    """Extract explicit MEP service-entry (x, y) coordinates in metres from task instructions."""
+def _parse_json_service_entries(obj: Any) -> Dict[str, List[List[float]]]:
+    """Recursively extract MEP service-entry coordinates (in metres) from a parsed JSON structure."""
     hints: Dict[str, List[List[float]]] = {}
-    if not task or not str(task).strip():
+    svc_kw_re = {
+        "busway": re.compile(r"(?:^|[^a-z0-9])(?:busway|bus[_\s-]*duct|bw[-_]?\d*|power(?:\s+entry)?)(?:[^a-z0-9]|$)", re.I),
+        "cable_tray": re.compile(r"(?:^|[^a-z0-9])(?:cable[_\s-]*tray|telecom|ct[-_]?\d*|tray)(?:[^a-z0-9]|$)", re.I),
+        "chw_pipe": re.compile(r"(?:^|[^a-z0-9])(?:chw(?:[-_]?(?:pipe|\d*))?|chilled[_\s-]*water|pipe)(?:[^a-z0-9]|$)", re.I),
+    }
+    container_keys = {
+        "service_entries",
+        "service_entries_mm",
+        "service_entry",
+        "service_entry_mm",
+        "entry_points",
+        "entry_points_mm",
+        "feed_points",
+        "feed_points_mm",
+        "mep_entries",
+        "mep_entries_mm",
+        "mep_service_entries",
+        "mep_service_entries_mm",
+    }
+    per_svc_keys = {
+        "service_entry",
+        "service_entry_mm",
+        "entry_mm",
+        "entry_xy_mm",
+        "entry_point",
+        "entry_point_mm",
+        "feed_point",
+        "feed_point_mm",
+    }
+
+    def _match_svc(label: Any) -> Optional[str]:
+        s = str(label or "")
+        for sk, pat in svc_kw_re.items():
+            if pat.search(s):
+                return sk
+        return None
+
+    def _parse_xy(val: Any, assume_mm: bool = False) -> List[List[float]]:
+        out: List[List[float]] = []
+        if isinstance(val, dict):
+            for ck in (
+                "xy_mm",
+                "coord_mm",
+                "coords_mm",
+                "entry_mm",
+                "point_mm",
+                "location_mm",
+                "xy",
+                "coord",
+                "coords",
+                "entry",
+                "point",
+                "location",
+            ):
+                if ck in val:
+                    out.extend(_parse_xy(val[ck], assume_mm=assume_mm or ("mm" in ck)))
+            if not out:
+                xk = "x_mm" if "x_mm" in val else ("x" if "x" in val else ("X" if "X" in val else None))
+                yk = "y_mm" if "y_mm" in val else ("y" if "y" in val else ("Y" if "Y" in val else None))
+                if xk is not None and yk is not None:
+                    try:
+                        px, py = float(val[xk]), float(val[yk])
+                        if assume_mm or "mm" in xk.lower() or "mm" in yk.lower() or max(abs(px), abs(py)) > 150.0:
+                            px /= 1000.0
+                            py /= 1000.0
+                        out.append([round(px, 4), round(py, 4)])
+                    except (TypeError, ValueError):
+                        pass
+            return out
+        if isinstance(val, str):
+            m_xy = re.search(
+                r"[\(\[]\s*(-?\d+(?:\.\d+)?)\s*(mm|m)?\s*,\s*(-?\d+(?:\.\d+)?)\s*(mm|m)?\s*[\)\]]",
+                val,
+                re.I,
+            )
+            if m_xy:
+                px, py = float(m_xy.group(1)), float(m_xy.group(3))
+                u = (m_xy.group(4) or m_xy.group(2) or "").lower()
+                if assume_mm or u == "mm" or (not u and max(abs(px), abs(py)) > 150.0):
+                    px /= 1000.0
+                    py /= 1000.0
+                out.append([round(px, 4), round(py, 4)])
+            return out
+        if isinstance(val, (list, tuple)) and val:
+            if isinstance(val[0], (list, tuple, dict)):
+                for item in val:
+                    out.extend(_parse_xy(item, assume_mm=assume_mm))
+                return out
+            if len(val) >= 2 and isinstance(val[0], (int, float)) and isinstance(val[1], (int, float)):
+                px, py = float(val[0]), float(val[1])
+                if assume_mm or max(abs(px), abs(py)) > 150.0:
+                    px /= 1000.0
+                    py /= 1000.0
+                out.append([round(px, 4), round(py, 4)])
+        return out
+
+    stack: List[Tuple[Optional[str], Any]] = [(None, obj)]
+    visited = 0
+    while stack and visited < 5000:
+        parent_k, cur = stack.pop()
+        visited += 1
+        if isinstance(cur, dict):
+            p_svc = _match_svc(parent_k) if parent_k else None
+            for ck, cv in cur.items():
+                ck_low = str(ck).strip().lower()
+                if ck_low in container_keys and isinstance(cv, dict):
+                    is_mm = "mm" in ck_low
+                    for raw_svc, sub_v in cv.items():
+                        sk = _match_svc(raw_svc)
+                        if sk:
+                            for pt in _parse_xy(sub_v, assume_mm=is_mm):
+                                lst = hints.setdefault(sk, [])
+                                if pt not in lst:
+                                    lst.append(pt)
+                elif p_svc and ck_low in per_svc_keys:
+                    for pt in _parse_xy(cv, assume_mm=("mm" in ck_low)):
+                        lst = hints.setdefault(p_svc, [])
+                        if pt not in lst:
+                            lst.append(pt)
+                elif isinstance(cv, (dict, list)):
+                    stack.append((str(ck), cv))
+        elif isinstance(cur, list):
+            for item in cur:
+                if isinstance(item, (dict, list)):
+                    stack.append((parent_k, item))
+    return hints
+
+
+def extract_mep_service_entry_hints(
+    task: str = "",
+    *,
+    plan: str = "",
+    constraints_json: str = "",
+) -> Dict[str, List[List[float]]]:
+    """Extract explicit MEP service-entry (x, y) coordinates in metres from task/plan/constraints."""
+    hints: Dict[str, List[List[float]]] = {}
+
+    def _add_pt(svc: str, xv: float, yv: float) -> None:
+        pt = [round(xv, 4), round(yv, 4)]
+        lst = hints.setdefault(svc, [])
+        if pt not in lst:
+            lst.append(pt)
+
+    if constraints_json and str(constraints_json).strip():
+        payload = extract_json_payload(str(constraints_json)) or str(constraints_json).strip()
+        try:
+            parsed_c = json.loads(payload)
+            for svc, pts in _parse_json_service_entries(parsed_c).items():
+                for pt in pts:
+                    _add_pt(svc, pt[0], pt[1])
+        except Exception:
+            pass
+
+    combined_chunks = [str(s) for s in (task, plan, constraints_json) if s and str(s).strip()]
+    if not combined_chunks:
         return hints
-    text = str(task)
+    text = "\n".join(combined_chunks)
     entry_coord_re = re.compile(
-        r"(?:service\s+entry|entry|feed(?:er)?)(?:\s+(?:at|point|coord(?:inate)?s?|loc(?:ation)?))?\s*[:=]?\s*"
-        r"\(\s*(-?\d+(?:\.\d+)?)\s*(mm|m)?\s*,\s*(-?\d+(?:\.\d+)?)\s*(mm|m)?\s*\)",
+        r"(?:service\s+entry|entry(?:\s+(?:at|point|callout|arrow|coord(?:inate)?s?|loc(?:ation)?))?|enters?(?:\s+\w+)?\s+at|feed(?:er)?(?:\s+(?:entry|point|at))?)"
+        r"[^\(\[\n]{0,45}"
+        r"[\(\[]\s*(-?\d+(?:\.\d+)?)\s*(mm|m)?\s*,\s*(-?\d+(?:\.\d+)?)\s*(mm|m)?\s*[\)\]]",
+        re.I,
+    )
+    entry_xy_eq_re = re.compile(
+        r"(?:service\s+entry|entry\s+(?:point|callout|arrow|at)|enters?(?:\s+\w+)?\s+at|feed(?:er)?\s+(?:entry|point))"
+        r"[^\n]{0,50}?\bX\s*=\s*(-?\d+(?:\.\d+)?)\s*(mm|m)?\s*[,;/\s]+\s*Y\s*=\s*(-?\d+(?:\.\d+)?)\s*(mm|m)?",
         re.I,
     )
     svc_kw_re = {
-        "busway": re.compile(r"\b(?:busway|bus\s*duct|bw[-_]?\d*|power\s+entry)\b", re.I),
-        "cable_tray": re.compile(r"\b(?:cable\s*tray|telecom|ct[-_]?\d*|tray)\b", re.I),
-        "chw_pipe": re.compile(r"\b(?:chw|chilled[\s_-]*water|pipe)\b", re.I),
+        "busway": re.compile(r"(?:^|[^a-z0-9])(?:busway|bus\s*duct|bw[-_]?\d*|power\s+entry)(?:[^a-z0-9]|$)", re.I),
+        "cable_tray": re.compile(r"(?:^|[^a-z0-9])(?:cable[_\s]*tray|telecom|ct[-_]?\d*|tray)(?:[^a-z0-9]|$)", re.I),
+        "chw_pipe": re.compile(r"(?:^|[^a-z0-9])(?:chw(?:[-_]?(?:pipe|\d*))?|chilled[\s_-]*water|pipe)(?:[^a-z0-9]|$)", re.I),
     }
-    prev_end = 0
-    for m in entry_coord_re.finditer(text):
-        xv = float(m.group(1))
-        xu = (m.group(2) or "").lower()
-        yv = float(m.group(3))
-        yu = (m.group(4) or "").lower()
-        unit = yu or xu
-        if unit == "mm" or (not unit and max(abs(xv), abs(yv)) > 150.0):
-            xv /= 1000.0
-            yv /= 1000.0
-        ctx_start = max(prev_end, m.start() - 75)
-        ctx = text[ctx_start : min(len(text), m.end() + 20)]
-        prev_end = m.end()
-        best_svc = None
-        best_pos = -1
-        for svc, pat in svc_kw_re.items():
-            for km in pat.finditer(ctx):
-                if km.start() > best_pos:
-                    best_pos = km.start()
-                    best_svc = svc
-        if best_svc is not None:
-            pt = [round(xv, 4), round(yv, 4)]
-            lst = hints.setdefault(best_svc, [])
-            if pt not in lst:
-                lst.append(pt)
+    for pat_re in (entry_coord_re, entry_xy_eq_re):
+        prev_end = 0
+        for m in pat_re.finditer(text):
+            xv = float(m.group(1))
+            xu = (m.group(2) or "").lower()
+            yv = float(m.group(3))
+            yu = (m.group(4) or "").lower()
+            unit = yu or xu
+            if unit == "mm" or (not unit and max(abs(xv), abs(yv)) > 150.0):
+                xv /= 1000.0
+                yv /= 1000.0
+            line_start = text.rfind("\n", 0, m.start()) + 1
+            ctx_start = max(prev_end, line_start, m.start() - 95)
+            ctx_before = text[ctx_start : m.end()]
+            prev_end = m.end()
+            best_svc = None
+            best_pos = -1
+            for svc, pat in svc_kw_re.items():
+                for km in pat.finditer(ctx_before):
+                    if km.start() > best_pos:
+                        best_pos = km.start()
+                        best_svc = svc
+            if best_svc is None:
+                line_end = text.find("\n", m.end())
+                if line_end < 0:
+                    line_end = len(text)
+                tail = re.split(r"\band\b|;", text[m.end() : min(line_end, m.end() + 25)], maxsplit=1, flags=re.I)[0]
+                for svc, pat in svc_kw_re.items():
+                    if pat.search(tail):
+                        best_svc = svc
+                        break
+            if best_svc is not None:
+                _add_pt(best_svc, xv, yv)
     return hints
 
 
@@ -4917,6 +5401,8 @@ def _build_programmatic_audit_script(
     disallowed_sections: Optional[Iterable[str]] = None,
     required_scope_exclusions: Optional[Iterable[str]] = None,
     enforce_deliverables: bool = False,
+    plan: str = "",
+    constraints_json: str = "",
 ) -> str:
     """Return a self-contained Python 3 audit script for task deliverables."""
     _ = task
@@ -5008,6 +5494,14 @@ def _build_programmatic_audit_script(
             f"SERVICE_ENTRY_HINTS = json.loads({encoded_hints})",
             1,
         )
+    extracted_hints = extract_mep_service_entry_hints("", plan=plan, constraints_json=constraints_json)
+    if extracted_hints:
+        encoded_ext_hints = json.dumps(json.dumps(extracted_hints, separators=(",", ":")))
+        script = script.replace(
+            "EXTRACTED_ENTRY_HINTS = {}  # __PLE_EXTRACTED_ENTRY_HINTS__",
+            f"EXTRACTED_ENTRY_HINTS = json.loads({encoded_ext_hints})",
+            1,
+        )
     return script
 
 
@@ -5024,6 +5518,8 @@ async def run_programmatic_audit(
     disallowed_sections: Optional[Iterable[str]] = None,
     required_scope_exclusions: Optional[Iterable[str]] = None,
     enforce_deliverables: bool = True,
+    plan: str = "",
+    constraints_json: str = "",
 ) -> Dict[str, Any]:
     """Run deterministic CSV/XLSX/JSON/DOCX/IFC checks in the task container before verification."""
     empty: Dict[str, Any] = {
@@ -5052,6 +5548,8 @@ async def run_programmatic_audit(
         disallowed_sections=disallowed_sections,
         required_scope_exclusions=required_scope_exclusions,
         enforce_deliverables=enforce_deliverables,
+        plan=plan,
+        constraints_json=constraints_json,
     )
     cmd = (
         "PY_BIN=$(command -v python3 || command -v python || true)\n"
@@ -5183,6 +5681,7 @@ async def solve(
             mcp_registry=mcp_registry,
             breaker=breaker,
             max_turns=runtime_cfg.get("max_plan_turns", 18),
+            wrap_up_message=PLANNER_WRAP_UP,
         )
         await session.log(f"plan: {plan[:1000]}")
 
@@ -5263,6 +5762,8 @@ async def solve(
                 allowed_sections=excl_rules["allowed_sections"],
                 disallowed_sections=excl_rules["disallowed_sections"],
                 required_scope_exclusions=excl_rules["required_scope_exclusions"],
+                plan=plan,
+                constraints_json=constraints_json,
             )
             if max_fix_rounds > 0
             else {
@@ -5448,6 +5949,8 @@ async def solve(
                 allowed_sections=excl_rules["allowed_sections"],
                 disallowed_sections=excl_rules["disallowed_sections"],
                 required_scope_exclusions=excl_rules["required_scope_exclusions"],
+                plan=plan,
+                constraints_json=constraints_json,
             )
             err_tail = f" {'; '.join(audit['errors'][:5])}" if audit["errors"] else ""
             await session.log(
