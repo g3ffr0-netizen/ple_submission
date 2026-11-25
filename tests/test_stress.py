@@ -1015,18 +1015,23 @@ class TestAdversarialHarnessStress(unittest.TestCase):
 
     def test_429_5xx_backoff_fallback_rotation_and_malformed_tool_calls_resilience(self):
         # Part A: HarnessExecutionEngine 429 + Retry-After + 5xx exponential backoff & rotation
-        def _mock_http_response(status_code: int, headers: Optional[Dict[str, str]] = None) -> SimpleNamespace:
+        def _mock_http_response(status_code: int, headers: Optional[Dict[str, str]] = None) -> Any:
             try:
                 import httpx
 
-                req: Any = httpx.Request("POST", "https://api.example/v1/chat/completions")
+                return httpx.Response(
+                    status_code,
+                    headers=dict(headers or {}),
+                    request=httpx.Request("POST", "https://api.example/v1/chat/completions"),
+                )
             except ImportError:
-                req = SimpleNamespace(method="POST", url="https://api.example/v1/chat/completions", headers={})
-            return SimpleNamespace(
-                status_code=status_code,
-                headers=dict(headers or {}),
-                request=req,
-            )
+                return SimpleNamespace(
+                    status_code=status_code,
+                    headers=dict(headers or {}),
+                    history=[],
+                    next_request=None,
+                    request=SimpleNamespace(method="POST", url="https://api.example/v1/chat/completions", headers={}),
+                )
 
         sleep_calls: List[float] = []
         engine = HarnessExecutionEngine(

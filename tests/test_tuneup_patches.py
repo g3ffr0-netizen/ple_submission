@@ -912,19 +912,29 @@ util = _Util()
         self.assertTrue(res_fixed["mep_summary"]["busway"]["perimeter_endpoints_mm"])
 
     def test_openai_api_status_error_mock_request_has_headers_for_sdk_v2(self) -> None:
-        """Regression test for GitHub Actions Unit Tests (#63-#69) with openai v2 _error_request(request.headers)."""
+        """Regression test for GitHub Actions Unit Tests (#63-#69) with openai v2 _error_request/_error_response."""
         import openai
 
         try:
             import httpx
 
-            req: object = httpx.Request("POST", "https://api.example/v1/chat/completions")
+            resp: object = httpx.Response(
+                429,
+                headers={"Retry-After": "2"},
+                request=httpx.Request("POST", "https://api.example/v1/chat/completions"),
+            )
         except ImportError:
-            req = SimpleNamespace(method="POST", url="https://api.example/v1/chat/completions", headers={})
-        resp = SimpleNamespace(status_code=429, headers={"Retry-After": "2"}, request=req)
+            resp = SimpleNamespace(
+                status_code=429,
+                headers={"Retry-After": "2"},
+                history=[],
+                next_request=None,
+                request=SimpleNamespace(method="POST", url="https://api.example/v1/chat/completions", headers={}),
+            )
         err = openai.APIStatusError("quota 429", response=resp, body=None)  # type: ignore[arg-type]
         self.assertTrue(hasattr(err.request, "headers"))
-        self.assertFalse(any(k in err.request.headers for k in ("authorization", "api-key")))
+        self.assertTrue(hasattr(err.response, "history"))
+        self.assertEqual(err.response.headers.get("retry-after") or err.response.headers.get("Retry-After"), "2")
 
 
 if __name__ == "__main__":

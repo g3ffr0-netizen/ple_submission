@@ -1110,18 +1110,23 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
             self.assertEqual(_run_audit(workdir)["errors"], [])
 
     def test_429_503_api_storms_fallback_rotation_and_malformed_tool_calls(self):
-        def _mock_http_response(status_code: int, headers: Optional[Dict[str, str]] = None) -> SimpleNamespace:
+        def _mock_http_response(status_code: int, headers: Optional[Dict[str, str]] = None) -> Any:
             try:
                 import httpx
 
-                req: Any = httpx.Request("POST", "https://api.example/v1/chat/completions")
+                return httpx.Response(
+                    status_code,
+                    headers=dict(headers or {}),
+                    request=httpx.Request("POST", "https://api.example/v1/chat/completions"),
+                )
             except ImportError:
-                req = SimpleNamespace(method="POST", url="https://api.example/v1/chat/completions", headers={})
-            return SimpleNamespace(
-                status_code=status_code,
-                headers=dict(headers or {}),
-                request=req,
-            )
+                return SimpleNamespace(
+                    status_code=status_code,
+                    headers=dict(headers or {}),
+                    history=[],
+                    next_request=None,
+                    request=SimpleNamespace(method="POST", url="https://api.example/v1/chat/completions", headers={}),
+                )
 
         clean_csv = "device_id,register,qty\nD1,REG-1,10\nD2,REG-2,20\nTOTAL,,30\n"
 
@@ -1673,18 +1678,23 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
         self.assertEqual(empty_fb["entities"], [])
         self.assertEqual(empty_fb["note"], "no_constraints_found")
 
-        def _mock_http_response(status_code: int, headers: Optional[Dict[str, str]] = None) -> SimpleNamespace:
+        def _mock_http_response(status_code: int, headers: Optional[Dict[str, str]] = None) -> Any:
             try:
                 import httpx
 
-                req: Any = httpx.Request("POST", "https://api.example/v1/chat/completions")
+                return httpx.Response(
+                    status_code,
+                    headers=dict(headers or {}),
+                    request=httpx.Request("POST", "https://api.example/v1/chat/completions"),
+                )
             except ImportError:
-                req = SimpleNamespace(method="POST", url="https://api.example/v1/chat/completions", headers={})
-            return SimpleNamespace(
-                status_code=status_code,
-                headers=dict(headers or {}),
-                request=req,
-            )
+                return SimpleNamespace(
+                    status_code=status_code,
+                    headers=dict(headers or {}),
+                    history=[],
+                    next_request=None,
+                    request=SimpleNamespace(method="POST", url="https://api.example/v1/chat/completions", headers={}),
+                )
 
         with tempfile.TemporaryDirectory() as tmp:
             workdir = Path(tmp)
