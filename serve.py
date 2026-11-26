@@ -63,13 +63,13 @@ RESULT_CHARS = 20_000
 EXEC_INLINE_CAP_CHARS = 6_000
 EXEC_SPILL_HEAD_CHARS = 3_400
 EXEC_SPILL_TAIL_CHARS = 2_000
-PRUNE_TOOL_AGE_TURNS = 8
-PRUNE_TOOL_MIN_CHARS = 4_000
+PRUNE_TOOL_AGE_TURNS = 6
+PRUNE_TOOL_MIN_CHARS = 2_500
 PRUNE_REF_WINDOW_TURNS = 4
 PRUNE_STUB_CHARS = 300
-PRUNE_CHECKPOINT_EVERY = 12
+PRUNE_CHECKPOINT_EVERY = 6
 MAX_IMAGE_BYTES = 5 << 20
-MAX_ACTIVE_IMAGES = 10
+MAX_ACTIVE_IMAGES = 6
 IMAGE_MAGIC: Tuple[Tuple[bytes, str], ...] = (
     (b"\x89PNG", "image/png"),
     (b"\xff\xd8\xff", "image/jpeg"),
@@ -118,8 +118,9 @@ PLANNER = (
     "file. For PNG/JPEG/GIF/WEBP engineering drawings, schedules, or diagrams, "
     "call view_image instead of writing pixel/ASCII OCR scripts (if cropping dense "
     "sheets to /tmp PNGs, note PIL may be absent so use matplotlib.image or zlib/struct, "
-    "and ALWAYS include full outer margins x=0..W / y=0..H around perimeter walls so "
-    "left/outer-margin callouts left of the West wall are never clipped; on MEP sheets "
+    "and ALWAYS crop two overlapping high-res West-wall margin strips "
+    "(upper-West x=0..0.45*W, y=0..0.55*H AND lower-West x=0..0.45*W, y=0.45*H..1.0*H, "
+    "plus other outer margins as needed) so left/lower-margin callouts are never clipped; on MEP sheets "
     "E-101 and M-101 inspect busway BW-*, cable tray CT-*, and CHW-* service-entry "
     "callouts along the entire perimeter independently—never assume BW and CT share one "
     "entry coordinate—and record each service's exact (X, Y) mm service entry). Keep your "
@@ -179,15 +180,18 @@ WORKER = (
     "zero missing/shifted columns, zero NaN/N/A/TBD or unresolved '[_____]'/'*as indicated' "
     "artifacts, and on optimization/sizing tasks with hard resource caps run a discrete search "
     "preserving positive margins with >= 0.5% buffer where feasible); (2) if creating or modifying .ifc BIM deliverables, "
-    "(a) if drawing PNG sheets (E-101, M-101, A-101, F-101) specify service-entry locations, crop full-margin perimeter "
-    "strips (for West wall include x=0..0.45*W across full height y=0..H so callout text in the left margin is NEVER clipped; "
-    "remember PNG y=0 is North Y_max and y=H is South Y=0, so lower-West offset entries like (200, 4910) appear at y~0.45*H..0.75*H "
-    "separate from upper-West entries near (0, 12470)), inspect BW-* busway and CT-* cable tray on E-101 and CHW-* on M-101 "
-    "individually with view_image (governing discipline sheets E-101/M-101 override generic notes when inter-sheet offsets exist; "
-    "never assume busway, cable tray, and CHW share one entry coordinate), record exact `\"service_entries_mm\": {{\"busway\": [x, y], "
-    "\"cable_tray\": [x, y], \"chw_pipe\": [x, y]}}` in `output/reconciliation.json` (or `output/service_entries.json`), and ensure "
-    "every routed network starts within <= 2500 mm XY of its own drawn service entry, forms 1 connected component (<= 250 mm joint "
-    "tolerance), reaches >= 80% of every rack row (<= 2500 mm XY), and reaches every CRAH unit (<= 2500 mm XY for CHW); (b) run "
+    "(a) if drawing PNG sheets (E-101, M-101, A-101, F-101) specify service-entry locations, crop two overlapping "
+    "high-res West-wall perimeter strips (upper-West x=0..0.45*W, y=0..0.55*H AND lower-West x=0..0.45*W, y=0.45*H..1.0*H "
+    "so callout text in the left/bottom-left margin is NEVER clipped; "
+    "remember PNG y=0 is North Y_max and y=H is South Y=0, so lower-West offset entries like (200, 3360) or (200, 4910) "
+    "appear in the lower-West strip y~0.45*H..0.95*H separate from upper-West entries near (0, 12470)), inspect BW-* busway "
+    "and CT-* cable tray on E-101 and CHW-* on M-101 individually with view_image (governing discipline sheets E-101/M-101 "
+    "override generic notes when inter-sheet offsets exist; never assume busway, cable tray, and CHW share one entry coordinate), "
+    "record exact `\"service_entries_mm\": {{\"busway\": [x, y], \"cable_tray\": [x, y], \"chw_pipe\": [x, y]}}` in "
+    "`output/reconciliation.json` (or `output/service_entries.json`), and ensure every routed network starts within <= 2500 mm XY "
+    "of its own drawn service entry (re-verify this after ANY routing rewrite so fixes never detach a network from its entry!), "
+    "forms 1 connected component (<= 250 mm joint tolerance), reaches >= 80% of every rack row (<= 2500 mm XY), and reaches every "
+    "CRAH unit (<= 2500 mm XY for CHW); (b) run "
     "ifcopenshell.validate plus ifcopenshell.geom.tree BVH clash checks across "
     "ALL elements (including same-service MEP segments—never exempt "
     "IfcRelConnects* links or 0 mm touching butt-joints). Because BVH flags "
@@ -201,11 +205,12 @@ WORKER = (
     "tray-stack/access headroom >= 300 mm above/below trays per TIA-569-B, "
     "overhead clear height >= 2600 mm AFF unless explicitly permitted, "
     "sprinkler clearance >= 457 mm, PDU clear zones, and site building/road "
-    "non-intersection). When routing MEP networks or resolving clash, separation, "
-    "or headroom violations, keep runs compact and direct—prefer minimal local "
-    "lateral offsets, clean parallel lane allocation, or valid elevation/zone "
-    "separation over perimeter detours or redundant backtracks that bloat total "
-    "routed length and degrade length-efficiency objectives. "
+    "non-intersection). When routing MEP networks, keep runs compact and direct: on the FIRST pass, allocate "
+    "unstacked parallel horizontal lanes with minimal local lateral offsets (>= 300 mm lateral gap between CT-*, BW-*, "
+    "and overhead CHW-*) OR >= 300 mm vertical gap at perpendicular crossings (or "
+    "under-floor CHW when shown on M-101/A-301) using direct trunk-and-tap combs—"
+    "NEVER build full-perimeter boustrophedon or perimeter detours or redundant backtracks that "
+    "bloat total routed length and degrade length-efficiency objectives. "
     "After any edit or fix, immediately regenerate and re-run "
     "verification checks on the actual deliverable file before replying. When "
     "done, reply without calling a tool: summarize each deliverable, its exact "
@@ -238,8 +243,9 @@ VERIFIER = (
     "For .ifc deliverables, run Python checks using ifcopenshell.geom.tree BVH "
     "across ALL elements without exempting IfcRelConnects* or 0 mm butt-joints "
     "(verify 5-10 mm non-touching gaps at L-corners/T-junctions/joints so BVH clash "
-    "count is 0 while each service forms 1 connected component <= 250 mm), crop full-margin "
-    "perimeter strips (x=0..0.45*W, y=0..H plus other borders—never rely on uncropped full-sheet views) "
+    "count is 0 while each service forms 1 connected component <= 250 mm), crop two overlapping "
+    "high-res West-wall strips (upper-West x=0..0.45*W, y=0..0.55*H AND lower-West x=0..0.45*W, y=0.45*H..1.0*H, "
+    "plus other borders—never rely on uncropped full-sheet views) "
     "of E-101.png and M-101.png to verify separate BW-*, CT-*, and CHW-* service-entry (X, Y) coordinates "
     "against reconciliation.json['service_entries_mm'] and MEP SUMMARY feed_endpoints_mm (<= 2500 mm XY), "
     "verify rack-row coverage (>= 80% per row <= 2500 mm), and CRAH reachability, plus 3D "

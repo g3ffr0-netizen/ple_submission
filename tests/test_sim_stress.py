@@ -2071,7 +2071,7 @@ class TestLayer2ScriptedAgentLoopSimulation(unittest.TestCase):
 
 class TestLayer3HardeningPRA(unittest.TestCase):
     def test_view_image_dedup_and_mtime_invalidation(self):
-        self.assertEqual(serve.MAX_ACTIVE_IMAGES, 10)
+        self.assertEqual(serve.MAX_ACTIVE_IMAGES, 6)
         png_a = b"\x89PNG\r\n\x1a\n" + b"frame-alpha-001"
         png_b = b"\x89PNG\r\n\x1a\n" + b"frame-bravo-002"
 
