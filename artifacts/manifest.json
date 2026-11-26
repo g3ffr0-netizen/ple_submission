@@ -1,11 +1,11 @@
 {
   "format": 1,
   "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
-  "created": "2026-11-25T23:25:40Z",
+  "created": "2026-11-26T22:38:17Z",
   "harness": {
     "name": "ple-submission",
     "model_api": "google-cloud/gemini-4-argon",
-    "tree": "de46f52d802e81f44648e9300b74586bb741ad82b89dfc34ae535abcf6e1f193",
+    "tree": "b79ccec539ce9be3fea55c48a677b300bac97da8fa1896254b21baba25494aec",
     "files": {
       ".devcontainer/devcontainer.json": "100644 19ff7d1d65c3a10438b77d0248e2e7a38c34318c",
       ".gitattributes": "100644 a6369682b02ec3774333e56f3fc8b461e0e9d899",
@@ -26,7 +26,7 @@
       "pipeline.py": "100644 93e666371d78eda7cc55c4c78f76b72ea9925ff9",
       "requirements-serve.txt": "100644 b25202469c405ac068fb76b78270eaaa12bd2e63",
       "requirements.txt": "100644 f4f0fa490ce2e03a6f7fc2bc7a87e180eec5a84d",
-      "serve.py": "100644 5f36391cc588311fa0d307920c67d8f3473fd380",
+      "serve.py": "100644 28208208a1c466d3849b1a456b33e91667eede86",
       "submission.yaml": "100644 dfea19e83d4f466a1834f8ec9106bf627220008b",
       "taskbridge.py": "100644 26cc3d6cf8dbcaed859731ce9a6881f4ca8bfe40",
       "tests/test_analyze_eval.py": "100644 f64553bd80dc6cb08f95977067a3f1f1ffbca56b",
@@ -35,7 +35,7 @@
       "tests/test_fallback_and_lockout.py": "100644 54469e74752504537f1e6085adc12a5ada6e059f",
       "tests/test_handoff_sync.py": "100644 91f85a59f08f6e83f722aa2258d62dbdade8a1bb",
       "tests/test_serve_live.py": "100644 cee51e3a0cce5019ada4196f0c00402c591b8947",
-      "tests/test_sim_stress.py": "100644 7ca6c387a6dab7ff71dc8fd46afae421089eb544",
+      "tests/test_sim_stress.py": "100644 a2c1ec515548625cf328e2b5788b5c7eda725e74",
       "tests/test_stress.py": "100644 33b607cae5ded997e7d7ff1071fe8821ccc090cb",
       "tests/test_tuneup.py": "100644 40951b3684aa8a99540cdba8319ae32a805ccb9e",
       "tests/test_tuneup_patches.py": "100644 9761876d7fa380f160be47e07c389a23412ecb50",
@@ -43,9 +43,10 @@
       "tests/verification.py": "100644 c3725ea12f1cef5ffa0728b83989b1560c28c8da",
       "tools/analyze_eval.py": "100644 602cd47789e846e1816f4fca5957494691dad22a",
       "tools/handoff_sync.py": "100644 f2352d5000c8cdd99cbddd3ebbfb570cfd8f0a9b",
+      "tools/mep_router.py": "100644 b5b9e27e9e64553e69a73937a7dc0fd64194f3bb",
       "tools/tuneup.py": "100644 5b6add390f694594c8c912632c942c180d1cc3d4"
     },
-    "commit": "3715b51b94c47111f2ff3b2325c87bc4158a08b4",
+    "commit": "e51264d6d6a474327b29915430b3f5f29312a861",
     "dirty": false
   },
   "tasks": {
@@ -162,16 +163,58 @@
       "skipped": []
     },
     "wind-diaphragm-shear": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
       "run": "eval_run",
       "trial": "wind-diaphragm-shear__Qkjsaqj",
       "ended": "ok",
       "reward": 0.261905,
       "tree": "de46f52d802e81f44648e9300b74586bb741ad82b89dfc34ae535abcf6e1f193",
-      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
       "files": {
         "filesystem/final_batch4__structural_task5_wind_diaphragm_shear__blind/output/submission.zip": "8bc6b1b0f9acd5af4b0f57a23ac90c3500022f2e"
       },
       "final_message": "0f5324e2fc903b47ac606658da523105b4e56549",
+      "deleted": [],
+      "skipped": []
+    },
+    "data-center-site-model": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "data-center-site-model__GYqkmxS",
+      "ended": "ok",
+      "reward": 1.0,
+      "tree": "b79ccec539ce9be3fea55c48a677b300bac97da8fa1896254b21baba25494aec",
+      "files": {
+        "app/files/frontier__DCBim__p6_002/submission/model.ifc": "fe7382160f3cf4b9bb16f1f7a177de181217671c"
+      },
+      "final_message": "45e03f2d93d6b80239c684222644257fcbd8bf2e",
+      "deleted": [],
+      "skipped": []
+    },
+    "data-hall-mep-routing": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "data-hall-mep-routing__KYAcHYu",
+      "ended": "ok",
+      "reward": 0.931655,
+      "tree": "b79ccec539ce9be3fea55c48a677b300bac97da8fa1896254b21baba25494aec",
+      "files": {
+        "app/files/dc_model__hall_seed000_d000__mep_routing/output/solution.py": "66ca26dfa8e568c87049c0990231e09b68110700"
+      },
+      "final_message": "11055d142cc9d8e0ce13e85bd21081a487a737ab",
+      "deleted": [],
+      "skipped": []
+    },
+    "data-hall-mep-routing-offset": {
+      "run": "eval_run",
+      "trial": "data-hall-mep-routing-offset__y3u3jMK",
+      "ended": "ok",
+      "reward": 0.889831,
+      "tree": "b79ccec539ce9be3fea55c48a677b300bac97da8fa1896254b21baba25494aec",
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "files": {
+        "app/files/dc_model__hall_seed005_d100__mep_routing/output/solution.py": "e0e6625023f40aff325ce50d8dcca3ab5b8ffcc0"
+      },
+      "final_message": "a621bc1a497e73520fc1f35d6befdc5a8533e373",
       "deleted": [],
       "skipped": []
     }
