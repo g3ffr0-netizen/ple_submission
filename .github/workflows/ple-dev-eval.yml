@@ -434,9 +434,28 @@ jobs:
           FREE_GB=$(df -BG --output=avail / | tail -n 1 | tr -dc '0-9')
           echo "Available root disk before reclaim: ${FREE_GB:-0} GB (grading=${TASK_GRADING:-unknown})"
           if [ "${TASK_GRADING:-}" = "rubric" ] || [ "${FREE_GB:-0}" -lt 35 ]; then
-            echo "Running disk reclaim (unconditional for rubric tasks or < 35 GB free) ..."
-            sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/boost /usr/local/share/chromium /usr/local/lib/node_modules || true
+            echo "Running aggressive disk reclaim (unconditional for rubric tasks or < 35 GB free) ..."
+            sudo rm -rf \
+              /usr/share/dotnet \
+              /opt/ghc \
+              /usr/local/.ghcup \
+              /usr/local/lib/android \
+              /opt/hostedtoolcache/CodeQL \
+              /usr/share/swift \
+              /usr/local/share/boost \
+              /usr/local/share/chromium \
+              /usr/local/lib/node_modules \
+              /opt/az \
+              /usr/share/miniconda \
+              /usr/local/share/powershell \
+              /usr/local/share/vcpkg \
+              /usr/local/julia* \
+              /usr/lib/jvm \
+              /usr/local/aws-cli \
+              /home/runner/.rustup \
+              /home/runner/.cargo || true
             sudo docker system prune -af --volumes || true
+            sudo docker builder prune -af || true
             sudo apt-get clean || true
           else
             echo "Skipping disk reclaim (grading=${TASK_GRADING:-unknown}, >= 35 GB free)"
@@ -513,6 +532,8 @@ jobs:
               "${CACHE_TO_ARGS[@]}" \
               -t "${TASK_TAG}" \
               "${ENV_DIR}" || echo "::warning::GHCR-cached pre-warm failed; eval/run.py will build locally"
+            sudo docker builder prune -af || true
+            df -h /
           fi
 
       - name: Start local Vertex AI model proxy
