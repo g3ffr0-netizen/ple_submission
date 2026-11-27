@@ -1,16 +1,16 @@
 {
   "format": 1,
   "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
-  "created": "2026-11-26T22:38:17Z",
+  "created": "2026-11-27T01:08:07Z",
   "harness": {
     "name": "ple-submission",
     "model_api": "google-cloud/gemini-4-argon",
-    "tree": "b79ccec539ce9be3fea55c48a677b300bac97da8fa1896254b21baba25494aec",
+    "tree": "424b2da9dbfd83e8129d8582d52a075ca4e106bd083722a23e72e08eec9609e9",
     "files": {
       ".devcontainer/devcontainer.json": "100644 19ff7d1d65c3a10438b77d0248e2e7a38c34318c",
       ".gitattributes": "100644 a6369682b02ec3774333e56f3fc8b461e0e9d899",
       ".github/workflows/codeql.yml": "100644 1edf38c830908bf753b00cd62f42a4212bc0401e",
-      ".github/workflows/ple-dev-eval.yml": "100644 7a96b08b15dcc718827492511425e7cbd48e837e",
+      ".github/workflows/ple-dev-eval.yml": "100644 14afeaa9c905d5de4c06b660f39478384605a4bc",
       ".github/workflows/ple-kit-check.yml": "100644 5cb15c9277a1fcbb044cfde5a7493ba9597c784f",
       ".github/workflows/tests.yml": "100644 9f8246e54bf9cfb039a619a44a7e0542a6e24de7",
       ".gitignore": "100644 0706b48c86420ee2722539589e437c06557ea1e4",
@@ -46,7 +46,7 @@
       "tools/mep_router.py": "100644 b5b9e27e9e64553e69a73937a7dc0fd64194f3bb",
       "tools/tuneup.py": "100644 5b6add390f694594c8c912632c942c180d1cc3d4"
     },
-    "commit": "e51264d6d6a474327b29915430b3f5f29312a861",
+    "commit": "94448e8a2c2e70f738742426f2eb91ce104e154a",
     "dirty": false
   },
   "tasks": {
@@ -205,16 +205,88 @@
       "skipped": []
     },
     "data-hall-mep-routing-offset": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
       "run": "eval_run",
       "trial": "data-hall-mep-routing-offset__y3u3jMK",
       "ended": "ok",
       "reward": 0.889831,
       "tree": "b79ccec539ce9be3fea55c48a677b300bac97da8fa1896254b21baba25494aec",
-      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
       "files": {
         "app/files/dc_model__hall_seed005_d100__mep_routing/output/solution.py": "e0e6625023f40aff325ce50d8dcca3ab5b8ffcc0"
       },
       "final_message": "a621bc1a497e73520fc1f35d6befdc5a8533e373",
+      "deleted": [],
+      "skipped": []
+    },
+    "eor-review-corrections": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "eor-review-corrections__6E9dGsN",
+      "ended": "ok",
+      "reward": 0.238824,
+      "tree": "424b2da9dbfd83e8129d8582d52a075ca4e106bd083722a23e72e08eec9609e9",
+      "files": {
+        "filesystem/dc_structural__eor_revision__blind/output/submission.zip": "b80d51ff6b38be6311addfd6d4b755179790e84a"
+      },
+      "final_message": "2630163a610ff8ca770a63a740febc460e38c354",
+      "deleted": [],
+      "skipped": []
+    },
+    "fire-test-validation-memo": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "fire-test-validation-memo__e7oQtff",
+      "ended": "ok",
+      "reward": 0.692308,
+      "tree": "424b2da9dbfd83e8129d8582d52a075ca4e106bd083722a23e72e08eec9609e9",
+      "files": {
+        "app/files/output/CFDME-2025-041_validation_memo_revA.docx": "2ead05eb1847ab2551104c1cd3ec0a73d4af1be7"
+      },
+      "final_message": "0406e195dbcb0190a708abbd6f97f29a580d1c2d",
+      "deleted": [],
+      "skipped": []
+    },
+    "foundation-strategy": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "foundation-strategy__NLBPKwu",
+      "ended": "ok",
+      "reward": 0.593172,
+      "tree": "424b2da9dbfd83e8129d8582d52a075ca4e106bd083722a23e72e08eec9609e9",
+      "files": {
+        "filesystem/dc_structural__foundation_strategy__blind/output/submission.zip": "d04f22bc43a165a42724cf93d9a518eaac5591e1"
+      },
+      "final_message": "048c937fcc6085a0e9217d2c7bb21cbc3efdae71",
+      "deleted": [],
+      "skipped": []
+    },
+    "landscape-sheet-revision": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "landscape-sheet-revision__ufn2T2h",
+      "ended": "ok",
+      "reward": 0.285714,
+      "tree": "424b2da9dbfd83e8129d8582d52a075ca4e106bd083722a23e72e08eec9609e9",
+      "files": {
+        "app/files/output/Memo_to_Callaway_L4_Resubmittal_10312026.docx": "7621e538540201074158fbc4666a6cfd79207c95",
+        "app/files/output/Memo_to_Callaway_L4_Resubmittal_10312026.md": "281f519d7056d6e80e46a5860f96b159b10c3386",
+        "app/files/output/Memo_to_Callaway_L4_Resubmittal_10312026.pdf": "2950c5fef152c5a8139bfa3ba12db9b31fa7aff8"
+      },
+      "final_message": "2dd52cc1f8f030e0d7ab97578adf57eff899471e",
+      "deleted": [],
+      "skipped": []
+    },
+    "lv-cable-sizing": {
+      "run": "eval_run",
+      "trial": "lv-cable-sizing__zxAnnaZ",
+      "ended": "ok",
+      "reward": 0.844925,
+      "tree": "424b2da9dbfd83e8129d8582d52a075ca4e106bd083722a23e72e08eec9609e9",
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "files": {
+        "filesystem/electrical__lv_cable_sizing__blind/output/submission.zip": "7056c2d49acd0c36b0c6cc71c1d4b35b7f5e99ef"
+      },
+      "final_message": "89e2e01ea4eaf005fd71278d6640298b0010eb65",
       "deleted": [],
       "skipped": []
     }
