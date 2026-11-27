@@ -1,7 +1,7 @@
 {
   "format": 1,
   "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
-  "created": "2026-11-27T11:33:49Z",
+  "created": "2026-11-27T13:00:59Z",
   "harness": {
     "name": "ple-submission",
     "model_api": "google-cloud/gemini-4-argon",
@@ -46,7 +46,7 @@
       "tools/mep_router.py": "100644 b5b9e27e9e64553e69a73937a7dc0fd64194f3bb",
       "tools/tuneup.py": "100644 5b6add390f694594c8c912632c942c180d1cc3d4"
     },
-    "commit": "f07619b6c30cb1699cee1306f0f91c46c13a23b9",
+    "commit": "e4a603b9793af90de559c2e2088b5b891abe3861",
     "dirty": false
   },
   "tasks": {
@@ -950,16 +950,44 @@
       "skipped": []
     },
     "solar-supplemental-review": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
       "run": "eval_run",
       "trial": "solar-supplemental-review__XgpcZzL",
       "ended": "ok",
       "reward": 0.311688,
       "tree": "dd2dc601e8d85be5c51de8f04abcdaf82c2927b0e17e80e3e6874ba344b72065",
-      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
       "files": {
         "filesystem/Bramwick_Commons_Screen_Memo.docx": "f4a3b9b64d5071f2e6902989676cedc593436947"
       },
       "final_message": "7a18d2b7aaaa119e38fa20c01145fe7b7e3683fd",
+      "deleted": [],
+      "skipped": []
+    },
+    "fire-solve-convergence": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "fire-solve-convergence__p4mpRi5",
+      "ended": "ok",
+      "reward": 0.511628,
+      "tree": "dd2dc601e8d85be5c51de8f04abcdaf82c2927b0e17e80e3e6874ba344b72065",
+      "files": {
+        "filesystem/CFDME-2025-041_transient_solve_disposition_revA.docx": "f322f4414ad96df035db5ec153ccb41a25b1d123"
+      },
+      "final_message": "aa5a3ebee880c841cf01d469ce609d99b5d181e5",
+      "deleted": [],
+      "skipped": []
+    },
+    "les-mesh-resolution": {
+      "run": "eval_run",
+      "trial": "les-mesh-resolution__GidyYVa",
+      "ended": "ok",
+      "reward": 0.109756,
+      "tree": "dd2dc601e8d85be5c51de8f04abcdaf82c2927b0e17e80e3e6874ba344b72065",
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "files": {
+        "filesystem/CFDME-2025-041_resolution_note_revA.docx": "f72105b9e6086d9f95bc04be876273303a2fc7d6"
+      },
+      "final_message": "a27551c5c2aede83ead0d7667c700ab8cbc9c0ab",
       "deleted": [],
       "skipped": []
     }
