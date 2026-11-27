@@ -1,16 +1,16 @@
 {
   "format": 1,
   "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
-  "created": "2026-11-27T06:40:31Z",
+  "created": "2026-11-27T11:33:49Z",
   "harness": {
     "name": "ple-submission",
     "model_api": "google-cloud/gemini-4-argon",
-    "tree": "424b2da9dbfd83e8129d8582d52a075ca4e106bd083722a23e72e08eec9609e9",
+    "tree": "dd2dc601e8d85be5c51de8f04abcdaf82c2927b0e17e80e3e6874ba344b72065",
     "files": {
       ".devcontainer/devcontainer.json": "100644 19ff7d1d65c3a10438b77d0248e2e7a38c34318c",
       ".gitattributes": "100644 a6369682b02ec3774333e56f3fc8b461e0e9d899",
       ".github/workflows/codeql.yml": "100644 1edf38c830908bf753b00cd62f42a4212bc0401e",
-      ".github/workflows/ple-dev-eval.yml": "100644 14afeaa9c905d5de4c06b660f39478384605a4bc",
+      ".github/workflows/ple-dev-eval.yml": "100644 46c6c31e9cfb6b3bd538a43303e3b3c067704f9d",
       ".github/workflows/ple-kit-check.yml": "100644 5cb15c9277a1fcbb044cfde5a7493ba9597c784f",
       ".github/workflows/tests.yml": "100644 9f8246e54bf9cfb039a619a44a7e0542a6e24de7",
       ".gitignore": "100644 0706b48c86420ee2722539589e437c06557ea1e4",
@@ -46,7 +46,7 @@
       "tools/mep_router.py": "100644 b5b9e27e9e64553e69a73937a7dc0fd64194f3bb",
       "tools/tuneup.py": "100644 5b6add390f694594c8c912632c942c180d1cc3d4"
     },
-    "commit": "d2602b601603997d28019ec55f5683c06727a690",
+    "commit": "f07619b6c30cb1699cee1306f0f91c46c13a23b9",
     "dirty": false
   },
   "tasks": {
@@ -645,12 +645,12 @@
       "skipped": []
     },
     "solar-witness-test-package": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
       "run": "eval_run",
       "trial": "solar-witness-test-package__6CvZYST",
       "ended": "ok",
       "reward": 1.0,
       "tree": "424b2da9dbfd83e8129d8582d52a075ca4e106bd083722a23e72e08eec9609e9",
-      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
       "files": {
         "app/tools/.apps_data/mysql/database_dump.sql": "3e8a7c3735030ebd419484d07f5a2f205914f53a",
         "app/tools/.apps_data/nextcloud_browser/database_dump.sql": "3a4061d16f6145a83d372988fb8f43a88bfeeb40",
@@ -875,6 +875,91 @@
         "filesystem/Municipal_Witness_Test_Package.docx": "efa931d94c6ae8b91aecf4dbe010881ee303b22d"
       },
       "final_message": "a3c6e0fe1662d2d33eb9d4a8e3dc00101c3a22b8",
+      "deleted": [],
+      "skipped": []
+    },
+    "emergency-spillway-check": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "emergency-spillway-check__QX997hn",
+      "ended": "ok",
+      "reward": 0.351351,
+      "tree": "dd2dc601e8d85be5c51de8f04abcdaf82c2927b0e17e80e3e6874ba344b72065",
+      "files": {
+        "filesystem/Memo_to_Callaway_Spillway_2026-10-31.docx": "8719e6862d39433a057fc2ecba9277945e1dd276"
+      },
+      "final_message": "c940fa9f0412c20854244cf78af01d2e0ce43341",
+      "deleted": [],
+      "skipped": []
+    },
+    "engineers-estimate-check": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "engineers-estimate-check__6kgQaQz",
+      "ended": "ok",
+      "reward": 0.565217,
+      "tree": "dd2dc601e8d85be5c51de8f04abcdaf82c2927b0e17e80e3e6874ba344b72065",
+      "files": {
+        "app/tools/.apps_data/.coordinator/config/config.json": "f7b7354d29a0cf2c3ed1d97a7e92fc3782b2c6eb",
+        "filesystem/Correspondence/Client/Memo_to_Callaway_2026-10-31.docx": "f5abfb53e854df0b2734e4ed46e0cbc57630d758"
+      },
+      "final_message": "8b1eea3be6e7c50722acd7671c366e715c99e464",
+      "deleted": [],
+      "skipped": []
+    },
+    "fill-compaction-acceptance": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "fill-compaction-acceptance__MaKfiGV",
+      "ended": "ok",
+      "reward": 0.25,
+      "tree": "dd2dc601e8d85be5c51de8f04abcdaf82c2927b0e17e80e3e6874ba344b72065",
+      "files": {
+        "filesystem/Thelbridge_Materials_Acceptance_Fill_Compaction_2026-0708.docx": "60f839ad227a3d08946cfad42c048b0b25f28d1c"
+      },
+      "final_message": "31a495d1cb9f1ed2e21b91d01ab416a8620b3764",
+      "deleted": [],
+      "skipped": []
+    },
+    "footing-settlement-verification": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "footing-settlement-verification__RYD6Qu4",
+      "ended": "ok",
+      "reward": 0.467742,
+      "tree": "dd2dc601e8d85be5c51de8f04abcdaf82c2927b0e17e80e3e6874ba344b72065",
+      "files": {
+        "filesystem/Thelbridge_Verification_Memo_Item051_BlockC.docx": "e5f9dbc4ade91911562e511686bee47fc770e661"
+      },
+      "final_message": "357defef82c346335a18632e99c5341611477054",
+      "deleted": [],
+      "skipped": []
+    },
+    "shoring-design-verification": {
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "run": "eval_run",
+      "trial": "shoring-design-verification__Zg2RsrL",
+      "ended": "ok",
+      "reward": 0.360656,
+      "tree": "dd2dc601e8d85be5c51de8f04abcdaf82c2927b0e17e80e3e6874ba344b72065",
+      "files": {
+        "filesystem/Thelbridge_Verification_Memo_Item048_BlockB.docx": "f5302d95caa4c8ebd6d3d2fc5e9b050e41c1fd03"
+      },
+      "final_message": "56da62e34ed6737f1b59c0f3d7ba7b7367e9ce30",
+      "deleted": [],
+      "skipped": []
+    },
+    "solar-supplemental-review": {
+      "run": "eval_run",
+      "trial": "solar-supplemental-review__XgpcZzL",
+      "ended": "ok",
+      "reward": 0.311688,
+      "tree": "dd2dc601e8d85be5c51de8f04abcdaf82c2927b0e17e80e3e6874ba344b72065",
+      "dev_set": "85ad6d96fbf76ee64d9fb6339b3bf342b07128a2ebadc0a10f008c95dac01a48",
+      "files": {
+        "filesystem/Bramwick_Commons_Screen_Memo.docx": "f4a3b9b64d5071f2e6902989676cedc593436947"
+      },
+      "final_message": "7a18d2b7aaaa119e38fa20c01145fe7b7e3683fd",
       "deleted": [],
       "skipped": []
     }
